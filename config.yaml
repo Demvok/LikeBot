@@ -1,0 +1,13 @@
+logging:
+  level: "DEBUG"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  console_log: true
+  save_to: "./logs/"
+
+reactions: 
+  palettes:
+    - "👍"
+    - "❤️"
+    - "😂"
+    - "😮"
+    - "😢"
+    - "😡"
