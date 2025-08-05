@@ -3,3 +3,5 @@
 logs/
 sessions/
 test.py
+__pycache__
+accounts.json

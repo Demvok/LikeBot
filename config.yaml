@@ -3,11 +3,16 @@ logging:
   console_log: true
   save_to: "./logs/"
 
-reactions: 
-  palettes:
+reactions:
+  mono:
     - "👍"
     - "❤️"
     - "😂"
     - "😮"
     - "😢"
     - "😡"
+  palettes:
+    positive:
+      - "👍"
+      - "❤️"
+      - "🔥"

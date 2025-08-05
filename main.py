@@ -1,91 +1,66 @@
-import os, re
-from dotenv import load_dotenv
-from telethon import TelegramClient, functions, types
-from telethon.tl.functions.messages import SendReactionRequest
+import json, asyncio
+from agent import *
 from logger import setup_logger
 
-load_dotenv()
-
-api_id = int(os.getenv("API_ID"))
-api_hash = os.getenv("API_HASH")
-session_name = os.getenv("SESSION_NAME", "default")
-TARGET_CHAT='https://t.me/+trTEmD0st1s4MmEy'
+# tmp
+import os
+from dotenv import load_dotenv
+# 
 
 logger = setup_logger("main", "main.log")
 
+async def connect_clients():
 
-client = TelegramClient(f'sessions/{session_name}', api_id, api_hash)
+    def load_account_config():
+        """Load account configuration from accounts.json file."""
+        with open('accounts.json', 'r', encoding='utf-8') as file:
+            accounts = json.load(file)
+            return accounts
 
-async def react_to_message(client, message, target_chat):
+    # Stage 1: Load account configuration
+    logger.debug('Starting to load account configuration...')
     try:
-        await client(SendReactionRequest(
-            peer=target_chat,
-            msg_id=message.id,
-            reaction=[types.ReactionEmoji(emoticon='👍')],
-            add_to_recent=True
-        ))
-        logger.error("Реакцію додано!")
+        accounts = load_account_config()
+        if not accounts:
+            logger.error("No accounts found in accounts.json. Please add at least one account.")
+            raise ValueError("No accounts found in accounts.json.")
+        if not isinstance(accounts, list):
+            logger.error("Invalid accounts.json format. Please ensure it contains a list of accounts.")
+            raise ValueError("Invalid accounts.json format. Please ensure it contains a list of accounts.")
     except Exception as e:
-        logger.warning(f"Помилка реакції: {e}")
+        logger.error(f"Unknown error: {e}")
+        raise
+    logger.debug('Account configuration loaded successfully.')
 
-async def comment_on_message(client, message, target_chat):
-    try:
-        discussion = await client(functions.messages.GetDiscussionMessageRequest(
-            peer=target_chat,
-            msg_id=message.id
-        ))
-        logger.debug(f"Обговорення знайдено: {discussion.messages[0].id}")
-        await client.send_message(
-                entity=discussion.messages[0].chat_id,
-                message="Дякую за пост! 🔥",
-                reply_to=message.id
-            )
-        logger.debug("Коментар додано!")
-    except Exception as e:
-        logger.warning(f"Помилка коментаря: {e}")
-
-
-
-async def get_message_and_chat_id_from_link(link):
-    # Example link: https://t.me/c/123456789/12345 or https://t.me/username/12345
-    match = re.match(r'https://t\.me/(c/)?([\w\d_]+)/(\d+)', link)
-    if not match:
-        raise ValueError("Invalid Telegram message link format.")
-
-    is_private = match.group(1) == 'c/'
-    chat_part = match.group(2)
-    message_id = int(match.group(3))
-
-    if is_private:
-        # For private groups/channels, chat_id is -100 + chat_part
-        chat_id = int(f"-100{chat_part}")
+    # Stage 2: Initialize Telegram clients for all accounts, authentificate if needed
+    if not accounts:
+        logger.error("No accounts found in accounts.json. Please add at least one account.")
+        raise ValueError("No accounts found in accounts.json.")
     else:
-        # For public, chat_part is username
-        chat_id = chat_part
-
-    # Get entity and message using TelegramClient
-    entity = await client.get_entity(chat_id)
-    message = await client.get_messages(entity, ids=message_id)
-
-    return entity, message
-
-
-
-
-
+        logger.info(f"Found {len(accounts)} accounts in accounts.json. Initializing clients...")
+        clients = []
+        for account in accounts:
+            client = Client(account)
+            clients.append(client)  # Don't await connect here
+    
+        logger.info(f"Initialized {len(clients)} clients successfully.")
+        return clients
 
 async def main():
-    await client.start()
-    logger.info("✅ Бот запущено...")
-   
-    entity, message = await get_message_and_chat_id_from_link('https://t.me/c/2723750105/12')
+    logger.info("System is starting...")
 
-    await react_to_message(message, entity)
-    await comment_on_message(message, entity)
+    load_dotenv()
+    post_link = os.getenv('POST_LINK')
+    if not post_link:
+        logger.error("POST_LINK not found in .env file.")
+        raise ValueError("POST_LINK not found in .env file.")
 
-    await client.run_until_disconnected()
+    clients = await connect_clients()
+    
+    async with clients[0] as client:
+        await client.react_to_message(post_link)
+        # await client.comment_on_message(post_link)
 
+    logger.info("System has finished processing.")
 
-if __name__ == "__main__":
-    with client:
-        client.loop.run_until_complete(main())
+asyncio.run(main())

@@ -7,12 +7,29 @@ def load_config():
         return yaml.safe_load(file)
 
 config = load_config()
-LEVEL = config['logging']['level']
+LOGGING_LEVEL = config['logging']['level']
 CONSOLE_LOG = config['logging']['console_log']
 SAVE_TO = config['logging']['save_to']
 
+if LOGGING_LEVEL == "DEBUG":
+    LEVEL = logging.DEBUG
+elif LOGGING_LEVEL == "INFO":
+    LEVEL = logging.INFO
+elif LOGGING_LEVEL == "WARNING":
+    LEVEL = logging.WARNING
+elif LOGGING_LEVEL == "ERROR":
+    LEVEL = logging.ERROR
+elif LOGGING_LEVEL == "CRITICAL":
+    LEVEL = logging.CRITICAL
+else:
+    raise ValueError(f"Unknown logging level: {LOGGING_LEVEL}")
+
 if not os.path.exists(SAVE_TO):
     os.makedirs(SAVE_TO)
+
+accounts_folder = os.path.join(SAVE_TO, "accounts")
+if not os.path.exists(accounts_folder):
+    os.makedirs(accounts_folder)
 
 def timeUsed(start_time, end_time) -> str:
     duration = end_time - start_time
@@ -45,6 +62,7 @@ def setup_logger(name: str, log_file: str) -> logging.Logger:
     # Create a fresh logger instance
     logger = logging.getLogger(name)
     logger.propagate = False
+    logger.setLevel(LEVEL)
     
     # Remove any existing handlers
     for handler in logger.handlers[:]:
