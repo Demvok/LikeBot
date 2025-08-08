@@ -1,0 +1,19 @@
+[
+    {
+        "task_id": 1,
+        "name": "Test task name",
+        "description": "Test task description",
+        "post_ids": [
+            1,
+            2,
+            3
+        ],
+        "accounts": [
+            "+380990253688"
+        ],
+        "reaction": "\u2764\ufe0f",
+        "status": "PENDING",
+        "created_at": "2025-08-07T20:27:29.954892",
+        "updated_at": "2025-08-07T20:27:29.954892"
+    }
+]
