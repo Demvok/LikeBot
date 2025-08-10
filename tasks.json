@@ -11,7 +11,12 @@
         "accounts": [
             "+380990253688"
         ],
-        "reaction": "\u2764\ufe0f",
+        "action": [
+            {
+                "type": "react",
+                "palette": "positive"
+            }
+        ],
         "status": "PENDING",
         "created_at": "2025-08-07T20:27:29.954892",
         "updated_at": "2025-08-07T20:27:29.954892"

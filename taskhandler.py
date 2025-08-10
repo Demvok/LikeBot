@@ -1,8 +1,14 @@
 import pandas as pd
-import json
-import re
+import json, re, yaml
 from enum import Enum, auto
-from agent import Account
+from agent import Account, Client
+from logger import setup_logger
+
+def load_config():
+    with open('config.yaml', 'r', encoding='utf-8') as file:
+        return yaml.safe_load(file)
+config = load_config()
+
 
 class Post:
     def __init__(self, post_id, message_link, chat_id=None, message_id=None, created_at=None, updated_at=None):
@@ -111,17 +117,35 @@ class Post:
 
     @classmethod
     async def mass_validate_posts(cls, posts, client, logger=None):
+        """Validate multiple posts asynchronously."""
+        if logger:
+            logger.debug(f"Validating {len(posts)} posts...")
+        if not posts:
+            if logger:
+                logger.warning("No posts to validate.")
+            return
+        if not isinstance(posts, list):
+            raise ValueError("Posts should be a list of Post objects.")
+        if not client:
+            raise ValueError("Client is not initialized.")
+        already_validated, newly_validated = 0, 0
         for post in posts:
             if post.is_validated:
-                if logger:
-                    logger.info(f"Post {post.post_id} is already validated.")
+                # if logger:
+                    # logger.info(f"Post {post.post_id} is already validated.")
+                already_validated += 1
                 continue
             post = await post.validate(client=client)
-            if logger:
-                logger.info(f"Validating post {post.post_id}...")
-
+            if post.is_validated:
+                newly_validated += 1
+            # if logger:
+                # logger.info(f"Validating post {post.post_id}...")
+        if logger:
+            logger.info(f"Validated {len(posts)} posts: {newly_validated} newly validated, {already_validated} already validated.")
 
 class Task:
+
+    logger = setup_logger("main", "main.log")
 
     class TaskStatus(Enum):
         PENDING = auto()
@@ -129,13 +153,13 @@ class Task:
         FINISHED = auto()
         CRASHED = auto()
 
-    def __init__(self, task_id, name, post_ids, accounts, reaction, description=None, status=None, created_at=None, updated_at=None):
+    def __init__(self, task_id, name, post_ids, accounts, action, description=None, status=None, created_at=None, updated_at=None):
         self.task_id = task_id
         self.name = name
         self.description = description
         self.post_ids = post_ids
         self.accounts = accounts
-        self.reaction = reaction
+        self.action = action
         self.status = status or Task.TaskStatus.PENDING
         self.created_at = created_at or pd.Timestamp.now()
         self.updated_at = updated_at or pd.Timestamp.now()
@@ -154,18 +178,111 @@ class Task:
             'description': self.description,
             'post_ids': self.post_ids if not rich else self.get_posts(),
             'accounts': self.accounts if not rich else self.get_accounts(),
-            'reaction': self.reaction,
+            'action': self.action,
             'status': self.status.name if isinstance(self.status, Task.TaskStatus) else self.status,
             'created_at': self.created_at.isoformat() if isinstance(self.created_at, pd.Timestamp) else self.created_at,
             'updated_at': self.updated_at.isoformat() if isinstance(self.updated_at, pd.Timestamp) else self.updated_at
         }
 
+    def get_actions(self):
+        """Get all actions as a list."""
+        return self.action if isinstance(self.action, list) else []
+
+    def get_actions_by_type(self, action_type):
+        """Get actions filtered by type (react, comment, etc.)."""
+        return [action for action in self.get_actions() if action.get('type') == action_type]
+
+    def get_react_actions(self):
+        """Get all react actions."""
+        return self.get_actions_by_type('react')
+
+    def get_comment_actions(self):
+        """Get all comment actions."""
+        return self.get_actions_by_type('comment')
+
+    def has_action_type(self, action_type):
+        """Check if task has a specific action type."""
+        return len(self.get_actions_by_type(action_type)) > 0
+
+    def get_reaction_palette_names(self):
+        """Get the palette for a specific action type."""
+        actions = self.get_actions_by_type('react')
+        return actions[0].get('palette') if actions else None
+
+    def get_action_emojis(self):
+        """Get emojis for a specific action type and palette from config."""
+        palette = self.get_reaction_palette_names()
+        if palette == 'positive':
+            return config.get('reactions_palettes', {}).get('positive', ['❤️', '👍', '🔥'])
+        elif palette == 'negative':
+            return config.get('reactions_palettes', {}).get('negative', ['👎', '💔'])
+        else:
+            return config.get('reactions_palettes', {}).get('neutral', ['🤔', '😐'])
+        
+    def set_action_emojis(self):
+        """Set emojis for the active emoji palette."""
+        Client.active_emoji_palette = self.get_action_emojis()
+
+    def get_current_emojis(self):
+        """Get the current emojis from the active emoji palette."""
+        # to test
+        return Client.active_emoji_palette if Client.active_emoji_palette else self.get_action_emojis()
+
 
     async def start(self):
         """Start the task."""
-        self.status = 'in_progress'
-        self.updated_at = pd.Timestamp.now()
-        # Logic to start the task goes here
+        try:
+            self.status = 'in_progress'
+            self.updated_at = pd.Timestamp.now()
+            
+            if self.has_action_type('react'):
+                self.set_action_emojis() # Set palette
+                accounts = self.get_accounts() # Get accounts
+                posts = self.get_posts() # Get posts
+
+                clients = await Client.connect_clients(accounts, self.logger)
+
+                # Validate posts with the first client
+                if clients:
+                    await Post.mass_validate_posts(posts, clients[0], self.logger)
+
+                # React to posts sequentially to avoid conflicts
+                for post in posts:
+                    if post.is_validated:
+                        for i, client in enumerate(clients):
+                            try:
+                                await client.react(post.message_id, post.chat_id)
+                                self.logger.debug(f"Client {i} reacted to post {post.post_id}")
+                            except Exception as e:
+                                self.logger.warning(f"Client {i} failed to react to post {post.post_id}: {e}")
+                        self.logger.info(f"Reacted to post {post.post_id} with {self.get_reaction_palette_names()}")
+
+                # Disconnect clients
+                for client in clients:
+                    try:
+                        await client.client.disconnect()
+                    except Exception as e:
+                        self.logger.warning(f"Error disconnecting client: {e}")
+
+            if self.has_action_type('comment'):
+            # Logic to handle comment actions can be added here
+                self.logger.info("Comment actions are not implemented yet.")
+                pass
+            if len(self.get_actions()) == 0:
+                raise ValueError("No actions defined for the task.")
+            
+            self.status = 'finished'
+            self.updated_at = pd.Timestamp.now()
+            self.logger.info(f"Task {self.task_id} completed successfully.")
+
+        except Exception as e:
+            self.logger.error(f"Error starting task {self.task_id}: {e}")
+            self.status = 'failed'
+            self.updated_at = pd.Timestamp.now()
+            raise e
+
+
+        
 
     async def pause(self):
         """Pause the task."""
@@ -192,6 +309,9 @@ class Task:
     def get_accounts(self):
         return Account.get_accounts(self.accounts)
 
+
+
+
     @classmethod
     def _load_tasks_from_json(cls, file_path):
         """Load tasks from a JSON file."""
@@ -215,14 +335,15 @@ class Task:
             # Convert string representations back to lists/objects if needed
             post_ids = eval(row['post_ids']) if isinstance(row['post_ids'], str) else row['post_ids']
             accounts = eval(row['accounts']) if isinstance(row['accounts'], str) else row['accounts']
+            action = eval(row['action']) if isinstance(row['action'], str) else row['action']  # Changed from reaction to action
             
             task = cls(
                 row['task_id'], 
                 row['name'], 
-                row['description'], 
-                post_ids, 
+                post_ids,
                 accounts, 
-                row['reaction'], 
+                action,
+                row['description'], 
                 row['status'], 
                 row['created_at'], 
                 row['updated_at']
@@ -255,5 +376,5 @@ class Task:
             cls._save_tasks_to_csv(tasks, file_path)
         else:
             raise ValueError("Unsupported file type. Use 'json' or 'csv'.")
-        
-    
+
+

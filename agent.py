@@ -114,7 +114,7 @@ class Account(object):
 
 class Client(object):
 
-    active_emoji_palette = config['reactions']['palettes']['positive']
+    active_emoji_palette = []
 
     def __init__(self, account):
         self.account = account
@@ -151,7 +151,7 @@ class Client(object):
         try:
             self.client = TelegramClient(f'sessions/{self.session_name}', api_id, api_hash)
             await self.client.start()
-            self.logger.info(f"Client for {self.phone_number} started successfully.")
+            self.logger.debug(f"Client for {self.phone_number} started successfully.")
             return self  # Add this line to return the Client object
         except Exception as e:
             self.logger.error(f"Failed to connect client for {self.phone_number}: {e}")
@@ -159,18 +159,27 @@ class Client(object):
 
     @classmethod
     async def connect_clients(cls, accounts, logger):
-        # WIP
-        logger.info(f"Found {len(accounts)} accounts in accounts.json. Initializing clients...")
+        if logger:
+            logger.info(f"Connecting clients for {len(accounts)} accounts...")
+        
         clients = []
-        for account in accounts:
-            client = cls(account)
-            clients.append(client)  # Don't await connect here
-    
-        logger.info(f"Initialized {len(clients)} clients successfully.")
-        return clients
+        for account in accounts:  # Connect clients sequentially to avoid database lock
+            client = Client(account)
+            await client.connect()
+            clients.append(client)
+        
+        if logger:
+            logger.info(f"Connected clients for {len(clients)} accounts.")
+        
+        return clients if clients else None
 
     async def _react(self, message, target_chat):
         try:
+            if not self.active_emoji_palette:
+                # Load emoji palette from config
+                self.active_emoji_palette = config.get('reactions_palettes', []).get('positive', [])
+                if not self.active_emoji_palette:
+                    raise ValueError("Emoji palette is empty in the configuration.")
             emoticon = random.choice(self.active_emoji_palette)
             await self.client(SendReactionRequest(
                 peer=target_chat,
@@ -226,7 +235,61 @@ class Client(object):
         self.logger.debug(f"Retrieved message {message_id} from chat {chat_id}")
         return entity, message
 
+    async def _undo_reaction(self, message, target_chat):
+        try:
+            await self.client(SendReactionRequest(
+                peer=target_chat,
+                msg_id=message.id,
+                reaction=[],  # Empty list removes reaction
+                add_to_recent=False
+            ))
+            self.logger.info("Reaction removed successfully")
+        except Exception as e:
+            self.logger.warning(f"Error removing reaction: {e}")
 
+    async def _undo_comment(self, message, target_chat):
+        try:
+            discussion = await self.client(functions.messages.GetDiscussionMessageRequest(
+                peer=target_chat,
+                msg_id=message.id
+            ))
+            discussion_chat = discussion.chats[0]
+            # Find comments by this user on this discussion
+            async for msg in self.client.iter_messages(discussion_chat, reply_to=discussion.messages[0].id, from_user='me'):
+                await msg.delete()
+                self.logger.info(f"Comment {msg.id} deleted successfully!")
+        except Exception as e:
+            self.logger.warning(f"Error deleting comment: {e}")
+
+    async def undo_reaction(self, message_id: int, chat_id: str):
+        entity = await self.client.get_entity(chat_id)
+        message = await self.client.get_messages(entity, ids=message_id)
+        await self._undo_reaction(message, entity)
+
+    async def undo_comment(self, message_id: int, chat_id: str):
+        entity = await self.client.get_entity(chat_id)
+        message = await self.client.get_messages(entity, ids=message_id)
+        await self._undo_comment(message, entity)
+
+    async def undo_reaction_on_message(self, message_link: str):
+        entity, message = await self._get_message_ids(message_link)
+        await self._undo_reaction(message, entity)
+
+    async def undo_comment_on_message(self, message_link: str):
+        entity, message = await self._get_message_ids(message_link)
+        await self._undo_comment(message, entity)
+
+    async def react(self, message_id:int, chat_id:str):
+        """React to a message by its ID in a specific chat."""
+        entity = await self.client.get_entity(chat_id)
+        message = await self.client.get_messages(entity, ids=message_id)
+        await self._react(message, entity)
+
+    async def comment(self, message_id:int, chat_id:str):
+        """Comment on a message by its ID in a specific chat."""
+        entity = await self.client.get_entity(chat_id)
+        message = await self.client.get_messages(entity, ids=message_id)
+        await self._comment(message, entity)
 
     async def react_to_message(self, message_link:str):
         entity, message = await self._get_message_ids(message_link)
