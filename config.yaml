@@ -3,6 +3,12 @@ logging:
   console_log: true
   save_to: "./logs/"
 
+filepaths:
+  accounts: "accounts.json"
+  posts: "posts.json"
+  tasks: "tasks.json"
+  sessions_folder: "sessions/"
+
 reactions_palettes:
   positive:
     - "👍"

@@ -96,24 +96,24 @@ class Post:
         df.to_csv(file_path, index=False)
 
     @classmethod
-    def load_posts(cls, file_path='posts.json', file_type='json'):
+    def load_posts(cls, file_path=config.get('filepaths', {}).get('posts', 'posts.json')):
         """Load posts from a file, either JSON or CSV."""
-        if file_type == 'json':
+        if file_path.endswith('.json'):
             return cls._load_posts_from_json(file_path)
-        elif file_type == 'csv':
+        elif file_path.endswith('.csv'):
             return cls._load_posts_from_csv(file_path)
         else:
-            raise ValueError("Unsupported file type. Use 'json' or 'csv'.")
+            raise ValueError("Unsupported file type. Use '.json' or '.csv' file extension.")
 
     @classmethod
-    def save_posts(cls, posts, file_path='posts.json', file_type='json'):
+    def save_posts(cls, posts, file_path=config.get('filepaths', {}).get('posts', 'posts.json')):
         """Save posts to a file, either JSON or CSV."""
-        if file_type == 'json':
+        if file_path.endswith('.json'):
             cls._save_posts_to_json(posts, file_path)
-        elif file_type == 'csv':
+        elif file_path.endswith('.csv'):
             cls._save_posts_to_csv(posts, file_path)
         else:
-            raise ValueError("Unsupported file type. Use 'json' or 'csv'.")
+            raise ValueError("Unsupported file type. Use '.json' or '.csv' file extension.")
 
     @classmethod
     async def mass_validate_posts(cls, posts, client, logger=None):
@@ -251,7 +251,6 @@ class Task:
             await self._check_pause()
             
             clients = await Client.connect_clients(accounts, self.logger)
-            await asyncio.sleep(15)
 
             if self.has_action_type('react'):
                 current_emojis = self.get_reaction_emojis()  # Get reaction palette
@@ -390,23 +389,23 @@ class Task:
         df.to_csv(file_path, index=False)
 
     @classmethod
-    def load_tasks(cls, file_path='tasks.json', file_type='json'):
+    def load_tasks(cls, file_path=config.get('filepaths', {}).get('tasks', 'tasks.json')):
         """Load tasks from a file, either JSON or CSV."""
-        if file_type == 'json':
+        if file_path.endswith('.json'):
             return cls._load_tasks_from_json(file_path)
-        elif file_type == 'csv':
+        elif file_path.endswith('.csv'):
             return cls._load_tasks_from_csv(file_path)
         else:
-            raise ValueError("Unsupported file type. Use 'json' or 'csv'.")
+            raise ValueError("Unsupported file type. Use '.json' or '.csv' file extension.")
         
     @classmethod
-    def save_tasks(cls, tasks, file_path='tasks.json', file_type='json'):
+    def save_tasks(cls, tasks, file_path=config.get('filepaths', {}).get('tasks', 'tasks.json')):
         """Save tasks to a file, either JSON or CSV."""
-        if file_type == 'json':
+        if file_path.endswith('.json'):
             cls._save_tasks_to_json(tasks, file_path)
-        elif file_type == 'csv':
+        elif file_path.endswith('.csv'):
             cls._save_tasks_to_csv(tasks, file_path)
         else:
-            raise ValueError("Unsupported file type. Use 'json' or 'csv'.")
+            raise ValueError("Unsupported file type. Use '.json' or '.csv' file extension.")
 
 

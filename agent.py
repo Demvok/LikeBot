@@ -61,7 +61,7 @@ class Account(object):
         return cls(account_data)
 
     @classmethod
-    def load_accounts(cls, file_path='accounts.json'):
+    def load_accounts(cls, file_path=config.get('filepaths', {}).get('accounts', 'accounts.json')):
         """Load accounts from accounts.json or accounts.csv file."""
         if os.path.exists(file_path):
             if file_path.endswith('.json'):
@@ -97,7 +97,7 @@ class Account(object):
         df.to_csv(file_path, index=False)
 
     @classmethod
-    def save_accounts(cls, accounts, file_path='accounts.json'):
+    def save_accounts(cls, accounts, file_path=config.get('filepaths', {}).get('accounts', 'accounts.json')):
         """Save accounts to a file, either JSON or CSV."""
         if file_path.endswith('.json'):
             cls._save_accounts_to_json(accounts, file_path)
@@ -147,7 +147,7 @@ class Client(object):
 
     async def connect(self):
         try:
-            self.client = TelegramClient(f'sessions/{self.session_name}', api_id, api_hash)
+            self.client = TelegramClient(f'{config.get('filepaths', {}).get('sessions_folder', 'sessions/')}{self.session_name}', api_id, api_hash)
             await self.client.start()
             self.logger.debug(f"Client for {self.phone_number} started successfully.")
             return self  # Add this line to return the Client object
@@ -233,7 +233,7 @@ class Client(object):
         self.logger.debug(f"Retrieved message {message_id} from chat {chat_id}")
         return entity, message
 
-    async def _undo_reaction(self, message, target_chat):
+    async def _undo_reaction(self, message, target_chat):  # to test
         try:
             await self.client(SendReactionRequest(
                 peer=target_chat,
@@ -245,7 +245,7 @@ class Client(object):
         except Exception as e:
             self.logger.warning(f"Error removing reaction: {e}")
 
-    async def _undo_comment(self, message, target_chat):
+    async def _undo_comment(self, message, target_chat):  # to test
         try:
             discussion = await self.client(functions.messages.GetDiscussionMessageRequest(
                 peer=target_chat,
