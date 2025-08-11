@@ -1,5 +1,5 @@
 import pandas as pd
-import json, re, yaml
+import json, re, yaml, asyncio
 from enum import Enum, auto
 from agent import Account, Client
 from logger import setup_logger
@@ -143,6 +143,10 @@ class Post:
         if logger:
             logger.info(f"Validated {len(posts)} posts: {newly_validated} newly validated, {already_validated} already validated.")
 
+
+
+
+
 class Task:
 
     logger = setup_logger("main", "main.log")
@@ -150,8 +154,13 @@ class Task:
     class TaskStatus(Enum):
         PENDING = auto()
         RUNNING = auto()
+        PAUSED = auto()
         FINISHED = auto()
         CRASHED = auto()
+        def __str__(self):
+            return self.name
+        def __repr__(self):
+            return self.name
 
     def __init__(self, task_id, name, post_ids, accounts, action, description=None, status=None, created_at=None, updated_at=None):
         self.task_id = task_id
@@ -163,6 +172,9 @@ class Task:
         self.status = status or Task.TaskStatus.PENDING
         self.created_at = created_at or pd.Timestamp.now()
         self.updated_at = updated_at or pd.Timestamp.now()
+        self._pause_event = asyncio.Event()
+        self._pause_event.set()  # Initially not paused
+        self._task = None
 
     def __repr__(self):
         return f"Task({self.task_id}, {self.name}, {self.status}, {self.created_at}, {self.updated_at})"
@@ -184,6 +196,13 @@ class Task:
             'updated_at': self.updated_at.isoformat() if isinstance(self.updated_at, pd.Timestamp) else self.updated_at
         }
 
+    def get_posts(self):
+        """Get a list of Post objects from a list of post IDs."""
+        return [elem for elem in Post.load_posts() if elem.post_id in self.post_ids]
+    
+    def get_accounts(self):
+        return Account.get_accounts(self.accounts)
+
     def get_actions(self):
         """Get all actions as a list."""
         return self.action if isinstance(self.action, list) else []
@@ -192,11 +211,11 @@ class Task:
         """Get actions filtered by type (react, comment, etc.)."""
         return [action for action in self.get_actions() if action.get('type') == action_type]
 
-    def get_react_actions(self):
+    def get_react_actions(self):  # Possibly useless
         """Get all react actions."""
         return self.get_actions_by_type('react')
 
-    def get_comment_actions(self):
+    def get_comment_actions(self):  # Possibly useless
         """Get all comment actions."""
         return self.get_actions_by_type('comment')
 
@@ -204,50 +223,52 @@ class Task:
         """Check if task has a specific action type."""
         return len(self.get_actions_by_type(action_type)) > 0
 
-    def get_reaction_palette_names(self):
+    def get_reaction_palette_name(self):
         """Get the palette for a specific action type."""
         actions = self.get_actions_by_type('react')
         return actions[0].get('palette') if actions else None
 
-    def get_action_emojis(self):
+    def get_reaction_emojis(self):
         """Get emojis for a specific action type and palette from config."""
-        palette = self.get_reaction_palette_names()
+        palette = self.get_reaction_palette_name()
         if palette == 'positive':
-            return config.get('reactions_palettes', {}).get('positive', ['❤️', '👍', '🔥'])
+            return config.get('reactions_palettes', {}).get('positive', [])
         elif palette == 'negative':
-            return config.get('reactions_palettes', {}).get('negative', ['👎', '💔'])
+            return config.get('reactions_palettes', {}).get('negative', [])
         else:
-            return config.get('reactions_palettes', {}).get('neutral', ['🤔', '😐'])
-        
-    def set_action_emojis(self):
-        """Set emojis for the active emoji palette."""
-        Client.active_emoji_palette = self.get_action_emojis()
+            raise ValueError(f"Unknown reaction palette: {palette}")
 
-    def get_current_emojis(self):
-        """Get the current emojis from the active emoji palette."""
-        # to test
-        return Client.active_emoji_palette if Client.active_emoji_palette else self.get_action_emojis()
-
-
-    async def start(self):
-        """Start the task."""
+    async def _run(self):
         try:
-            self.status = 'in_progress'
+            self.status = Task.TaskStatus.RUNNING
             self.updated_at = pd.Timestamp.now()
+            self.logger.info(f"Starting task {self.task_id} - {self.name}...")
+
+            accounts = self.get_accounts()
+            posts = self.get_posts()
+
+            # Check for pause before connecting clients
+            await self._check_pause()
             
+            clients = await Client.connect_clients(accounts, self.logger)
+            await asyncio.sleep(15)
+
             if self.has_action_type('react'):
-                self.set_action_emojis() # Set palette
-                accounts = self.get_accounts() # Get accounts
-                posts = self.get_posts() # Get posts
+                current_emojis = self.get_reaction_emojis()  # Get reaction palette
 
-                clients = await Client.connect_clients(accounts, self.logger)
+                for client in clients:
+                    client.active_emoji_palette = current_emojis
 
-                # Validate posts with the first client
+                # Check for pause before validation
+                await self._check_pause()
+                
                 if clients:
                     await Post.mass_validate_posts(posts, clients[0], self.logger)
 
-                # React to posts sequentially to avoid conflicts
+                # React to posts with pause checking
                 for post in posts:
+                    await self._check_pause()  # Check pause before each post
+                    
                     if post.is_validated:
                         for i, client in enumerate(clients):
                             try:
@@ -255,7 +276,7 @@ class Task:
                                 self.logger.debug(f"Client {i} reacted to post {post.post_id}")
                             except Exception as e:
                                 self.logger.warning(f"Client {i} failed to react to post {post.post_id}: {e}")
-                        self.logger.info(f"Reacted to post {post.post_id} with {self.get_reaction_palette_names()}")
+                        self.logger.info(f"Reacted to post {post.post_id} with {self.get_reaction_palette_name()}")
 
                 # Disconnect clients
                 for client in clients:
@@ -271,45 +292,56 @@ class Task:
             if len(self.get_actions()) == 0:
                 raise ValueError("No actions defined for the task.")
             
-            self.status = 'finished'
+            self.status = Task.TaskStatus.FINISHED
             self.updated_at = pd.Timestamp.now()
             self.logger.info(f"Task {self.task_id} completed successfully.")
-
+        except asyncio.CancelledError:
+            self.logger.info(f"Task {self.task_id} was cancelled.")
+            self.status = Task.TaskStatus.FINISHED
+            self.updated_at = pd.Timestamp.now()
         except Exception as e:
             self.logger.error(f"Error starting task {self.task_id}: {e}")
-            self.status = 'failed'
+            self.status = Task.TaskStatus.CRASHED
             self.updated_at = pd.Timestamp.now()
             raise e
 
 
-        
+    async def start(self):
+        """Start the task."""
+        if self._task is None or self._task.done():
+            self._pause_event.set()
+            self._task = asyncio.create_task(self._run())
+            self.status = Task.TaskStatus.RUNNING       
 
     async def pause(self):
         """Pause the task."""
-        self.status = 'paused'
-        self.updated_at = pd.Timestamp.now()
-        # Logic to pause the task goes here
+        if self.status == Task.TaskStatus.RUNNING:
+            self._pause_event.clear()
+            self.status = Task.TaskStatus.PAUSED  # Add this line
+            self.logger.info(f"Task {self.task_id} paused.")
 
-    async def stop(self):
-        """Stop the task."""
-        self.status = 'stopped'
-        self.updated_at = pd.Timestamp.now()
-        # Logic to stop the task goes here
-    
+    async def resume(self):
+        """Resume the task."""
+        if self.status == Task.TaskStatus.PAUSED:
+            self._pause_event.set()
+            self.status = Task.TaskStatus.RUNNING  # Add this line
+            self.logger.info(f"Task {self.task_id} resumed.")
+
+    async def _check_pause(self):
+        """Check if task should be paused and wait if needed."""
+        if not self._pause_event.is_set():
+            self.status = Task.TaskStatus.PAUSED
+            self.logger.info(f"Task {self.task_id} is paused, waiting to resume...")
+            await self._pause_event.wait()
+            self.status = Task.TaskStatus.RUNNING
+            self.logger.info(f"Task {self.task_id} resumed.")
+
     async def get_status(self):
         """Get the current status of the task."""
         # Additional info gathering logic can be added here
         # Will be used to create reports
         return self.status
     
-    def get_posts(self):
-        """Get a list of Post objects from a list of post IDs."""
-        return [elem for elem in Post.load_posts() if elem.post_id in self.post_ids]
-    
-    def get_accounts(self):
-        return Account.get_accounts(self.accounts)
-
-
 
 
     @classmethod

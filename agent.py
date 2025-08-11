@@ -114,8 +114,6 @@ class Account(object):
 
 class Client(object):
 
-    active_emoji_palette = []
-
     def __init__(self, account):
         self.account = account
         try:
@@ -123,7 +121,7 @@ class Client(object):
             self.phone_number = account.phone_number
         except KeyError as e:
             raise ValueError(f"Missing key in account configuration: {e}")
-        
+        self.active_emoji_palette = ['👍', '❤️', '🔥']  # Default emoji palette
         self.logger = setup_logger(f"{self.phone_number}", f"accounts/account_{self.phone_number}.log")
         self.logger.info(f"Initializing client for {self.phone_number}. Awaiting connection...")
         self.client = None

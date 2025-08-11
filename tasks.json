@@ -14,7 +14,7 @@
         "action": [
             {
                 "type": "react",
-                "palette": "positive"
+                "palette": "negative"
             }
         ],
         "status": "PENDING",
