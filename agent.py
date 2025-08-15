@@ -1,6 +1,6 @@
 import re, yaml, json, os, random
 import pandas as pd
-from telethon.tl.functions.messages import SendReactionRequest
+from telethon.tl.functions.messages import SendReactionRequest, GetMessagesRequest
 from telethon import TelegramClient, functions, types
 from logger import setup_logger
 from dotenv import load_dotenv
@@ -121,7 +121,7 @@ class Client(object):
             self.phone_number = account.phone_number
         except KeyError as e:
             raise ValueError(f"Missing key in account configuration: {e}")
-        self.active_emoji_palette = ['👍', '❤️', '🔥']  # Default emoji palette
+        self.active_emoji_palette = ['👍', '❤️', '🔥']  # Default emoji palette, replaces automatically
         self.logger = setup_logger(f"{self.phone_number}", f"accounts/account_{self.phone_number}.log")
         self.logger.info(f"Initializing client for {self.phone_number}. Awaiting connection...")
         self.client = None
@@ -258,6 +258,49 @@ class Client(object):
                 self.logger.info(f"Comment {msg.id} deleted successfully!")
         except Exception as e:
             self.logger.warning(f"Error deleting comment: {e}")
+
+
+
+    async def get_message_content(self, chat_id=None, message_id=None, message_link=None):
+        """
+        Retrieve the content of a single message by chat and message_id.
+        """
+        try:
+            if message_link and not (message_id and chat_id):
+                entity, message = await self._get_message_ids(message_link)
+                return message.message if message else None
+            else:
+                if not chat_id or not message_id:
+                    raise ValueError("Either message_link or both chat_id and message_id must be provided.")
+
+            result = await self.client(GetMessagesRequest(id=[message_id]))
+            if result.messages:
+                return result.messages[0].message  # The text content
+            else:
+                return None
+        except Exception as e:
+            self.logger.warning(f"Error retrieving message content: {e}")
+            return None
+
+    async def get_messages_content(self, chat_id=None, message_ids=None, message_links=None):
+        """
+        Retrieve the content of multiple messages by chat and a list of message_ids.
+        """
+        try:
+            if message_links and not (message_ids and chat_id):
+                messages = []
+                for link in message_links:
+                    entity, message = await self._get_message_ids(link)
+                    messages.append(message.message if message else None)
+                return messages
+            else:
+                if not chat_id or not message_ids:
+                    raise ValueError("Either message_link or both chat_id and message_id must be provided.")
+            result = await self.client(GetMessagesRequest(id=message_ids))
+            return [msg.message for msg in result.messages if hasattr(msg, 'message')]
+        except Exception as e:
+            self.logger.warning(f"Error retrieving messages content: {e}")
+            return []
 
     async def undo_reaction(self, message_id: int, chat_id: str):
         entity = await self.client.get_entity(chat_id)

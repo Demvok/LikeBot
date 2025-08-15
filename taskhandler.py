@@ -135,7 +135,7 @@ class Post:
                     # logger.info(f"Post {post.post_id} is already validated.")
                 already_validated += 1
                 continue
-            post = await post.validate(client=client)
+            post = await post.validate(client=client.client)
             if post.is_validated:
                 newly_validated += 1
             # if logger:
@@ -287,8 +287,20 @@ class Task:
             if self.has_action_type('comment'):
             # Logic to handle comment actions can be added here
                 self.logger.info("Comment actions are not implemented yet.")
+                # Disconnect clients
+                for client in clients:
+                    try:
+                        await client.client.disconnect()
+                    except Exception as e:
+                        self.logger.warning(f"Error disconnecting client: {e}")
                 pass
             if len(self.get_actions()) == 0:
+                # Disconnect clients
+                for client in clients:
+                    try:
+                        await client.client.disconnect()
+                    except Exception as e:
+                        self.logger.warning(f"Error disconnecting client: {e}")
                 raise ValueError("No actions defined for the task.")
             
             self.status = Task.TaskStatus.FINISHED
@@ -297,10 +309,24 @@ class Task:
         except asyncio.CancelledError:
             self.logger.info(f"Task {self.task_id} was cancelled.")
             self.status = Task.TaskStatus.FINISHED
+            # Disconnect clients
+            for client in clients:
+                try:
+                    await client.client.disconnect()
+                except Exception as e:
+                    self.logger.warning(f"Error disconnecting client: {e}")
+
             self.updated_at = pd.Timestamp.now()
         except Exception as e:
             self.logger.error(f"Error starting task {self.task_id}: {e}")
             self.status = Task.TaskStatus.CRASHED
+            # Disconnect clients
+            for client in clients:
+                try:
+                    await client.client.disconnect()
+                except Exception as e:
+                    self.logger.warning(f"Error disconnecting client: {e}")
+
             self.updated_at = pd.Timestamp.now()
             raise e
 
