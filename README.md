@@ -3,9 +3,6 @@
 ### TO DO:
 
 Must:
-- implement human-like delays (config)
-- add connection retries (config)
-- add action retries (config)
 
 - implement task report logic (task, date, status, errors from accounts (async exception handling))
 - add api for task import
@@ -28,7 +25,9 @@ Could:
 
 ### v0.2
 - configure ALL filepaths in config
-
+- implement human-like delays (config)
+- add connection retries (config)
+- add action retries (config)
 
 ### v0.1
 - post import logic

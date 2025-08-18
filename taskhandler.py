@@ -1,4 +1,4 @@
-import pandas as pd
+from pandas import Timestamp, read_csv, DataFrame
 import json, re, yaml, asyncio
 from enum import Enum, auto
 from agent import Account, Client
@@ -11,28 +11,45 @@ config = load_config()
 
 
 class Post:
+    
     def __init__(self, post_id, message_link, chat_id=None, message_id=None, created_at=None, updated_at=None):
         self.post_id = post_id
         self.chat_id = chat_id
         self.message_id = message_id
         self.message_link = message_link
-        self.created_at = created_at or pd.Timestamp.now()
-        self.updated_at = updated_at or pd.Timestamp.now()
+        self.created_at = created_at or Timestamp.now()
+        self.updated_at = updated_at or Timestamp.now()
 
     def __repr__(self):
         return f"Post({self.post_id}, {'validated' if self.is_validated else 'unvalidated'}, {self.message_link})"
+
 
     @property
     def is_validated(self):
         """Check if the post has been validated by checking chat_id and message_id."""
         return self.chat_id is not None and self.message_id is not None
 
-    async def validate(self, client):
-        """Validate the post by fetching its chat_id and message_id."""            
+    async def get_chat_id(self, client, file_path=config.get('filepaths', {}).get('posts', 'posts.json')):
+        """Get chat_id, auto-validate and update if needed."""
+        if not self.is_validated:
+            await self.validate(client, file_path)
+        return self.chat_id
+
+    async def get_message_id(self, client, file_path=config.get('filepaths', {}).get('posts', 'posts.json')):
+        """Get message_id, auto-validate and update if needed."""
+        if not self.is_validated:
+            await self.validate(client, file_path)
+        return self.message_id
+
+
+    async def validate(self, client, file_path=config.get('filepaths', {}).get('posts', 'posts.json')):
+        """Validate the post by fetching its chat_id and message_id, and update the record in file."""
         chat_id, message_id = await self._get_message_ids(client, self.message_link)
         self.chat_id = chat_id
         self.message_id = message_id
-        self.updated_at = pd.Timestamp.now()
+        self.updated_at = Timestamp.now()
+        # Update the record in file
+        type(self).update_post(self, file_path)
         return self
 
     async def _get_message_ids(self, client, link):
@@ -55,7 +72,8 @@ class Post:
         # Get entity and message using TelegramClient
         entity = await client.get_entity(chat_id)
         message = await client.get_messages(entity, ids=message_id)
-        return entity, message
+        # Return only the IDs, not the objects
+        return entity.id if hasattr(entity, 'id') else entity, message.id if hasattr(message, 'id') else message
 
     def to_dict(self):
         """Convert Post object to dictionary with serializable timestamps."""
@@ -64,9 +82,37 @@ class Post:
             'chat_id': self.chat_id,
             'message_id': self.message_id,
             'message_link': self.message_link,
-            'created_at': self.created_at.isoformat() if isinstance(self.created_at, pd.Timestamp) else self.created_at,
-            'updated_at': self.updated_at.isoformat() if isinstance(self.updated_at, pd.Timestamp) else self.updated_at
+            'created_at': self.created_at.isoformat() if isinstance(self.created_at, Timestamp) else self.created_at,
+            'updated_at': self.updated_at.isoformat() if isinstance(self.updated_at, Timestamp) else self.updated_at
         }
+
+    @classmethod
+    def update_post(cls, updated_post, file_path=config.get('filepaths', {}).get('posts', 'posts.json')):
+        """Update a post in the file by post_id."""
+        posts = cls.load_posts(file_path)
+        for i, post in enumerate(posts):
+            if post.post_id == updated_post.post_id:
+                posts[i] = updated_post
+                break
+        else:
+            raise ValueError(f"Post with id {updated_post.post_id} not found.")
+        cls.save_posts(posts, file_path)
+
+    @classmethod
+    def add_post(cls, new_post, file_path=config.get('filepaths', {}).get('posts', 'posts.json')):
+        """Add a new post to the file."""
+        posts = cls.load_posts(file_path)
+        if any(post.post_id == new_post.post_id for post in posts):
+            raise ValueError(f"Post with id {new_post.post_id} already exists.")
+        posts.append(new_post)
+        cls.save_posts(posts, file_path)
+
+    @classmethod
+    def delete_post(cls, post_id, file_path=config.get('filepaths', {}).get('posts', 'posts.json')):
+        """Delete a post from the file by post_id."""
+        posts = cls.load_posts(file_path)
+        posts = [post for post in posts if post.post_id != post_id]
+        cls.save_posts(posts, file_path)
 
     @classmethod
     def _load_posts_from_json(cls, file_path):
@@ -85,14 +131,14 @@ class Post:
     @classmethod
     def _load_posts_from_csv(cls, file_path):
         """Load posts from a CSV file."""
-        df = pd.read_csv(file_path)
+        df = read_csv(file_path)
         posts = [Post(row['post_id'], row['chat_id'], row['message_id'], row['message_link'], row['created_at'], row['updated_at']) for index, row in df.iterrows()]
         return posts
 
     @classmethod
     def _save_posts_to_csv(cls, posts, file_path):
         """Save posts to a CSV file."""
-        df = pd.DataFrame([post.__dict__ for post in posts])
+        df = DataFrame([post.__dict__ for post in posts])
         df.to_csv(file_path, index=False)
 
     @classmethod
@@ -170,8 +216,8 @@ class Task:
         self.accounts = accounts
         self.action = action
         self.status = status or Task.TaskStatus.PENDING
-        self.created_at = created_at or pd.Timestamp.now()
-        self.updated_at = updated_at or pd.Timestamp.now()
+        self.created_at = created_at or Timestamp.now()
+        self.updated_at = updated_at or Timestamp.now()
         self._pause_event = asyncio.Event()
         self._pause_event.set()  # Initially not paused
         self._task = None
@@ -192,8 +238,8 @@ class Task:
             'accounts': self.accounts if not rich else self.get_accounts(),
             'action': self.action,
             'status': self.status.name if isinstance(self.status, Task.TaskStatus) else self.status,
-            'created_at': self.created_at.isoformat() if isinstance(self.created_at, pd.Timestamp) else self.created_at,
-            'updated_at': self.updated_at.isoformat() if isinstance(self.updated_at, pd.Timestamp) else self.updated_at
+            'created_at': self.created_at.isoformat() if isinstance(self.created_at, Timestamp) else self.created_at,
+            'updated_at': self.updated_at.isoformat() if isinstance(self.updated_at, Timestamp) else self.updated_at
         }
 
     def get_posts(self):
@@ -241,7 +287,7 @@ class Task:
     async def _run(self):
         try:
             self.status = Task.TaskStatus.RUNNING
-            self.updated_at = pd.Timestamp.now()
+            self.updated_at = Timestamp.now()
             self.logger.info(f"Starting task {self.task_id} - {self.name}...")
 
             accounts = self.get_accounts()
@@ -304,7 +350,7 @@ class Task:
                 raise ValueError("No actions defined for the task.")
             
             self.status = Task.TaskStatus.FINISHED
-            self.updated_at = pd.Timestamp.now()
+            self.updated_at = Timestamp.now()
             self.logger.info(f"Task {self.task_id} completed successfully.")
         except asyncio.CancelledError:
             self.logger.info(f"Task {self.task_id} was cancelled.")
@@ -316,7 +362,7 @@ class Task:
                 except Exception as e:
                     self.logger.warning(f"Error disconnecting client: {e}")
 
-            self.updated_at = pd.Timestamp.now()
+            self.updated_at = Timestamp.now()
         except Exception as e:
             self.logger.error(f"Error starting task {self.task_id}: {e}")
             self.status = Task.TaskStatus.CRASHED
@@ -327,7 +373,7 @@ class Task:
                 except Exception as e:
                     self.logger.warning(f"Error disconnecting client: {e}")
 
-            self.updated_at = pd.Timestamp.now()
+            self.updated_at = Timestamp.now()
             raise e
 
 
@@ -386,7 +432,7 @@ class Task:
     @classmethod
     def _load_tasks_from_csv(cls, file_path):
         """Load tasks from a CSV file."""
-        df = pd.read_csv(file_path)
+        df = read_csv(file_path)
         tasks = []
         for index, row in df.iterrows():
             # Convert string representations back to lists/objects if needed
@@ -411,7 +457,7 @@ class Task:
     @classmethod
     def _save_tasks_to_csv(cls, tasks, file_path):
         """Save tasks to a CSV file."""
-        df = pd.DataFrame([task.__dict__ for task in tasks])
+        df = DataFrame([task.__dict__ for task in tasks])
         df.to_csv(file_path, index=False)
 
     @classmethod

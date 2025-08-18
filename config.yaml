@@ -21,3 +21,13 @@ reactions_palettes:
     - "🤮"
     - "💩"
     - "🤡"
+
+delays:
+  # Humanization level represents the level at which bot attempts to simulate human behaviour
+  # At 0 level (always on) it will only have minimal delays to prevent spamming and getting banned
+  # At 1st level (default) it will retrieve message content and wait estimated reading time
+  # At 2nd level it will emulate "sessions" of activity, limiting the number of actions per login
+  # At 3rd level it will emulate day-cycle, introducing more smart level of "session" creating via different lifestyles
+  humanisation_level: 1
+  connection_retries: 5
+  action_retries: 3
