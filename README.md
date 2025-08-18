@@ -12,6 +12,7 @@ Should:
 - automate an provide manual way of session verification
 - route account to session creation for first use
 - implement various exception messages for client errors
+- add creation of neccessary files if they dont exist
 
 Could:
 - implement proxy logic (import, status, links to accounts)
@@ -24,13 +25,13 @@ Could:
 ## Changelog
 
 ### v0.2
-- configure ALL filepaths in config
-- implement human-like delays (config)
-- add connection retries (config)
-- add action retries (config)
+- configured ALL filepaths in config
+- implemented human-like delays (config)
+- added connection retries (config)
+- added action retries (config)
 
 ### v0.1
-- post import logic
+- post import logic implemented
 - task and post classes implementation
 - post ids verification
 - created emoji palettes

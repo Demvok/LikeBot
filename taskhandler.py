@@ -479,5 +479,33 @@ class Task:
             cls._save_tasks_to_csv(tasks, file_path)
         else:
             raise ValueError("Unsupported file type. Use '.json' or '.csv' file extension.")
+        
+        
+    @classmethod
+    def update_task(cls, updated_task, file_path=config.get('filepaths', {}).get('tasks', 'tasks.json')):
+        """Update a task in the file by task_id."""
+        tasks = cls.load_tasks(file_path)
+        for i, task in enumerate(tasks):
+            if task.task_id == updated_task.task_id:
+                tasks[i] = updated_task
+                break
+        else:
+            raise ValueError(f"Task with id {updated_task.task_id} not found.")
+        cls.save_tasks(tasks, file_path)
 
+    @classmethod
+    def add_task(cls, new_task, file_path=config.get('filepaths', {}).get('tasks', 'tasks.json')):
+        """Add a new task to the file."""
+        tasks = cls.load_tasks(file_path)
+        if any(task.task_id == new_task.task_id for task in tasks):
+            raise ValueError(f"Task with id {new_task.task_id} already exists.")
+        tasks.append(new_task)
+        cls.save_tasks(tasks, file_path)
+
+    @classmethod
+    def delete_task(cls, task_id, file_path=config.get('filepaths', {}).get('tasks', 'tasks.json')):
+        """Delete a task from the file by task_id."""
+        tasks = cls.load_tasks(file_path)
+        tasks = [task for task in tasks if task.task_id != task_id]
+        cls.save_tasks(tasks, file_path)
 

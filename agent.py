@@ -149,14 +149,24 @@ class Client(object):
             self.logger.info(f"Client for {self.phone_number} disconnected.")
 
     async def connect(self):
-        try:
-            self.client = TelegramClient(f'{config.get('filepaths', {}).get('sessions_folder', 'sessions/')}{self.session_name}', api_id, api_hash)
-            await self.client.start()
-            self.logger.debug(f"Client for {self.phone_number} started successfully.")
-            return self  # Add this line to return the Client object
-        except Exception as e:
-            self.logger.error(f"Failed to connect client for {self.phone_number}: {e}")
-            raise
+        """Connect to Telegram with retry logic."""
+        retries = config.get('delays', {}).get('connection_retries', 5)
+        delay = config.get('delays', {}).get('reconnect_delay', 3)
+
+        attempt = 0
+        while attempt < retries:
+            try:
+                self.client = TelegramClient(f'{config.get('filepaths', {}).get('sessions_folder', 'sessions/')}{self.session_name}', api_id, api_hash)
+                await self.client.start()
+                self.logger.debug(f"Client for {self.phone_number} started successfully.")
+                return self
+            except Exception as e:
+                attempt += 1
+                self.logger.error(f"Failed to connect client for {self.phone_number} (attempt {attempt}/{retries}): {e}")
+                if attempt < retries:
+                    await asyncio.sleep(delay)
+                else:
+                    raise
 
     @classmethod
     async def connect_clients(cls, accounts, logger):
@@ -242,7 +252,7 @@ class Client(object):
             discussion_chat = discussion.chats[0]
             
             # Text typing speed should be added to simulate properly
-            
+
             # await asyncio.sleep(random.uniform(0.5, 2))  # Prevent spam if everything is broken
 
             await self.client.send_message(
@@ -310,38 +320,90 @@ class Client(object):
     # Actions
 
     async def undo_reaction(self, message_id: int=None, chat_id: str=None, message_link:str=None):
-        if message_link:
-            entity, message = await self._get_message_ids(message_link)
-        else:
-            entity = await self.client.get_entity(chat_id)
-            message = await self.client.get_messages(entity, ids=message_id)
-        await self._undo_reaction(message, entity)
+        retries = config.get('delays', {}).get('action_retries', 3)
+        delay = config.get('delays', {}).get('action_retry_delay', 3)
+        attempt = 0
+        while attempt < retries:
+            try:
+                if message_link:
+                    entity, message = await self._get_message_ids(message_link)
+                else:
+                    entity = await self.client.get_entity(chat_id)
+                    message = await self.client.get_messages(entity, ids=message_id)
+                await self._undo_reaction(message, entity)
+                return
+            except Exception as e:
+                attempt += 1
+                self.logger.warning(f"undo_reaction failed (attempt {attempt}/{retries}): {e}")
+                if attempt < retries:
+                    await asyncio.sleep(delay)
+                else:
+                    raise
 
     async def undo_comment(self, message_id: int=None, chat_id: str=None, message_link:str=None):
-        if message_link:
-            entity, message = await self._get_message_ids(message_link)
-        else:
-            entity = await self.client.get_entity(chat_id)
-            message = await self.client.get_messages(entity, ids=message_id)
-        await self._undo_comment(message, entity)
+        retries = config.get('delays', {}).get('action_retries', 3)
+        delay = config.get('delays', {}).get('action_retry_delay', 3)
+        attempt = 0
+        while attempt < retries:
+            try:
+                if message_link:
+                    entity, message = await self._get_message_ids(message_link)
+                else:
+                    entity = await self.client.get_entity(chat_id)
+                    message = await self.client.get_messages(entity, ids=message_id)
+                await self._undo_comment(message, entity)
+                return
+            except Exception as e:
+                attempt += 1
+                self.logger.warning(f"undo_comment failed (attempt {attempt}/{retries}): {e}")
+                if attempt < retries:
+                    await asyncio.sleep(delay)
+                else:
+                    raise
 
     async def react(self, message_id:int=None, chat_id:str=None, message_link:str=None):
         """React to a message by its ID in a specific chat."""
-        if message_link:
-            entity, message = await self._get_message_ids(message_link)
-        else:
-            entity = await self.client.get_entity(chat_id)
-            message = await self.client.get_messages(entity, ids=message_id)
-        await self._react(message, entity)
+        retries = config.get('delays', {}).get('action_retries', 3)
+        delay = config.get('delays', {}).get('action_retry_delay', 3)
+        attempt = 0
+        while attempt < retries:
+            try:
+                if message_link:
+                    entity, message = await self._get_message_ids(message_link)
+                else:
+                    entity = await self.client.get_entity(chat_id)
+                    message = await self.client.get_messages(entity, ids=message_id)
+                await self._react(message, entity)
+                return
+            except Exception as e:
+                attempt += 1
+                self.logger.warning(f"react failed (attempt {attempt}/{retries}): {e}")
+                if attempt < retries:
+                    await asyncio.sleep(delay)
+                else:
+                    raise
 
     async def comment(self, content, message_id:int=None, chat_id:str=None, message_link:str=None):
         """Comment on a message by its ID in a specific chat."""
-        if message_link:
-            entity, message = await self._get_message_ids(message_link)
-        else:
-            entity = await self.client.get_entity(chat_id)
-            message = await self.client.get_messages(entity, ids=message_id)
-        await self._comment(message=message, entity=entity, content=content)
+        retries = config.get('delays', {}).get('action_retries', 3)
+        delay = config.get('delays', {}).get('action_retry_delay', 3)
+        attempt = 0
+        while attempt < retries:
+            try:
+                if message_link:
+                    entity, message = await self._get_message_ids(message_link)
+                else:
+                    entity = await self.client.get_entity(chat_id)
+                    message = await self.client.get_messages(entity, ids=message_id)
+                await self._comment(message=message, entity=entity, content=content)
+                return
+            except Exception as e:
+                attempt += 1
+                self.logger.warning(f"comment failed (attempt {attempt}/{retries}): {e}")
+                if attempt < retries:
+                    await asyncio.sleep(delay)
+                else:
+                    raise
 
 
 
