@@ -2,26 +2,21 @@
 
 ### TO DO:
 
-Must:
+- add account status as meta
+- implement various exception messages for client errors
+
 
 - implement task report logic (task, date, status, errors from accounts (async exception handling))
 - add api for task import
-- add account status as meta
 
-Should:
+
 - automate an provide manual way of session verification
 - route account to session creation for first use
-- implement various exception messages for client errors
+
 - add creation of neccessary files if they dont exist
 - add check for validated posts if they still exist
 - implement time tracking into logs or abandon it
-
-Could:
 - implement proxy logic (import, status, links to accounts)
-
-
-### Questions:
-- 123
 
 
 ## Changelog

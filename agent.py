@@ -19,6 +19,7 @@ config = load_config()
 
 
 class Account(object):
+    
     def __init__(self, account_data):
         try:
             self.account_id = account_data.get('account_id', None)
@@ -44,13 +45,6 @@ class Account(object):
             'phone_number': self.phone_number
         }
 
-    async def create_connection(self):
-        """Create a TelegramClient connection."""
-        client = Client(self)  # Create Client instance
-        await client.connect()  # Connect the client
-        client.logger.info(f"Client for {self.phone_number} connected successfully.")  # Use self.logger instead of client.logger
-        return client
-
     @classmethod
     def from_keys(cls, phone_number, account_id=None, session_name=None):
         """Create an Account object from a dictionary."""
@@ -60,6 +54,22 @@ class Account(object):
             'phone_number': phone_number
         }
         return cls(account_data)
+
+
+
+    async def create_connection(self):
+        """Create a TelegramClient connection from account, useful for debugging."""
+        client = Client(self)  # Create Client instance
+        await client.connect()  # Connect the client
+        client.logger.info(f"Client for {self.phone_number} connected successfully.")  # Use self.logger instead of client.logger
+        return client
+
+    @classmethod
+    def get_accounts(cls, phones:list):
+        """Get a list of Account objects from a list of phone numbers."""
+        return [elem for elem in Account.load_accounts() if elem.phone_number in phones]
+
+
 
     @classmethod
     def load_accounts(cls, file_path=config.get('filepaths', {}).get('accounts', 'accounts.json')):
@@ -106,11 +116,47 @@ class Account(object):
             cls._save_accounts_to_csv(accounts, file_path)
         else:
             raise ValueError("Unsupported file type. Use 'json' or 'csv'.")
-        
+    
     @classmethod
-    def get_accounts(cls, phones:list):
-        """Get a list of Account objects from a list of phone numbers."""
-        return [elem for elem in Account.load_accounts() if elem.phone_number in phones]
+    def add_account(cls, account_data, file_path=config.get('filepaths', {}).get('accounts', 'accounts.json')):
+        """Add a new account to the accounts file."""
+        accounts = cls.load_accounts(file_path)
+        accounts.append(cls(account_data))
+        cls.save_accounts(accounts, file_path)
+        return True
+
+    @classmethod
+    def load_account(cls, phone_number, file_path=config.get('filepaths', {}).get('accounts', 'accounts.json')):
+        """Read an account by phone number."""
+        accounts = cls.load_accounts(file_path)
+        for acc in accounts:
+            if acc.phone_number == phone_number:
+                return acc
+        return None
+
+    @classmethod
+    def update_account(cls, phone_number, update_data, file_path=config.get('filepaths', {}).get('accounts', 'accounts.json')):
+        """Update an account by phone number."""
+        accounts = cls.load_accounts(file_path)
+        updated = False
+        for acc in accounts:
+            if acc.phone_number == phone_number:
+                for k, v in update_data.items():
+                    setattr(acc, k, v)
+                updated = True
+        if updated:
+            cls.save_accounts(accounts, file_path)
+        return updated
+
+    @classmethod
+    def delete_account(cls, phone_number, file_path=config.get('filepaths', {}).get('accounts', 'accounts.json')):
+        """Delete an account by phone number."""
+        accounts = cls.load_accounts(file_path)
+        new_accounts = [acc for acc in accounts if acc.phone_number != phone_number]
+        if len(new_accounts) != len(accounts):
+            cls.save_accounts(new_accounts, file_path)
+            return True
+        return False
 
 
 
@@ -160,6 +206,7 @@ class Client(object):
                 )
                 await self.client.start()
                 self.logger.debug(f"Client for {self.phone_number} started successfully.")
+                await self.update_account_id_from_telegram()
                 return self
             except Exception as e:
                 attempt += 1
@@ -227,6 +274,19 @@ class Client(object):
         except Exception as e:
             self.logger.warning(f"Error retrieving message content: {e}")
             return None
+
+    async def update_account_id_from_telegram(self):
+        """Fetch account id from Telegram and update the account record in accounts file."""
+        await self.ensure_connected()
+        me = await self.client.get_me()
+        account_id = me.id if hasattr(me, 'id') else None
+        if account_id:
+            from agent import Account  # Avoid circular import if any
+            Account.update_account(self.phone_number, {'account_id': account_id})
+            self.logger.info(f"Updated account_id for {self.phone_number} to {account_id}")
+            self.account.account_id = account_id
+        else:
+            self.logger.warning("Could not fetch account_id from Telegram.")
 
     # Basic actions
 
