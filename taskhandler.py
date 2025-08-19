@@ -221,6 +221,7 @@ class Task:
         self._pause_event = asyncio.Event()
         self._pause_event.set()  # Initially not paused
         self._task = None
+        self._clients = None  # Store connected clients for pause/resume
 
     def __repr__(self):
         return f"Task({self.task_id}, {self.name}, {self.status}, {self.created_at}, {self.updated_at})"
@@ -293,10 +294,10 @@ class Task:
             accounts = self.get_accounts()
             posts = self.get_posts()
 
-            # Check for pause before connecting clients
-            await self._check_pause()
-            
-            clients = await Client.connect_clients(accounts, self.logger)
+            await self._check_pause()  # Check for pause before connecting clients
+
+            self._clients = await Client.connect_clients(accounts, self.logger)
+            clients = self._clients
 
             if self.has_action_type('react'):
                 current_emojis = self.get_reaction_emojis()  # Get reaction palette
@@ -304,16 +305,16 @@ class Task:
                 for client in clients:
                     client.active_emoji_palette = current_emojis
 
-                # Check for pause before validation
-                await self._check_pause()
-                
+
+                await self._check_pause()  # Check for pause before validation
+
                 if clients:
                     await Post.mass_validate_posts(posts, clients[0], self.logger)
 
-                # React to posts with pause checking
+                # React to posts
                 for post in posts:
                     await self._check_pause()  # Check pause before each post
-                    
+                    clients = self._clients  # Always use the latest connected clients after pause
                     if post.is_validated:
                         for i, client in enumerate(clients):
                             try:
@@ -321,32 +322,17 @@ class Task:
                                 self.logger.debug(f"Client {i} reacted to post {post.post_id}")
                             except Exception as e:
                                 self.logger.warning(f"Client {i} failed to react to post {post.post_id}: {e}")
-                        self.logger.info(f"Reacted to post {post.post_id} with {self.get_reaction_palette_name()}")
-
-                # Disconnect clients
-                for client in clients:
-                    try:
-                        await client.client.disconnect()
-                    except Exception as e:
-                        self.logger.warning(f"Error disconnecting client: {e}")
+                        self.logger.info(f"All clients have reacted to post {post.post_id} with {self.get_reaction_palette_name()}")
+           
+                self._clients = await Client.disconnect_clients(clients, self.logger)
 
             if self.has_action_type('comment'):
-            # Logic to handle comment actions can be added here
+                # Logic to handle comment actions can be added here
                 self.logger.info("Comment actions are not implemented yet.")
-                # Disconnect clients
-                for client in clients:
-                    try:
-                        await client.client.disconnect()
-                    except Exception as e:
-                        self.logger.warning(f"Error disconnecting client: {e}")
+                self._clients = await Client.disconnect_clients(clients, self.logger)
                 pass
             if len(self.get_actions()) == 0:
-                # Disconnect clients
-                for client in clients:
-                    try:
-                        await client.client.disconnect()
-                    except Exception as e:
-                        self.logger.warning(f"Error disconnecting client: {e}")
+                self._clients = await Client.disconnect_clients(clients, self.logger)
                 raise ValueError("No actions defined for the task.")
             
             self.status = Task.TaskStatus.FINISHED
@@ -355,24 +341,12 @@ class Task:
         except asyncio.CancelledError:
             self.logger.info(f"Task {self.task_id} was cancelled.")
             self.status = Task.TaskStatus.FINISHED
-            # Disconnect clients
-            for client in clients:
-                try:
-                    await client.client.disconnect()
-                except Exception as e:
-                    self.logger.warning(f"Error disconnecting client: {e}")
-
+            self._clients = await Client.disconnect_clients(clients, self.logger)
             self.updated_at = Timestamp.now()
         except Exception as e:
             self.logger.error(f"Error starting task {self.task_id}: {e}")
             self.status = Task.TaskStatus.CRASHED
-            # Disconnect clients
-            for client in clients:
-                try:
-                    await client.client.disconnect()
-                except Exception as e:
-                    self.logger.warning(f"Error disconnecting client: {e}")
-
+            self._clients = await Client.disconnect_clients(clients, self.logger)
             self.updated_at = Timestamp.now()
             raise e
 
@@ -399,13 +373,25 @@ class Task:
             self.logger.info(f"Task {self.task_id} resumed.")
 
     async def _check_pause(self):
-        """Check if task should be paused and wait if needed."""
+        """Check if task should be paused and wait if needed. Disconnect clients on pause, reconnect on resume."""
         if not self._pause_event.is_set():
             self.status = Task.TaskStatus.PAUSED
-            self.logger.info(f"Task {self.task_id} is paused, waiting to resume...")
+            self.logger.info(f"Task {self.task_id} is paused, disconnecting clients and waiting to resume...")
+            # Disconnect clients if connected
+            if self._clients:
+                for client in self._clients:
+                    try:
+                        await client.client.disconnect()
+                    except Exception as e:
+                        self.logger.warning(f"Error disconnecting client: {e}")
+                self._clients = None
             await self._pause_event.wait()
             self.status = Task.TaskStatus.RUNNING
-            self.logger.info(f"Task {self.task_id} resumed.")
+            self.logger.info(f"Task {self.task_id} resumed. Reconnecting clients...")
+            # Reconnect clients
+            accounts = self.get_accounts()
+            self._clients = await Client.connect_clients(accounts, self.logger)
+
 
     async def get_status(self):
         """Get the current status of the task."""

@@ -13,6 +13,8 @@ Should:
 - route account to session creation for first use
 - implement various exception messages for client errors
 - add creation of neccessary files if they dont exist
+- add check for validated posts if they still exist
+- implement time tracking into logs or abandon it
 
 Could:
 - implement proxy logic (import, status, links to accounts)

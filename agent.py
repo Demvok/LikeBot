@@ -149,14 +149,15 @@ class Client(object):
             self.logger.info(f"Client for {self.phone_number} disconnected.")
 
     async def connect(self):
-        """Connect to Telegram with retry logic."""
         retries = config.get('delays', {}).get('connection_retries', 5)
         delay = config.get('delays', {}).get('reconnect_delay', 3)
-
         attempt = 0
         while attempt < retries:
             try:
-                self.client = TelegramClient(f'{config.get('filepaths', {}).get('sessions_folder', 'sessions/')}{self.session_name}', api_id, api_hash)
+                self.client = TelegramClient(
+                    f"{config.get('filepaths', {}).get('sessions_folder', 'sessions/')}{self.session_name}",
+                    api_id, api_hash
+                )
                 await self.client.start()
                 self.logger.debug(f"Client for {self.phone_number} started successfully.")
                 return self
@@ -167,6 +168,20 @@ class Client(object):
                     await asyncio.sleep(delay)
                 else:
                     raise
+
+    async def disconnect(self):
+        """Disconnect the client."""
+        retries = config.get('delays', {}).get('connection_retries', 5)
+        delay = config.get('delays', {}).get('reconnect_delay', 3)
+
+        if self.client:
+            await self.client.disconnect()
+            self.logger.info(f"Client for {self.phone_number} disconnected.")
+
+    async def ensure_connected(self):
+        if not self.client or not self.client.is_connected():
+            self.logger.info(f"Client for {self.phone_number} is not connected. Reconnecting...")
+            await self.connect()
 
     @classmethod
     async def connect_clients(cls, accounts, logger):
@@ -183,12 +198,22 @@ class Client(object):
             logger.info(f"Connected clients for {len(clients)} accounts.")
         
         return clients if clients else None
+    
+    @classmethod
+    async def disconnect_clients(cls, clients, logger):
+        for client in clients:
+            try:
+               await client.disconnect()
+            except Exception as e:
+                logger.warning(f"Error disconnecting client: {e}")
+        return None  # Return None to indicate all clients are disconnected
 
     async def get_message_content(self, chat_id=None, message_id=None, message_link=None):
         """
         Retrieve the content of a single message by chat and message_id.
         """
         try:
+            await self.ensure_connected()
             if message_link and not (message_id and chat_id):
                 entity, message = await self._get_message_ids(message_link)
                 return message.message if message else None
@@ -207,13 +232,15 @@ class Client(object):
 
     async def _react(self, message, target_chat):
         try:
-            msg_content = await self.get_message_content(chat_id=target_chat, message_id=message.id)
-            if not msg_content:
-                self.logger.warning("Message content is empty, skipping reaction.")
-                return
-            reading_time = estimate_reading_time(msg_content)
-            self.logger.debug(f"Estimated reading time: {reading_time} seconds")
-            await asyncio.sleep(reading_time)
+            await self.ensure_connected()
+            if config.get('delays', {}).get('humanisation_level', 1) >= 1:  # If humanisation level is 1 or higher it should consider reading time
+                msg_content = await self.get_message_content(chat_id=target_chat, message_id=message.id)
+                if not msg_content:
+                    self.logger.warning("Message content is empty, skipping reaction.")
+                    return
+                reading_time = estimate_reading_time(msg_content)
+                self.logger.debug(f"Estimated reading time: {reading_time} seconds")
+                await asyncio.sleep(reading_time)
 
             if not self.active_emoji_palette:
                 # Load emoji palette from config
@@ -236,10 +263,12 @@ class Client(object):
 
     async def _comment(self, message, target_chat, content):
         try:
-            msg_content = await self.get_message_content(chat_id=target_chat, message_id=message.id)
-            reading_time = estimate_reading_time(msg_content)
-            self.logger.debug(f"Estimated reading time: {reading_time} seconds")
-            await asyncio.sleep(reading_time)
+            await self.ensure_connected()
+            if config.get('delays', {}).get('humanisation_level', 1) >= 1:  # If humanisation level is 1 or higher it should consider reading time
+                msg_content = await self.get_message_content(chat_id=target_chat, message_id=message.id)
+                reading_time = estimate_reading_time(msg_content)
+                self.logger.debug(f"Estimated reading time: {reading_time} seconds")
+                await asyncio.sleep(reading_time)
 
             discussion = await self.client(functions.messages.GetDiscussionMessageRequest(
                 peer=target_chat,
@@ -253,7 +282,7 @@ class Client(object):
             
             # Text typing speed should be added to simulate properly
 
-            # await asyncio.sleep(random.uniform(0.5, 2))  # Prevent spam if everything is broken
+            await asyncio.sleep(random.uniform(0.5, 2))  # Prevent spam if everything is broken
 
             await self.client.send_message(
                 entity=discussion_chat,
@@ -266,6 +295,8 @@ class Client(object):
 
     async def _undo_reaction(self, message, target_chat):
         try:
+            await self.ensure_connected()
+            await asyncio.sleep(random.uniform(0.5, 1))  # Prevent spam if everything is broken
             await self.client(SendReactionRequest(
                 peer=target_chat,
                 msg_id=message.id,
@@ -281,6 +312,8 @@ class Client(object):
         Deletes all user comments on given post.
         """
         try:
+            await self.ensure_connected()
+            await asyncio.sleep(random.uniform(0.5, 1))  # Prevent spam if everything is broken
             discussion = await self.client(functions.messages.GetDiscussionMessageRequest(
                 peer=target_chat,
                 msg_id=message.id
@@ -309,7 +342,8 @@ class Client(object):
         else:
             # For public, chat_part is username
             chat_id = chat_part
-
+        
+        await self.ensure_connected()
         # Get entity and message using TelegramClient
         entity = await self.client.get_entity(chat_id)
         message = await self.client.get_messages(entity, ids=message_id)

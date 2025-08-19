@@ -33,6 +33,7 @@ min_periods_cnt = 1
 max_periods_cnt = 5
 
 def get_general_activity_period(profile_id=None):
+    # TO BE DELETED
     if profile_id is not None:
         profile = profiles[profile_id]
     else:
@@ -41,6 +42,7 @@ def get_general_activity_period(profile_id=None):
 
 
 def get_profile_activity_periods(profile_id=None, n_periods=None):
+    # TO BE DELETED: currently it is very hard and not neccessary to implement connection handling for each client in each task
 
     if profile_id is not None:
         profile = profiles[profile_id]
