@@ -62,11 +62,12 @@ class Account(object):
         return cls(account_data)
 
     @classmethod
-    def get_accounts(cls, phones:list):
+    async def get_accounts(cls, phones:list):
         """Get a list of Account objects from a list of phone numbers."""
         from database import get_db
         db = get_db()
-        return [elem for elem in db.load_all_accounts() if elem.phone_number in phones]
+        all_accounts = await db.load_all_accounts()
+        return [elem for elem in all_accounts if elem.phone_number in phones]
 
 
 
@@ -203,7 +204,7 @@ class Client(object):
         if account_id:
             from database import get_db  # Avoid circular import if any
             db = get_db()
-            db.update_account(self.phone_number, {'account_id': account_id})
+            await db.update_account(self.phone_number, {'account_id': account_id})
             self.logger.info(f"Updated account_id for {self.phone_number} to {account_id}")
             self.account.account_id = account_id
         else:

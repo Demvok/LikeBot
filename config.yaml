@@ -8,7 +8,7 @@ filepaths:  # File paths for various resources
   accounts: "accounts.json"
   posts: "posts.json"
   tasks: "tasks.json"
-  sessions_folder: "sessions/" ###
+  sessions_folder: "sessions/"
 
 reactions_palettes:
   positive:

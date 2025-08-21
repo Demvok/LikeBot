@@ -1,206 +1,197 @@
-import asyncio
-import aiosqlite
-import uuid
-import json
-import os
-import time
-import signal
-from datetime import datetime
+import asyncio, uuid, signal
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List
+import motor.motor_asyncio
+from pymongo import IndexModel
+from pymongo import ASCENDING
+from pymongo.write_concern import WriteConcern
 
-# TEMPORARY UNUSABLE
+# CONFIG
+MONGO_URI = "mongodb://localhost:27017"
+DB_NAME = "task_reporting"
+EVENTS_COLL = "events"
+RUNS_COLL = "task_runs"
+
+BATCH_SIZE = 100
+BATCH_TIMEOUT = 0.5  # seconds
 
 
-DB_PATH = "task_reports.db"
-JSONL_DIR = "task_reports_jsonl"
-BATCH_SIZE = 50
-BATCH_TIMEOUT = 0.5  # сек
+def utc_now():
+    return datetime.now(timezone.utc)
 
-os.makedirs(JSONL_DIR, exist_ok=True)
+class MongoReporter:
+    def __init__(self, client: motor.motor_asyncio.AsyncIOMotorClient, db_name: str = DB_NAME):
+        self.client = client
+        self.db = client[db_name]
+        # Use majority write concern + journaling for durability guarantees (requires replica set for true majority)
+        self.events_coll = self.db.get_collection(EVENTS_COLL, write_concern=WriteConcern(w="majority", j=True))
+        self.runs_coll = self.db.get_collection(RUNS_COLL, write_concern=WriteConcern(w="majority", j=True))
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self._writer_task: Optional[asyncio.Task] = None
+        self._stop_event = asyncio.Event()
 
-def now_iso():
-    return datetime.utcnow().isoformat() + "Z"
+    async def init(self):
+        # Create indexes (idempotent)
+        await self.runs_coll.create_index([("run_id", ASCENDING)], unique=True)
+        # Index events by run_id, ts for fast querying by run
+        await self.events_coll.create_indexes([
+            IndexModel([("run_id", ASCENDING), ("ts", ASCENDING)]),
+            IndexModel([("task_id", ASCENDING)]),
+            IndexModel([("level", ASCENDING)]),
+            IndexModel([("code", ASCENDING)])
+        ])
 
-async def init_db(db_path=DB_PATH):
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute("PRAGMA journal_mode=WAL;")
-        await db.execute("PRAGMA synchronous=FULL;")
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS task_runs (
-            run_id TEXT PRIMARY KEY,
-            task_id TEXT,
-            started_at TEXT,
-            finished_at TEXT,
-            status TEXT,
-            meta JSON
-        );
-        """)
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_id TEXT,
-            task_id TEXT,
-            ts TEXT,
-            level TEXT,      -- INFO/ERROR/DEBUG
-            code TEXT,       -- machine-readable code
-            message TEXT,
-            payload JSON
-        );
-        """)
-        await db.commit()
-
-class TaskReporter:
-    def __init__(self, queue: asyncio.Queue):
-        self.queue = queue
-
-    async def new_run(self, task_id: str, meta: dict | None = None):
+    # ---- Public reporter API used by workers ----
+    async def new_run(self, task_id: str, meta: Optional[Dict[str, Any]] = None) -> str:
         run_id = str(uuid.uuid4())
-        await self.queue.put({
-            "type": "run_start",
+        doc = {
             "run_id": run_id,
             "task_id": task_id,
-            "ts": now_iso(),
+            "started_at": utc_now(),
+            "finished_at": None,
+            "status": "running",
             "meta": meta or {}
-        })
+        }
+        # write run doc immediately for stronger traceability
+        await self.runs_coll.insert_one(doc)
         return run_id
 
-    async def end_run(self, run_id: str, task_id: str, status: str, meta: dict | None = None):
-        await self.queue.put({
-            "type": "run_end",
-            "run_id": run_id,
-            "task_id": task_id,
-            "ts": now_iso(),
-            "status": status,
-            "meta": meta or {}
-        })
+    async def end_run(self, run_id: str, status: str = "success", meta_patch: Optional[Dict[str, Any]] = None):
+        update = {"$set": {"finished_at": utc_now(), "status": status}}
+        if meta_patch:
+            update["$set"]["meta"] = meta_patch
+        await self.runs_coll.update_one({"run_id": run_id}, update)
 
-    async def event(self, run_id: str, task_id: str, level: str, code: str, message: str, payload: dict | None = None):
-        await self.queue.put({
+    async def event(self, run_id: str, task_id: str, level: str, code: str, message: str, payload: Optional[Dict[str, Any]] = None):
+        item = {
             "type": "event",
             "run_id": run_id,
             "task_id": task_id,
-            "ts": now_iso(),
+            "ts": utc_now(),
             "level": level,
             "code": code,
             "message": message,
             "payload": payload or {}
-        })
+        }
+        await self.queue.put(item)
 
-async def writer_loop(queue: asyncio.Queue, db_path=DB_PATH, jsonl_dir=JSONL_DIR, stop_event: asyncio.Event = None):
-    """
-    Беремо записи з черги, записуємо батчами в SQLite та в JSONL.
-    """
-    await init_db(db_path)
-    jsonl_files = {}  # run_id -> open file handle
-    async with aiosqlite.connect(db_path) as db:
-        # великий цикл
-        buffer = []
-        last_flush = time.time()
-
-        async def flush_buffer():
-            nonlocal buffer, db
-            if not buffer:
-                return
-            # запис у DB в транзакції
-            async with db.execute("BEGIN"):
-                for item in buffer:
-                    if item["type"] == "run_start":
-                        await db.execute(
-                            "INSERT OR REPLACE INTO task_runs (run_id, task_id, started_at, status, meta) VALUES (?, ?, ?, ?, ?)",
-                            (item["run_id"], item["task_id"], item["ts"], "running", json.dumps(item["meta"]))
-                        )
-                    elif item["type"] == "run_end":
-                        await db.execute(
-                            "UPDATE task_runs SET finished_at = ?, status = ?, meta = json_patch(meta, ?) WHERE run_id = ?",
-                            (item["ts"], item["status"], json.dumps(item["meta"]), item["run_id"])
-                        )
-                    elif item["type"] == "event":
-                        await db.execute(
-                            "INSERT INTO events (run_id, task_id, ts, level, code, message, payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            (item["run_id"], item["task_id"], item["ts"], item["level"], item["code"], item["message"], json.dumps(item["payload"]))
-                        )
-            await db.commit()
-
-            # JSONL mirror
-            for item in buffer:
-                run_file = os.path.join(jsonl_dir, f"{item['run_id']}.jsonl")
-                # append line atomically
-                line = json.dumps(item, ensure_ascii=False) + "\n"
-                # open/append and fsync
-                with open(run_file, "a", encoding="utf-8") as f:
-                    f.write(line)
-                    f.flush()
-                    os.fsync(f.fileno())
-
-            buffer = []
+    # ---- Background writer ----
+    async def _writer_loop(self):
+        buffer: List[Dict[str, Any]] = []
+        last_flush = asyncio.get_running_loop().time()
 
         while True:
+            # stop condition: stop_event set and queue empty and buffer flushed
+            if self._stop_event.is_set() and self.queue.empty() and not buffer:
+                break
+
             try:
                 try:
-                    item = await asyncio.wait_for(queue.get(), timeout=BATCH_TIMEOUT)
+                    # wait for item or timeout
+                    item = await asyncio.wait_for(self.queue.get(), timeout=BATCH_TIMEOUT)
+                    buffer.append(item)
+                    self.queue.task_done()
                 except asyncio.TimeoutError:
                     item = None
 
-                if item is not None:
-                    buffer.append(item)
-                    queue.task_done()
-
-                # Накопичили достатньо або таймаут/зовнішній stop
-                if (len(buffer) >= BATCH_SIZE) or (time.time() - last_flush >= BATCH_TIMEOUT) or (stop_event and stop_event.is_set() and buffer):
-                    await flush_buffer()
-                    last_flush = time.time()
-
-                if stop_event and stop_event.is_set():
-                    # перед виходом — переконатися, що черга пуста
-                    # Drain queue quickly
-                    while True:
-                        try:
-                            item = queue.get_nowait()
-                            buffer.append(item)
-                            queue.task_done()
-                            if len(buffer) >= BATCH_SIZE:
-                                await flush_buffer()
-                        except asyncio.QueueEmpty:
-                            break
-                    if buffer:
-                        await flush_buffer()
-                    break
+                now = asyncio.get_running_loop().time()
+                if buffer and (len(buffer) >= BATCH_SIZE or (now - last_flush) >= BATCH_TIMEOUT or (self._stop_event.is_set() and self.queue.empty())):
+                    # prepare documents for insert
+                    docs = []
+                    for it in buffer:
+                        # Normalize fields if necessary (Mongo can store datetimes directly)
+                        docs.append({
+                            "run_id": it["run_id"],
+                            "task_id": it["task_id"],
+                            "ts": it["ts"],
+                            "level": it["level"],
+                            "code": it["code"],
+                            "message": it["message"],
+                            "payload": it["payload"]
+                        })
+                    # unordered insert for speed and resilience; write concern handled by collection's WriteConcern
+                    try:
+                        await self.events_coll.insert_many(docs, ordered=False)
+                    except Exception as e:
+                        # handle partial failures — you might want to log this to stderr or another collection
+                        print("Warning: insert_many failed:", e)
+                        # fallback: try inserting one-by-one (so nothing is silently lost)
+                        for doc in docs:
+                            try:
+                                await self.events_coll.insert_one(doc)
+                            except Exception as ex:
+                                # If even single insert fails, store minimal failure record in runs collection
+                                await self.runs_coll.update_one({"run_id": doc["run_id"]}, {"$set": {"status": "persist_error"}})
+                                print("Failed to persist doc:", ex)
+                    buffer = []
+                    last_flush = now
 
             except Exception as exc:
-                # У реальному коді — використовуй backoff, логування в stderr та retry
-                print("Writer error:", exc)
+                # transient writer-level errors; avoid tight loop
+                print("Writer loop error:", exc)
                 await asyncio.sleep(0.2)
 
-async def example_worker(task_id: str, reporter: TaskReporter):
-    run_id = await reporter.new_run(task_id, meta={"info": "demo"})
-    try:
-        # симуляція подій
+    async def start(self):
+        await self.init()
+        self._writer_task = asyncio.create_task(self._writer_loop())
+
+    async def stop(self):
+        # signal stop, wait for writer to flush remaining items
+        self._stop_event.set()
+        if self._writer_task:
+            await self._writer_task
+        # optionally close client
+        self.client.close()
+
+    # Convenient context manager for a run
+    async def run_context(self, task_id: str, meta: Optional[Dict[str, Any]] = None):
+        """
+        Async context manager usage:
+        async with reporter.run_context("task-1") as run_id:
+            await reporter.event(...)
+        """
+        class _RunCtx:
+            def __init__(self, reporter, task_id, meta):
+                self.reporter = reporter
+                self.task_id = task_id
+                self.meta = meta
+                self.run_id = None
+            async def __aenter__(self):
+                self.run_id = await self.reporter.new_run(self.task_id, self.meta)
+                return self.run_id
+            async def __aexit__(self, exc_type, exc, tb):
+                if exc:
+                    await self.reporter.event(self.run_id, self.task_id, "ERROR", "exception", str(exc), {"exc_type": str(exc_type)})
+                    await self.reporter.end_run(self.run_id, status="failed", meta_patch={"error": str(exc)})
+                else:
+                    await self.reporter.end_run(self.run_id, status="success")
+        return _RunCtx(self, task_id, meta)
+
+# ---------------- Example usage ----------------
+
+async def example_worker(task_id: str, reporter: MongoReporter):
+    # using context manager
+    async with await reporter.run_context(task_id, meta={"info": "demo"}) as run_id:
         await reporter.event(run_id, task_id, "INFO", "step.started", "Start step 1", {"step": 1})
-        await asyncio.sleep(0.1)
-        await reporter.event(run_id, task_id, "INFO", "step.progress", "Progress 50%", {"progress": 50})
-        # проблема
-        # raise ValueError("Simulated failure")
+        await asyncio.sleep(0.2)
+        await reporter.event(run_id, task_id, "INFO", "step.progress", "50% done", {"progress": 50})
+        # simulate error:
+        # raise RuntimeError("Simulated")
         await reporter.event(run_id, task_id, "INFO", "step.finished", "Step 1 done", {"step": 1})
-        await reporter.end_run(run_id, task_id, status="success")
-    except Exception as e:
-        await reporter.event(run_id, task_id, "ERROR", "exception", str(e), {"exc_type": type(e).__name__})
-        await reporter.end_run(run_id, task_id, status="failed", meta={"error": str(e)})
 
 async def main():
-    queue = asyncio.Queue()
-    reporter = TaskReporter(queue)
-    stop_event = asyncio.Event()
+    client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+    reporter = MongoReporter(client)
+    await reporter.start()
 
-    # починаємо writer
-    writer_task = asyncio.create_task(writer_loop(queue, stop_event=stop_event))
-
-    # налаштування graceful shutdown
+    # graceful shutdown on signals
     loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop_event.set)
+        loop.add_signal_handler(sig, stop.set)
 
-    # запускаємо кілька робіт
     workers = [asyncio.create_task(example_worker(f"task-{i}", reporter)) for i in range(5)]
     await asyncio.gather(*workers)
-    # все готово — ставимо stop
-    stop_event.set()
-    await writer_task
+
+    # stop reporter and flush
+    await reporter.stop()

@@ -16,8 +16,9 @@
 - implement time tracking into logs or abandon it
 - implement proxy logic (import, status, links to accounts)
 
-- check for id type consistency
-- 
+- check for id data type consistency
+- ? move sessions into MongoDB
+- update task status during run
 
 ### Questions
 - Should I implement 2nd layer of humanisation or drop it?

@@ -83,7 +83,7 @@ class Post:
         self.chat_id = chat_id
         self.message_id = message_id
         self.updated_at = Timestamp.now()
-        db.update_post(self)
+        await db.update_post(self, {'chat_id': chat_id, 'message_id': message_id})
         return self
     
     @classmethod
@@ -164,14 +164,15 @@ class Task:
 
 # Property methods
 
-    def get_posts(self):
+    async def get_posts(self):
         """Get a list of Post objects from a list of post IDs."""
         from database import get_db
         db = get_db()
-        return [elem for elem in db.load_all_posts() if elem.post_id in self.post_ids]
-    
-    def get_accounts(self):
-        return Account.get_accounts(self.accounts)
+        all_posts = await db.load_all_posts()
+        return [elem for elem in all_posts if elem.post_id in self.post_ids]
+
+    async def get_accounts(self):
+        return await Account.get_accounts(self.accounts)
 
     def get_actions(self):
         """Get all actions as a list."""
@@ -204,8 +205,8 @@ class Task:
 
     async def _run(self):
         try:
-            accounts = self.get_accounts()
-            posts = self.get_posts()
+            accounts = await self.get_accounts()
+            posts = await self.get_posts()
 
             await self._check_pause()  # Check for pause before connecting clients
             self._clients = await Client.connect_clients(accounts, self.logger)
