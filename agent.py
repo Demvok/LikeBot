@@ -1,5 +1,4 @@
-import re, yaml, json, os, random, asyncio
-from pandas import read_csv, DataFrame
+import re, yaml, os, random, asyncio
 from telethon.tl.functions.messages import SendReactionRequest, GetMessagesRequest
 from telethon import TelegramClient, functions, types
 from logger import setup_logger
@@ -28,7 +27,7 @@ class Account(object):
         except KeyError as e:
             raise ValueError(f"Missing key in account configuration: {e}")
 
-        if  self.session_name is None:
+        if  self.session_name is None:  # Session creation should be linked somewhere here
             self.session_name = self.phone_number
     
     def __repr__(self):
@@ -45,6 +44,13 @@ class Account(object):
             'phone_number': self.phone_number
         }
 
+    async def create_connection(self):
+        """Create a TelegramClient connection from account, useful for debugging."""
+        client = Client(self)
+        await client.connect()
+        client.logger.info(f"Client for {self.phone_number} connected successfully.")  # Use self.logger instead of client.logger
+        return client
+
     @classmethod
     def from_keys(cls, phone_number, account_id=None, session_name=None):
         """Create an Account object from a dictionary."""
@@ -55,108 +61,12 @@ class Account(object):
         }
         return cls(account_data)
 
-
-
-    async def create_connection(self):
-        """Create a TelegramClient connection from account, useful for debugging."""
-        client = Client(self)  # Create Client instance
-        await client.connect()  # Connect the client
-        client.logger.info(f"Client for {self.phone_number} connected successfully.")  # Use self.logger instead of client.logger
-        return client
-
     @classmethod
     def get_accounts(cls, phones:list):
         """Get a list of Account objects from a list of phone numbers."""
-        return [elem for elem in Account.load_accounts() if elem.phone_number in phones]
-
-
-
-    @classmethod
-    def load_accounts(cls, file_path=config.get('filepaths', {}).get('accounts', 'accounts.json')):
-        """Load accounts from accounts.json or accounts.csv file."""
-        if os.path.exists(file_path):
-            if file_path.endswith('.json'):
-                return cls._load_accounts_from_json(file_path)
-            elif file_path.endswith('.csv'):
-                return cls._load_accounts_from_csv(file_path)
-        raise FileNotFoundError("No accounts.json or accounts.csv file found.")
-
-    @classmethod
-    def _load_accounts_from_json(cls, file_path):
-        """Load accounts from a JSON file."""
-        with open(file_path, 'r', encoding='utf-8') as file:
-            accounts = json.load(file)
-            return [cls(account) for account in accounts]
-
-    @classmethod
-    def _load_accounts_from_csv(cls, file_path):
-        """Load accounts from a CSV file."""
-        df = read_csv(file_path)
-        accounts = [cls(row.to_dict()) for index, row in df.iterrows()]
-        return accounts
-
-    @classmethod
-    def _save_accounts_to_json(cls, accounts, file_path):
-        """Save accounts to a JSON file."""
-        with open(file_path, 'w', encoding='utf-8') as file:
-            json.dump([account.to_dict() for account in accounts], file, indent=4)
-
-    @classmethod
-    def _save_accounts_to_csv(cls, accounts, file_path):
-        """Save accounts to a CSV file."""
-        df = DataFrame([account.to_dict() for account in accounts])
-        df.to_csv(file_path, index=False)
-
-    @classmethod
-    def save_accounts(cls, accounts, file_path=config.get('filepaths', {}).get('accounts', 'accounts.json')):
-        """Save accounts to a file, either JSON or CSV."""
-        if file_path.endswith('.json'):
-            cls._save_accounts_to_json(accounts, file_path)
-        elif file_path.endswith('.csv'):
-            cls._save_accounts_to_csv(accounts, file_path)
-        else:
-            raise ValueError("Unsupported file type. Use 'json' or 'csv'.")
-    
-    @classmethod
-    def add_account(cls, account_data, file_path=config.get('filepaths', {}).get('accounts', 'accounts.json')):
-        """Add a new account to the accounts file."""
-        accounts = cls.load_accounts(file_path)
-        accounts.append(cls(account_data))
-        cls.save_accounts(accounts, file_path)
-        return True
-
-    @classmethod
-    def load_account(cls, phone_number, file_path=config.get('filepaths', {}).get('accounts', 'accounts.json')):
-        """Read an account by phone number."""
-        accounts = cls.load_accounts(file_path)
-        for acc in accounts:
-            if acc.phone_number == phone_number:
-                return acc
-        return None
-
-    @classmethod
-    def update_account(cls, phone_number, update_data, file_path=config.get('filepaths', {}).get('accounts', 'accounts.json')):
-        """Update an account by phone number."""
-        accounts = cls.load_accounts(file_path)
-        updated = False
-        for acc in accounts:
-            if acc.phone_number == phone_number:
-                for k, v in update_data.items():
-                    setattr(acc, k, v)
-                updated = True
-        if updated:
-            cls.save_accounts(accounts, file_path)
-        return updated
-
-    @classmethod
-    def delete_account(cls, phone_number, file_path=config.get('filepaths', {}).get('accounts', 'accounts.json')):
-        """Delete an account by phone number."""
-        accounts = cls.load_accounts(file_path)
-        new_accounts = [acc for acc in accounts if acc.phone_number != phone_number]
-        if len(new_accounts) != len(accounts):
-            cls.save_accounts(new_accounts, file_path)
-            return True
-        return False
+        from database import get_db
+        db = get_db()
+        return [elem for elem in db.load_all_accounts() if elem.phone_number in phones]
 
 
 
@@ -170,7 +80,7 @@ class Client(object):
             self.phone_number = account.phone_number
         except KeyError as e:
             raise ValueError(f"Missing key in account configuration: {e}")
-        self.active_emoji_palette = ['👍', '❤️', '🔥']  # Default emoji palette, replaces automatically
+        self.active_emoji_palette = ['👍', '❤️', '🔥']  # Default emoji palette, is replaced automatically
         self.logger = setup_logger(f"{self.phone_number}", f"accounts/account_{self.phone_number}.log")
         self.logger.info(f"Initializing client for {self.phone_number}. Awaiting connection...")
         self.client = None
@@ -194,15 +104,16 @@ class Client(object):
             await self.client.disconnect()
             self.logger.info(f"Client for {self.phone_number} disconnected.")
 
+
     async def connect(self):
         retries = config.get('delays', {}).get('connection_retries', 5)
         delay = config.get('delays', {}).get('reconnect_delay', 3)
         attempt = 0
-        while attempt < retries:
+        while attempt < retries:  # Actually this could be implemented via inbuilt TelegramClient properties, but I'm not sure how to log it
             try:
                 self.client = TelegramClient(
                     f"{config.get('filepaths', {}).get('sessions_folder', 'sessions/')}{self.session_name}",
-                    api_id, api_hash
+                    api_id, api_hash  # Add proxy logic here
                 )
                 await self.client.start()
                 self.logger.debug(f"Client for {self.phone_number} started successfully.")
@@ -220,13 +131,22 @@ class Client(object):
         """Disconnect the client."""
         retries = config.get('delays', {}).get('connection_retries', 5)
         delay = config.get('delays', {}).get('reconnect_delay', 3)
-
-        if self.client:
-            await self.client.disconnect()
-            self.logger.info(f"Client for {self.phone_number} disconnected.")
+        attempt = 0
+        while attempt < retries:
+            try:
+                await self.client.disconnect()
+                self.logger.info(f"Client for {self.phone_number} disconnected.")
+                break
+            except Exception as e:
+                attempt += 1
+                self.logger.error(f"Failed to disconnect client for {self.phone_number} (attempt {attempt}/{retries}): {e}")
+                if attempt < retries:
+                    await asyncio.sleep(delay)
+                else:
+                    raise
 
     async def ensure_connected(self):
-        if not self.client or not self.client.is_connected():
+        if not self.client or not self.is_connected:
             self.logger.info(f"Client for {self.phone_number} is not connected. Reconnecting...")
             await self.connect()
 
@@ -281,8 +201,9 @@ class Client(object):
         me = await self.client.get_me()
         account_id = me.id if hasattr(me, 'id') else None
         if account_id:
-            from agent import Account  # Avoid circular import if any
-            Account.update_account(self.phone_number, {'account_id': account_id})
+            from database import get_db  # Avoid circular import if any
+            db = get_db()
+            db.update_account(self.phone_number, {'account_id': account_id})
             self.logger.info(f"Updated account_id for {self.phone_number} to {account_id}")
             self.account.account_id = account_id
         else:

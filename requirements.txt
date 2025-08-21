@@ -2,3 +2,4 @@ python-dotenv
 telethon
 PyYAML
 pandas
+pymongo

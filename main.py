@@ -8,7 +8,9 @@ logger = setup_logger("main", "main.log")
 async def main():
     logger.info("System is starting...")
 
-    clients = await connect_clients(logger)
+    # NYI
+
+    # clients = await connect_clients(logger)
     
 
 

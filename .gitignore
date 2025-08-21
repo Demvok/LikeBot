@@ -2,8 +2,6 @@
 .env
 logs/
 sessions/
-test.py
-test.ipynb
 __pycache__
 accounts.json
 posts.json

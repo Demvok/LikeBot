@@ -1,5 +1,5 @@
-from pandas import Timestamp, read_csv, DataFrame
-import json, re, yaml, asyncio
+from pandas import Timestamp
+import re, yaml, asyncio
 from enum import Enum, auto
 from agent import Account, Client
 from logger import setup_logger
@@ -11,8 +11,8 @@ config = load_config()
 
 
 class Post:
-    
-    def __init__(self, post_id, message_link, chat_id=None, message_id=None, created_at=None, updated_at=None):
+
+    def __init__(self, post_id:int, message_link:str, chat_id:int=None, message_id:int=None, created_at=None, updated_at=None):
         self.post_id = post_id
         self.chat_id = chat_id
         self.message_id = message_id
@@ -23,34 +23,32 @@ class Post:
     def __repr__(self):
         return f"Post({self.post_id}, {'validated' if self.is_validated else 'unvalidated'}, {self.message_link})"
 
-
     @property
     def is_validated(self):
         """Check if the post has been validated by checking chat_id and message_id."""
         return self.chat_id is not None and self.message_id is not None
 
-    async def get_chat_id(self, client, file_path=config.get('filepaths', {}).get('posts', 'posts.json')):
-        """Get chat_id, auto-validate and update if needed."""
-        if not self.is_validated:
-            await self.validate(client, file_path)
-        return self.chat_id
+    def to_dict(self):
+        """Convert Post object to dictionary with serializable timestamps."""
+        return {
+            'post_id': self.post_id,
+            'chat_id': self.chat_id,
+            'message_id': self.message_id,
+            'message_link': self.message_link,
+            'created_at': self.created_at.isoformat() if isinstance(self.created_at, Timestamp) else self.created_at,
+            'updated_at': self.updated_at.isoformat() if isinstance(self.updated_at, Timestamp) else self.updated_at
+        }
 
-    async def get_message_id(self, client, file_path=config.get('filepaths', {}).get('posts', 'posts.json')):
-        """Get message_id, auto-validate and update if needed."""
-        if not self.is_validated:
-            await self.validate(client, file_path)
-        return self.message_id
+    @classmethod
+    def from_keys(cls, post_id:int, message_link:str, chat_id:int=None, message_id:int=None):
+        """Create a Post object from keys."""
+        return cls(
+            post_id=post_id,
+            message_link=message_link,
+            chat_id=chat_id,
+            message_id=message_id
+        )
 
-
-    async def validate(self, client, file_path=config.get('filepaths', {}).get('posts', 'posts.json')):
-        """Validate the post by fetching its chat_id and message_id, and update the record in file."""
-        chat_id, message_id = await self._get_message_ids(client, self.message_link)
-        self.chat_id = chat_id
-        self.message_id = message_id
-        self.updated_at = Timestamp.now()
-        # Update the record in file
-        type(self).update_post(self, file_path)
-        return self
 
     async def _get_message_ids(self, client, link):
         # Example link: https://t.me/c/123456789/12345 or https://t.me/username/12345
@@ -70,97 +68,24 @@ class Post:
             chat_id = chat_part
 
         # Get entity and message using TelegramClient
-        entity = await client.get_entity(chat_id)
-        message = await client.get_messages(entity, ids=message_id)
+        entity = await client.client.get_entity(chat_id)
+        message = await client.client.get_messages(entity, ids=message_id)
         # Return only the IDs, not the objects
         return entity.id if hasattr(entity, 'id') else entity, message.id if hasattr(message, 'id') else message
 
-    def to_dict(self):
-        """Convert Post object to dictionary with serializable timestamps."""
-        return {
-            'post_id': self.post_id,
-            'chat_id': self.chat_id,
-            'message_id': self.message_id,
-            'message_link': self.message_link,
-            'created_at': self.created_at.isoformat() if isinstance(self.created_at, Timestamp) else self.created_at,
-            'updated_at': self.updated_at.isoformat() if isinstance(self.updated_at, Timestamp) else self.updated_at
-        }
 
-    @classmethod
-    def update_post(cls, updated_post, file_path=config.get('filepaths', {}).get('posts', 'posts.json')):
-        """Update a post in the file by post_id."""
-        posts = cls.load_posts(file_path)
-        for i, post in enumerate(posts):
-            if post.post_id == updated_post.post_id:
-                posts[i] = updated_post
-                break
-        else:
-            raise ValueError(f"Post with id {updated_post.post_id} not found.")
-        cls.save_posts(posts, file_path)
 
-    @classmethod
-    def add_post(cls, new_post, file_path=config.get('filepaths', {}).get('posts', 'posts.json')):
-        """Add a new post to the file."""
-        posts = cls.load_posts(file_path)
-        if any(post.post_id == new_post.post_id for post in posts):
-            raise ValueError(f"Post with id {new_post.post_id} already exists.")
-        posts.append(new_post)
-        cls.save_posts(posts, file_path)
-
-    @classmethod
-    def delete_post(cls, post_id, file_path=config.get('filepaths', {}).get('posts', 'posts.json')):
-        """Delete a post from the file by post_id."""
-        posts = cls.load_posts(file_path)
-        posts = [post for post in posts if post.post_id != post_id]
-        cls.save_posts(posts, file_path)
-
-    @classmethod
-    def _load_posts_from_json(cls, file_path):
-        """Load posts from a JSON file."""
-        with open(file_path, 'r', encoding='utf-8') as file:
-            data = json.load(file)
-            posts = [Post(**post) for post in data]
-        return posts
-
-    @classmethod
-    def _save_posts_to_json(cls, posts, file_path):
-        """Save posts to a JSON file."""
-        with open(file_path, 'w', encoding='utf-8') as file:
-            json.dump([post.to_dict() for post in posts], file, indent=4)
-
-    @classmethod
-    def _load_posts_from_csv(cls, file_path):
-        """Load posts from a CSV file."""
-        df = read_csv(file_path)
-        posts = [Post(row['post_id'], row['chat_id'], row['message_id'], row['message_link'], row['created_at'], row['updated_at']) for index, row in df.iterrows()]
-        return posts
-
-    @classmethod
-    def _save_posts_to_csv(cls, posts, file_path):
-        """Save posts to a CSV file."""
-        df = DataFrame([post.__dict__ for post in posts])
-        df.to_csv(file_path, index=False)
-
-    @classmethod
-    def load_posts(cls, file_path=config.get('filepaths', {}).get('posts', 'posts.json')):
-        """Load posts from a file, either JSON or CSV."""
-        if file_path.endswith('.json'):
-            return cls._load_posts_from_json(file_path)
-        elif file_path.endswith('.csv'):
-            return cls._load_posts_from_csv(file_path)
-        else:
-            raise ValueError("Unsupported file type. Use '.json' or '.csv' file extension.")
-
-    @classmethod
-    def save_posts(cls, posts, file_path=config.get('filepaths', {}).get('posts', 'posts.json')):
-        """Save posts to a file, either JSON or CSV."""
-        if file_path.endswith('.json'):
-            cls._save_posts_to_json(posts, file_path)
-        elif file_path.endswith('.csv'):
-            cls._save_posts_to_csv(posts, file_path)
-        else:
-            raise ValueError("Unsupported file type. Use '.json' or '.csv' file extension.")
-
+    async def validate(self, client):
+        """Validate the post by fetching its chat_id and message_id, and update the record in file."""
+        from database import get_db
+        db = get_db()
+        chat_id, message_id = await self._get_message_ids(client, self.message_link)
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.updated_at = Timestamp.now()
+        db.update_post(self)
+        return self
+    
     @classmethod
     async def mass_validate_posts(cls, posts, client, logger=None):
         """Validate multiple posts asynchronously."""
@@ -177,19 +102,13 @@ class Post:
         already_validated, newly_validated = 0, 0
         for post in posts:
             if post.is_validated:
-                # if logger:
-                    # logger.info(f"Post {post.post_id} is already validated.")
                 already_validated += 1
                 continue
             post = await post.validate(client=client.client)
             if post.is_validated:
                 newly_validated += 1
-            # if logger:
-                # logger.info(f"Validating post {post.post_id}...")
         if logger:
             logger.info(f"Validated {len(posts)} posts: {newly_validated} newly validated, {already_validated} already validated.")
-
-
 
 
 
@@ -243,9 +162,13 @@ class Task:
             'updated_at': self.updated_at.isoformat() if isinstance(self.updated_at, Timestamp) else self.updated_at
         }
 
+# Property methods
+
     def get_posts(self):
         """Get a list of Post objects from a list of post IDs."""
-        return [elem for elem in Post.load_posts() if elem.post_id in self.post_ids]
+        from database import get_db
+        db = get_db()
+        return [elem for elem in db.load_all_posts() if elem.post_id in self.post_ids]
     
     def get_accounts(self):
         return Account.get_accounts(self.accounts)
@@ -257,14 +180,6 @@ class Task:
     def get_actions_by_type(self, action_type):
         """Get actions filtered by type (react, comment, etc.)."""
         return [action for action in self.get_actions() if action.get('type') == action_type]
-
-    def get_react_actions(self):  # Possibly useless
-        """Get all react actions."""
-        return self.get_actions_by_type('react')
-
-    def get_comment_actions(self):  # Possibly useless
-        """Get all comment actions."""
-        return self.get_actions_by_type('comment')
 
     def has_action_type(self, action_type):
         """Check if task has a specific action type."""
@@ -285,77 +200,72 @@ class Task:
         else:
             raise ValueError(f"Unknown reaction palette: {palette}")
 
+# Actions
+
     async def _run(self):
         try:
-            self.status = Task.TaskStatus.RUNNING
-            self.updated_at = Timestamp.now()
-            self.logger.info(f"Starting task {self.task_id} - {self.name}...")
-
             accounts = self.get_accounts()
             posts = self.get_posts()
 
             await self._check_pause()  # Check for pause before connecting clients
-
             self._clients = await Client.connect_clients(accounts, self.logger)
-            clients = self._clients
 
-            if self.has_action_type('react'):
-                current_emojis = self.get_reaction_emojis()  # Get reaction palette
+            if self.has_action_type('react'):  # Iterate tasks !!!
 
-                for client in clients:
+                current_emojis = self.get_reaction_emojis()  # Get and set reaction palette  TO FIX!!!
+                for client in self._clients:
                     client.active_emoji_palette = current_emojis
 
-
                 await self._check_pause()  # Check for pause before validation
+                if self._clients:
+                    await Post.mass_validate_posts(posts, self._clients[0], self.logger)
 
-                if clients:
-                    await Post.mass_validate_posts(posts, clients[0], self.logger)
 
-                # React to posts
-                for post in posts:
+                for post in posts:  # TO REVIEW, should be async
                     await self._check_pause()  # Check pause before each post
-                    clients = self._clients  # Always use the latest connected clients after pause
                     if post.is_validated:
-                        for i, client in enumerate(clients):
+                        for i, client in enumerate(self._clients):
                             try:
                                 await client.react(post.message_id, post.chat_id)
                                 self.logger.debug(f"Client {i} reacted to post {post.post_id}")
                             except Exception as e:
                                 self.logger.warning(f"Client {i} failed to react to post {post.post_id}: {e}")
                         self.logger.info(f"All clients have reacted to post {post.post_id} with {self.get_reaction_palette_name()}")
-           
-                self._clients = await Client.disconnect_clients(clients, self.logger)
 
-            if self.has_action_type('comment'):
-                # Logic to handle comment actions can be added here
+
+            if self.has_action_type('comment'):  # Logic to handle comment actions can be added here
                 self.logger.info("Comment actions are not implemented yet.")
-                self._clients = await Client.disconnect_clients(clients, self.logger)
                 pass
+
+
             if len(self.get_actions()) == 0:
-                self._clients = await Client.disconnect_clients(clients, self.logger)
                 raise ValueError("No actions defined for the task.")
-            
-            self.status = Task.TaskStatus.FINISHED
-            self.updated_at = Timestamp.now()
+
+
+            # If you get here - task succeeded
             self.logger.info(f"Task {self.task_id} completed successfully.")
+            self.status = Task.TaskStatus.FINISHED
+
         except asyncio.CancelledError:
             self.logger.info(f"Task {self.task_id} was cancelled.")
-            self.status = Task.TaskStatus.FINISHED
-            self._clients = await Client.disconnect_clients(clients, self.logger)
-            self.updated_at = Timestamp.now()
+            self.status = Task.TaskStatus.PENDING
         except Exception as e:
             self.logger.error(f"Error starting task {self.task_id}: {e}")
             self.status = Task.TaskStatus.CRASHED
-            self._clients = await Client.disconnect_clients(clients, self.logger)
-            self.updated_at = Timestamp.now()
             raise e
+        finally:
+            self._clients = await Client.disconnect_clients(self._clients, self.logger)
+            self.updated_at = Timestamp.now()
+
 
 
     async def start(self):
         """Start the task."""
         if self._task is None or self._task.done():
             self._pause_event.set()
+            self.logger.info(f"Starting task {self.task_id} - {self.name}...")
             self._task = asyncio.create_task(self._run())
+            self.updated_at = Timestamp.now()
             self.status = Task.TaskStatus.RUNNING       
 
     async def pause(self):
@@ -399,99 +309,3 @@ class Task:
         # Will be used to create reports
         return self.status
     
-
-
-    @classmethod
-    def _load_tasks_from_json(cls, file_path):
-        """Load tasks from a JSON file."""
-        with open(file_path, 'r', encoding='utf-8') as file:
-            data = json.load(file)
-            tasks = [cls(**task) for task in data]
-        return tasks
-
-    @classmethod
-    def _save_tasks_to_json(cls, tasks, file_path):
-        """Save tasks to a JSON file."""
-        with open(file_path, 'w', encoding='utf-8') as file:
-            json.dump([task.to_dict() for task in tasks], file, indent=4)
-
-    @classmethod
-    def _load_tasks_from_csv(cls, file_path):
-        """Load tasks from a CSV file."""
-        df = read_csv(file_path)
-        tasks = []
-        for index, row in df.iterrows():
-            # Convert string representations back to lists/objects if needed
-            post_ids = eval(row['post_ids']) if isinstance(row['post_ids'], str) else row['post_ids']
-            accounts = eval(row['accounts']) if isinstance(row['accounts'], str) else row['accounts']
-            action = eval(row['action']) if isinstance(row['action'], str) else row['action']  # Changed from reaction to action
-            
-            task = cls(
-                row['task_id'], 
-                row['name'], 
-                post_ids,
-                accounts, 
-                action,
-                row['description'], 
-                row['status'], 
-                row['created_at'], 
-                row['updated_at']
-            )
-            tasks.append(task)
-        return tasks
-
-    @classmethod
-    def _save_tasks_to_csv(cls, tasks, file_path):
-        """Save tasks to a CSV file."""
-        df = DataFrame([task.__dict__ for task in tasks])
-        df.to_csv(file_path, index=False)
-
-    @classmethod
-    def load_tasks(cls, file_path=config.get('filepaths', {}).get('tasks', 'tasks.json')):
-        """Load tasks from a file, either JSON or CSV."""
-        if file_path.endswith('.json'):
-            return cls._load_tasks_from_json(file_path)
-        elif file_path.endswith('.csv'):
-            return cls._load_tasks_from_csv(file_path)
-        else:
-            raise ValueError("Unsupported file type. Use '.json' or '.csv' file extension.")
-        
-    @classmethod
-    def save_tasks(cls, tasks, file_path=config.get('filepaths', {}).get('tasks', 'tasks.json')):
-        """Save tasks to a file, either JSON or CSV."""
-        if file_path.endswith('.json'):
-            cls._save_tasks_to_json(tasks, file_path)
-        elif file_path.endswith('.csv'):
-            cls._save_tasks_to_csv(tasks, file_path)
-        else:
-            raise ValueError("Unsupported file type. Use '.json' or '.csv' file extension.")
-        
-        
-    @classmethod
-    def update_task(cls, updated_task, file_path=config.get('filepaths', {}).get('tasks', 'tasks.json')):
-        """Update a task in the file by task_id."""
-        tasks = cls.load_tasks(file_path)
-        for i, task in enumerate(tasks):
-            if task.task_id == updated_task.task_id:
-                tasks[i] = updated_task
-                break
-        else:
-            raise ValueError(f"Task with id {updated_task.task_id} not found.")
-        cls.save_tasks(tasks, file_path)
-
-    @classmethod
-    def add_task(cls, new_task, file_path=config.get('filepaths', {}).get('tasks', 'tasks.json')):
-        """Add a new task to the file."""
-        tasks = cls.load_tasks(file_path)
-        if any(task.task_id == new_task.task_id for task in tasks):
-            raise ValueError(f"Task with id {new_task.task_id} already exists.")
-        tasks.append(new_task)
-        cls.save_tasks(tasks, file_path)
-
-    @classmethod
-    def delete_task(cls, task_id, file_path=config.get('filepaths', {}).get('tasks', 'tasks.json')):
-        """Delete a task from the file by task_id."""
-        tasks = cls.load_tasks(file_path)
-        tasks = [task for task in tasks if task.task_id != task_id]
-        cls.save_tasks(tasks, file_path)
-

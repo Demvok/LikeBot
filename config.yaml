@@ -4,10 +4,11 @@ logging:
   save_to: "./logs/"  # Directory to save log files
 
 filepaths:  # File paths for various resources
+  use_db: true  # If this is set to true, following paths will be ignored
   accounts: "accounts.json"
   posts: "posts.json"
   tasks: "tasks.json"
-  sessions_folder: "sessions/"
+  sessions_folder: "sessions/" ###
 
 reactions_palettes:
   positive:
