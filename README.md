@@ -13,7 +13,6 @@
 
 - add creation of neccessary files if they dont exist
 - add check for validated posts if they still exist
-- implement time tracking into logs or abandon it
 - implement proxy logic (import, status, links to accounts)
 
 - check for id data type consistency

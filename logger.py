@@ -31,20 +31,12 @@ accounts_folder = os.path.join(SAVE_TO, "accounts")
 if not os.path.exists(accounts_folder):
     os.makedirs(accounts_folder)
 
-def timeUsed(start_time, end_time) -> str:
-    duration = end_time - start_time
-    return f"{duration:.3f}s"
-
 class CustomFormatter(logging.Formatter):
     def format(self, record):
         # Set default value for execution_time if not provided
         if not hasattr(record, 'execution_time'):
             record.execution_time = 'N/A'
         return super().format(record)
-
-# # Remove all existing handlers to avoid conflicts
-# for handler in logging.root.handlers[:]:
-#     logging.root.removeHandler(handler)
 
 def setup_logger(name: str, log_file: str) -> logging.Logger:
     """
@@ -54,7 +46,7 @@ def setup_logger(name: str, log_file: str) -> logging.Logger:
     :param log_file: Path to the log file for this logger.
     :return: Configured Logger object.
     """
-    name = name.ljust(15, ' ')
+    name = name.ljust(12, ' ')
     # FORCE RESET: Remove any existing logger with this name
     if name in logging.Logger.manager.loggerDict:
         del logging.Logger.manager.loggerDict[name]
@@ -71,7 +63,7 @@ def setup_logger(name: str, log_file: str) -> logging.Logger:
     # File handler for individual file logging
     file_path = os.path.join(SAVE_TO, log_file)
     file_handler = logging.FileHandler(file_path)
-    formatter = CustomFormatter('%(asctime)s - %(name)s - %(levelname)s - %(execution_time)s - %(message)s')
+    formatter = CustomFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     formatter.converter = lambda *args: time.localtime(*args)
     formatter.default_time_format = '%Y-%m-%d %H:%M:%S'
     formatter.default_msec_format = ''
