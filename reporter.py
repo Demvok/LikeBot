@@ -1,16 +1,22 @@
-import asyncio, uuid, signal
+import asyncio, uuid, signal, os
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 import motor.motor_asyncio
 from pymongo import IndexModel
 from pymongo import ASCENDING
 from pymongo.write_concern import WriteConcern
+from dotenv import load_dotenv
+from logger import setup_logger
+
+load_dotenv()
+
+logger = setup_logger("reporter", "main.log")
 
 # CONFIG
-MONGO_URI = "mongodb://localhost:27017"
-DB_NAME = "task_reporting"
-EVENTS_COLL = "events"
-RUNS_COLL = "task_runs"
+MONGO_URI = os.getenv("db_url", "mongodb://localhost:27017")
+DB_NAME = os.getenv("db_name")
+EVENTS_COLL = 'events'
+RUNS_COLL = 'runs'
 
 BATCH_SIZE = 100
 BATCH_TIMEOUT = 0.5  # seconds
@@ -19,19 +25,22 @@ BATCH_TIMEOUT = 0.5  # seconds
 def utc_now():
     return datetime.now(timezone.utc)
 
-class MongoReporter:
-    def __init__(self, client: motor.motor_asyncio.AsyncIOMotorClient, db_name: str = DB_NAME):
-        self.client = client
-        self.db = client[db_name]
+
+class Reporter:
+    def __init__(self):
+        self.client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+        self.db = self.client[DB_NAME]
+
         # Use majority write concern + journaling for durability guarantees (requires replica set for true majority)
         self.events_coll = self.db.get_collection(EVENTS_COLL, write_concern=WriteConcern(w="majority", j=True))
         self.runs_coll = self.db.get_collection(RUNS_COLL, write_concern=WriteConcern(w="majority", j=True))
+
         self.queue: asyncio.Queue = asyncio.Queue()
         self._writer_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
 
     async def init(self):
-        # Create indexes (idempotent)
+        """Create indexes (idempotent)"""
         await self.runs_coll.create_index([("run_id", ASCENDING)], unique=True)
         # Index events by run_id, ts for fast querying by run
         await self.events_coll.create_indexes([
@@ -40,6 +49,8 @@ class MongoReporter:
             IndexModel([("level", ASCENDING)]),
             IndexModel([("code", ASCENDING)])
         ])
+
+
 
     # ---- Public reporter API used by workers ----
     async def new_run(self, task_id: str, meta: Optional[Dict[str, Any]] = None) -> str:
@@ -74,6 +85,8 @@ class MongoReporter:
             "payload": payload or {}
         }
         await self.queue.put(item)
+
+
 
     # ---- Background writer ----
     async def _writer_loop(self):
@@ -131,6 +144,8 @@ class MongoReporter:
                 print("Writer loop error:", exc)
                 await asyncio.sleep(0.2)
 
+
+
     async def start(self):
         await self.init()
         self._writer_task = asyncio.create_task(self._writer_loop())
@@ -146,7 +161,7 @@ class MongoReporter:
     # Convenient context manager for a run
     async def run_context(self, task_id: str, meta: Optional[Dict[str, Any]] = None):
         """
-        Async context manager usage:
+        Async context manager usage:\n
         async with reporter.run_context("task-1") as run_id:
             await reporter.event(...)
         """
@@ -167,9 +182,11 @@ class MongoReporter:
                     await self.reporter.end_run(self.run_id, status="success")
         return _RunCtx(self, task_id, meta)
 
+
+
 # ---------------- Example usage ----------------
 
-async def example_worker(task_id: str, reporter: MongoReporter):
+async def example_worker(task_id: str, reporter: Reporter):
     # using context manager
     async with await reporter.run_context(task_id, meta={"info": "demo"}) as run_id:
         await reporter.event(run_id, task_id, "INFO", "step.started", "Start step 1", {"step": 1})
@@ -179,9 +196,10 @@ async def example_worker(task_id: str, reporter: MongoReporter):
         # raise RuntimeError("Simulated")
         await reporter.event(run_id, task_id, "INFO", "step.finished", "Step 1 done", {"step": 1})
 
+
+
 async def main():
-    client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
-    reporter = MongoReporter(client)
+    reporter = Reporter()
     await reporter.start()
 
     # graceful shutdown on signals

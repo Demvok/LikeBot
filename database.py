@@ -434,7 +434,6 @@ class FileStorage(StorageInterface):
         return False
 
 
-
 class MongoStorage(StorageInterface):
     _accounts = None
     _db = None
