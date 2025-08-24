@@ -1,4 +1,5 @@
-import uuid, os, yaml, asyncio, inspect
+import os, yaml, json, inspect
+from pandas import read_csv, Timestamp, DataFrame
 from abc import ABC, abstractmethod
 from functools import wraps
 from dotenv import load_dotenv
@@ -118,8 +119,6 @@ class FileStorage(StorageInterface):
         """
         Load accounts from a JSON or CSV file and return a list of Account objects.
         """
-        from pandas import read_csv
-        import json
         file_path = config.get('filepaths', {}).get('accounts', 'accounts.json')
         if os.path.exists(file_path):
             if file_path.endswith('.json'):
@@ -137,8 +136,6 @@ class FileStorage(StorageInterface):
         """
         Save a list of Account objects to a JSON or CSV file.
         """
-        from pandas import DataFrame
-        import json
         file_path = config.get('filepaths', {}).get('accounts', 'accounts.json')
         data = [acc.to_dict() for acc in accounts]
         if file_path.endswith('.json'):
@@ -218,8 +215,6 @@ class FileStorage(StorageInterface):
         """
         Load posts from a JSON or CSV file and return a list of Post objects.
         """
-        from pandas import read_csv
-        import json
         file_path = config.get('filepaths', {}).get('posts', 'posts.json')
         if os.path.exists(file_path):
             if file_path.endswith('.json'):
@@ -239,8 +234,6 @@ class FileStorage(StorageInterface):
         """
         Save a list of Post objects to a JSON or CSV file.
         """
-        from pandas import DataFrame
-        import json
         file_path = config.get('filepaths', {}).get('posts', 'posts.json')
         data = [post.to_dict() for post in posts]
         if file_path.endswith('.json'):
@@ -322,14 +315,40 @@ class FileStorage(StorageInterface):
         """
         Load tasks from a JSON or CSV file and return a list of Task objects.
         """
-        from pandas import read_csv
-        import json
         file_path = config.get('filepaths', {}).get('tasks', 'tasks.json')
+        def parse_task(task):
+            # Ensure action is a dict, status is a string, timestamps are parsed
+            action = task.get('action')
+            status = task.get('status')
+            created_at = task.get('created_at')
+            updated_at = task.get('updated_at')
+            # Parse timestamps if they are strings
+            if isinstance(created_at, str):
+                try:
+                    created_at = Timestamp(created_at)
+                except Exception:
+                    pass
+            if isinstance(updated_at, str):
+                try:
+                    updated_at = Timestamp(updated_at)
+                except Exception:
+                    pass
+            return Task(
+                task_id=task.get('task_id'),
+                name=task.get('name'),
+                post_ids=task.get('post_ids'),
+                accounts=task.get('accounts'),
+                action=action,
+                description=task.get('description'),
+                status=status,
+                created_at=created_at,
+                updated_at=updated_at
+            )
         if os.path.exists(file_path):
             if file_path.endswith('.json'):
                 with open(file_path, 'r', encoding='utf-8') as file:
                     data = json.load(file)
-                    return [Task(**task) for task in data]
+                    return [parse_task(task) for task in data]
             elif file_path.endswith('.csv'):
                 df = read_csv(file_path)
                 tasks = []
@@ -337,6 +356,19 @@ class FileStorage(StorageInterface):
                     post_ids = eval(row['post_ids']) if isinstance(row['post_ids'], str) else row['post_ids']
                     accounts = eval(row['accounts']) if isinstance(row['accounts'], str) else row['accounts']
                     action = eval(row['action']) if isinstance(row['action'], str) else row['action']
+                    status = row.get('status')
+                    created_at = row.get('created_at')
+                    updated_at = row.get('updated_at')
+                    if isinstance(created_at, str):
+                        try:
+                            created_at = Timestamp(created_at)
+                        except Exception:
+                            pass
+                    if isinstance(updated_at, str):
+                        try:
+                            updated_at = Timestamp(updated_at)
+                        except Exception:
+                            pass
                     task = Task(
                         row['task_id'],
                         row['name'],
@@ -344,9 +376,9 @@ class FileStorage(StorageInterface):
                         accounts,
                         action,
                         row.get('description'),
-                        row.get('status'),
-                        row.get('created_at'),
-                        row.get('updated_at')
+                        status,
+                        created_at,
+                        updated_at
                     )
                     tasks.append(task)
                 return tasks
@@ -361,7 +393,7 @@ class FileStorage(StorageInterface):
         from pandas import DataFrame
         import json
         file_path = config.get('filepaths', {}).get('tasks', 'tasks.json')
-        data = [task.to_dict() for task in tasks]
+        data = [task.to_dict(rich=False) for task in tasks]
         if file_path.endswith('.json'):
             with open(file_path, 'w', encoding='utf-8') as file:
                 json.dump(data, file, indent=4)
@@ -379,7 +411,7 @@ class FileStorage(StorageInterface):
         If a task with the same task_id exists, update it instead.
         """
         if isinstance(task, Task):
-            task_data = task.to_dict()
+            task_data = task.to_dict(rich=False)
         else:
             task_data = task
         task_id = task_data.get('task_id')
@@ -387,7 +419,33 @@ class FileStorage(StorageInterface):
         if existing_task:
             return await cls.update_task(task_id, task_data)
         tasks = await cls.load_all_tasks()
-        tasks.append(Task(**task_data))
+        # Use the parse_task logic from load_all_tasks to ensure correct structure
+        from pandas import Timestamp
+        action = task_data.get('action')
+        status = task_data.get('status')
+        created_at = task_data.get('created_at')
+        updated_at = task_data.get('updated_at')
+        if isinstance(created_at, str):
+            try:
+                created_at = Timestamp(created_at)
+            except Exception:
+                pass
+        if isinstance(updated_at, str):
+            try:
+                updated_at = Timestamp(updated_at)
+            except Exception:
+                pass
+        tasks.append(Task(
+            task_id=task_data.get('task_id'),
+            name=task_data.get('name'),
+            post_ids=task_data.get('post_ids'),
+            accounts=task_data.get('accounts'),
+            action=action,
+            description=task_data.get('description'),
+            status=status,
+            created_at=created_at,
+            updated_at=updated_at
+        ))
         await cls.save_all_tasks(tasks)
         return True
 
@@ -602,7 +660,30 @@ class MongoStorage(StorageInterface):
         tasks = []
         async for task in cursor:
             task.pop('_id', None)
-            tasks.append(Task(**task))
+            # Parse timestamps if needed
+            created_at = task.get('created_at')
+            updated_at = task.get('updated_at')
+            if isinstance(created_at, str):
+                try:
+                    created_at = Timestamp(created_at)
+                except Exception:
+                    pass
+            if isinstance(updated_at, str):
+                try:
+                    updated_at = Timestamp(updated_at)
+                except Exception:
+                    pass
+            tasks.append(Task(
+                task_id=task.get('task_id'),
+                name=task.get('name'),
+                post_ids=task.get('post_ids'),
+                accounts=task.get('accounts'),
+                action=task.get('action'),
+                description=task.get('description'),
+                status=task.get('status'),
+                created_at=created_at,
+                updated_at=updated_at
+            ))
         return tasks
 
     @classmethod

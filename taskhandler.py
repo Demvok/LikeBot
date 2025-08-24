@@ -174,22 +174,17 @@ class Task:
     async def get_accounts(self):
         return await Account.get_accounts(self.accounts)
 
-    def get_actions(self):
-        """Get all actions as a list."""
-        return self.action if isinstance(self.action, list) else []
+    def get_action(self):
+        """Return the action as a dict."""
+        return self.action if isinstance(self.action, dict) else None
 
-    def get_actions_by_type(self, action_type):
-        """Get actions filtered by type (react, comment, etc.)."""
-        return [action for action in self.get_actions() if action.get('type') == action_type]
-
-    def has_action_type(self, action_type):
-        """Check if task has a specific action type."""
-        return len(self.get_actions_by_type(action_type)) > 0
+    def get_action_type(self):
+        """Return the action type if action is present, else None."""
+        return self.get_action().get('type', None)
 
     def get_reaction_palette_name(self):
-        """Get the palette for a specific action type."""
-        actions = self.get_actions_by_type('react')
-        return actions[0].get('palette') if actions else None
+        """Get the palette for react action, if present, else None."""
+        return self.get_action().get('palette', None)
 
     def get_reaction_emojis(self):
         """Get emojis for a specific action type and palette from config."""
@@ -198,6 +193,8 @@ class Task:
             return config.get('reactions_palettes', {}).get('positive', [])
         elif palette == 'negative':
             return config.get('reactions_palettes', {}).get('negative', [])
+        elif palette is None:
+            return []
         else:
             raise ValueError(f"Unknown reaction palette: {palette}")
 
@@ -211,7 +208,7 @@ class Task:
             await self._check_pause()  # Check for pause before connecting clients
             self._clients = await Client.connect_clients(accounts, self.logger)
 
-            if self.has_action_type('react'):  # Iterate tasks !!!
+            if self.get_action_type() == 'react':  # Iterate tasks !!!
 
                 current_emojis = self.get_reaction_emojis()  # Get and set reaction palette  TO FIX!!!
                 for client in self._clients:
@@ -234,13 +231,13 @@ class Task:
                         self.logger.info(f"All clients have reacted to post {post.post_id} with {self.get_reaction_palette_name()}")
 
 
-            if self.has_action_type('comment'):  # Logic to handle comment actions can be added here
+            if self.get_action_type() == 'comment':  # Logic to handle comment actions can be added here
                 self.logger.info("Comment actions are not implemented yet.")
                 pass
 
 
-            if len(self.get_actions()) == 0:
-                raise ValueError("No actions defined for the task.")
+            if self.get_action() is None:
+                raise ValueError("No action defined for the task.")
 
 
             # If you get here - task succeeded

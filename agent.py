@@ -81,7 +81,9 @@ class Client(object):
             self.phone_number = account.phone_number
         except KeyError as e:
             raise ValueError(f"Missing key in account configuration: {e}")
-        self.active_emoji_palette = ['👍', '❤️', '🔥']  # Default emoji palette, is replaced automatically
+        self.active_emoji_palette = config.get('reactions_palettes', []).get('positive', [])  # Default emoji palette, is replaced automatically
+        if not self.active_emoji_palette:
+            raise ValueError("Emoji palette is empty in the configuration.")
         self.logger = setup_logger(f"{self.phone_number}", f"accounts/account_{self.phone_number}.log")
         self.logger.info(f"Initializing client for {self.phone_number}. Awaiting connection...")
         self.client = None
@@ -224,11 +226,6 @@ class Client(object):
                 self.logger.debug(f"Estimated reading time: {reading_time} seconds")
                 await asyncio.sleep(reading_time)
 
-            if not self.active_emoji_palette:
-                # Load emoji palette from config
-                self.active_emoji_palette = config.get('reactions_palettes', []).get('positive', [])
-                if not self.active_emoji_palette:
-                    raise ValueError("Emoji palette is empty in the configuration.")
             emoticon = random.choice(self.active_emoji_palette)
 
             await asyncio.sleep(random.uniform(0.5, 2))  # Simulate human-like delay and prevent spam

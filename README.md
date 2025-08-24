@@ -17,6 +17,7 @@
 
 - check for id data type consistency
 - ? move sessions into MongoDB
+- add passwords into account records + encrypt data
 - update task status during run
 
 ### Questions
