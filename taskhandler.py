@@ -87,8 +87,6 @@ class Post:
         # Return only the IDs, not the objects
         return entity.id if hasattr(entity, 'id') else entity, message.id if hasattr(message, 'id') else message
 
-
-
     async def validate(self, client, logger=None):
         """Validate the post by fetching its chat_id and message_id, and update the record in file."""
         from database import get_db
@@ -256,46 +254,52 @@ class Task:
 # Actions
 
     async def _run(self):
-        try:
-            accounts = await self.get_accounts()
-            posts = await self.get_posts()
+        reporter = Reporter()
+        await reporter.start()
+        async with await reporter.run_context(self.task_id, meta={"task_name": self.name, "action": self.get_action_type()}) as run_id:
+            try:
+                accounts = await self.get_accounts()
+                posts = await self.get_posts()
 
-            await self._check_pause()
-            self._clients = await Client.connect_clients(accounts, self.logger)
-            
-            await self._check_pause()
-            if self._clients:  # Validate posts to get corresponding ids
-                posts = await Post.mass_validate_posts(posts, self._clients[0], self.logger)
+                await self._check_pause()
+                self._clients = await Client.connect_clients(accounts, self.logger)
+                
+                await self._check_pause()
+                if self._clients:  # Validate posts to get corresponding ids
+                    posts = await Post.mass_validate_posts(posts, self._clients[0], self.logger)
 
-            if self.get_action() is None:
-                raise ValueError("No action defined for the task.")
-            else:
-                reporter = Reporter()
-                await reporter.start()
-                async with await reporter.run_context(self.task_id, meta={"task_name": self.name, "action": self.get_action_type()}) as run_id:
+                if self.get_action() is None:
+                    raise ValueError("No action defined for the task.")
+                else:
                     workers = [
                         asyncio.create_task(self.client_worker(client, posts, reporter, run_id))
                         for client in self._clients
                     ]
-                    await asyncio.gather(*workers)
-                
-                # stop reporter and flush
-                await reporter.stop()
+                    results = await asyncio.gather(*workers, return_exceptions=True)
+                    for result in results:
+                        if isinstance(result, Exception):
+                            # handle/log the exception
+                            pass
+                    workers.clear()
 
-        except asyncio.CancelledError:
-            self.logger.info(f"Task {self.task_id} was cancelled.")
-            self.status = Task.TaskStatus.PENDING
-        except Exception as e:
-            self.logger.error(f"Error starting task {self.task_id}: {e}")
-            self.status = Task.TaskStatus.CRASHED
-            raise e
-        finally:
-            self._clients = await Client.disconnect_clients(self._clients, self.logger)
-            self.updated_at = Timestamp.now()
+            except asyncio.CancelledError:
+                self.logger.info(f"Task {self.task_id} was cancelled.")
+                self.status = Task.TaskStatus.PENDING
+            except Exception as e:
+                self.logger.error(f"Error starting task {self.task_id}: {e}")
+                self.status = Task.TaskStatus.CRASHED
+                raise e
+            finally:
+                self._clients = await Client.disconnect_clients(self._clients, self.logger)
+                self._clients = None
+                self.updated_at = Timestamp.now()
+                self._task = None  # Mark task as finished
+            
+            await reporter.stop()  # stop reporter and flush
 
-        # If you got here - task succeeded
-        self.logger.info(f"Task {self.task_id} completed successfully.")
-        self.status = Task.TaskStatus.FINISHED
+            # If you got here - task succeeded
+            self.logger.info(f"Task {self.task_id} completed successfully.")
+            self.status = Task.TaskStatus.FINISHED
 
     async def client_worker(self, client, posts, reporter=None, run_id=None):
         if self.get_action_type() == 'react':

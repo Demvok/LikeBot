@@ -19,6 +19,10 @@
 - post ids in task should be sorted!
 - ENSURE DATA TYPES CONSISTENCY
 - rewrite connect clients to async
+- add signal stops for reporter context
+
+## Questions
+- Should i save account passwords in DB?
 
 
 ## Changelog

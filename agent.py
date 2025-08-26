@@ -179,7 +179,7 @@ class Client(object):
                 logger.warning(f"Error disconnecting client: {e}")
         return None  # Return None to indicate all clients are disconnected
 
-    async def get_message_content(self, chat_id=None, message_id=None, message_link=None):
+    async def get_message_content(self, chat_id=None, message_id=None, message_link=None) -> str | None:
         """
         Retrieve the content of a single message by chat and message_id.
         """
@@ -213,32 +213,36 @@ class Client(object):
         else:
             self.logger.warning("Could not fetch account_id from Telegram.")
 
-    def _estimate_reading_time(text, wpm=None):
+    @staticmethod
+    def estimate_reading_time(text:str, wpm=None) -> float:
         """
-        Estimate the reading time for a given text in seconds.
+        Estimate the reading time for a given text in seconds. It uses a statistical model to predict reading speed.
         """
         from scipy.stats import skewnorm
-        from numpy import arange
-        words = len(text.split())
-        if wpm is None:
-            wpm_list = arange(160, 301, dtype=int)
-            wpm_distribution = skewnorm.pdf(wpm_list, loc=230, scale=30, a=0)
-            wpm_distribution = wpm_distribution / wpm_distribution.max()
-            probs = wpm_distribution / wpm_distribution.sum()
-            wpm = random.choice(wpm_list, p=probs, size=1)[0]
-        return round(float(words / wpm * 60), 3)
+        from numpy import arange, random as rnd
+        try:
+            words = len(str(text).split())
+            if wpm is None:
+                wpm_list = arange(160, 301, dtype=int)
+                wpm_distribution = skewnorm.pdf(wpm_list, loc=230, scale=30, a=0)
+                wpm_distribution = wpm_distribution / wpm_distribution.max()
+                probs = wpm_distribution / wpm_distribution.sum()
+                wpm = rnd.choice(wpm_list, p=probs, size=1)[0]
+            return round(float(words / wpm * 60), 3)
+        except Exception as e:
+            raise ValueError(f"Error estimating reading time: {e}")
 
     # Basic actions
 
     async def _react(self, message, target_chat):
         try:
             await self.ensure_connected()
-            if config.get('delays', {}).get('humanisation_level', 1) >= 1:  # If humanisation level is 1 or higher it should consider reading time
+            if config.get('delays', {}).get('humanisation_level', 1) >= 1:  # If humanisation level is 1 it should consider reading time
                 msg_content = await self.get_message_content(chat_id=target_chat, message_id=message.id)
                 if not msg_content:
                     self.logger.warning("Message content is empty, skipping reaction.")
                     return
-                reading_time = self._estimate_reading_time(msg_content)
+                reading_time = self.estimate_reading_time(msg_content)
                 self.logger.debug(f"Estimated reading time: {reading_time} seconds")
                 await asyncio.sleep(reading_time)
 
@@ -259,9 +263,9 @@ class Client(object):
     async def _comment(self, message, target_chat, content):
         try:
             await self.ensure_connected()
-            if config.get('delays', {}).get('humanisation_level', 1) >= 1:  # If humanisation level is 1 or higher it should consider reading time
+            if config.get('delays', {}).get('humanisation_level', 1) >= 1:  # If humanisation level is 1 it should consider reading time
                 msg_content = await self.get_message_content(chat_id=target_chat, message_id=message.id)
-                reading_time = self._estimate_reading_time(msg_content)
+                reading_time = self.estimate_reading_time(msg_content)
                 self.logger.debug(f"Estimated reading time: {reading_time} seconds")
                 await asyncio.sleep(reading_time)
 
