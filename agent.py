@@ -3,7 +3,6 @@ from telethon.tl.functions.messages import SendReactionRequest, GetMessagesReque
 from telethon import TelegramClient, functions, types
 from logger import setup_logger
 from dotenv import load_dotenv
-from humaniser import estimate_reading_time
 
 load_dotenv()
 api_id = os.getenv('api_id')
@@ -214,6 +213,21 @@ class Client(object):
         else:
             self.logger.warning("Could not fetch account_id from Telegram.")
 
+    def _estimate_reading_time(text, wpm=None):
+        """
+        Estimate the reading time for a given text in seconds.
+        """
+        from scipy.stats import skewnorm
+        from numpy import arange
+        words = len(text.split())
+        if wpm is None:
+            wpm_list = arange(160, 301, dtype=int)
+            wpm_distribution = skewnorm.pdf(wpm_list, loc=230, scale=30, a=0)
+            wpm_distribution = wpm_distribution / wpm_distribution.max()
+            probs = wpm_distribution / wpm_distribution.sum()
+            wpm = random.choice(wpm_list, p=probs, size=1)[0]
+        return round(float(words / wpm * 60), 3)
+
     # Basic actions
 
     async def _react(self, message, target_chat):
@@ -224,7 +238,7 @@ class Client(object):
                 if not msg_content:
                     self.logger.warning("Message content is empty, skipping reaction.")
                     return
-                reading_time = estimate_reading_time(msg_content)
+                reading_time = self._estimate_reading_time(msg_content)
                 self.logger.debug(f"Estimated reading time: {reading_time} seconds")
                 await asyncio.sleep(reading_time)
 
@@ -247,7 +261,7 @@ class Client(object):
             await self.ensure_connected()
             if config.get('delays', {}).get('humanisation_level', 1) >= 1:  # If humanisation level is 1 or higher it should consider reading time
                 msg_content = await self.get_message_content(chat_id=target_chat, message_id=message.id)
-                reading_time = estimate_reading_time(msg_content)
+                reading_time = self._estimate_reading_time(msg_content)
                 self.logger.debug(f"Estimated reading time: {reading_time} seconds")
                 await asyncio.sleep(reading_time)
 

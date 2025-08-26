@@ -14,19 +14,17 @@
 - add creation of neccessary files if they dont exist
 - implement proxy logic (import, status, links to accounts)
 
-- ? move sessions into MongoDB
 - add passwords into account records + encrypt data
 - update task status during run
 - post ids in task should be sorted!
 - ENSURE DATA TYPES CONSISTENCY
 - rewrite connect clients to async
 
-### Questions
-- Should I implement 2nd layer of humanisation or drop it?
-
-
 
 ## Changelog
+
+### v0.3
+
 
 
 ### v0.2
