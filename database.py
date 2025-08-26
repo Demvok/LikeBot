@@ -558,13 +558,7 @@ class MongoStorage(StorageInterface):
     @ensure_async
     async def update_account(cls, phone_number, update_data):
         cls._init()
-        if hasattr(phone_number, 'phone_number'):
-            phone_number = phone_number.phone_number
-        if hasattr(update_data, 'to_dict'):
-            update_data = update_data.to_dict()
-        elif isinstance(update_data, str):
-            update_data = {'value': update_data}
-        elif not isinstance(update_data, dict):
+        if not isinstance(update_data, dict):
             raise ValueError(f"update_data must be a dict mapping field names to values, got {type(update_data)}: {update_data}")
         update_data.pop('_id', None)
         result = await cls._accounts.update_one({"phone_number": phone_number}, {"$set": update_data})
@@ -630,13 +624,7 @@ class MongoStorage(StorageInterface):
     @ensure_async
     async def update_post(cls, post_id, update_data):
         cls._init()
-        if hasattr(post_id, 'post_id'):
-            post_id = post_id.post_id
-        if hasattr(update_data, 'to_dict'):
-            update_data = update_data.to_dict()
-        elif isinstance(update_data, str):
-            update_data = {'value': update_data}
-        elif not isinstance(update_data, dict):
+        if not isinstance(update_data, dict):
             raise ValueError(f"update_data must be a dict mapping field names to values, got {type(update_data)}: {update_data}")
         update_data.pop('_id', None)
         result = await cls._posts.update_one({"post_id": post_id}, {"$set": update_data})
@@ -724,13 +712,7 @@ class MongoStorage(StorageInterface):
     @ensure_async
     async def update_task(cls, task_id, update_data):
         cls._init()
-        if hasattr(task_id, 'task_id'):
-            task_id = task_id.task_id
-        if hasattr(update_data, 'to_dict'):
-            update_data = update_data.to_dict()
-        elif isinstance(update_data, str):
-            update_data = {'value': update_data}
-        elif not isinstance(update_data, dict):
+        if not isinstance(update_data, dict):
             raise ValueError(f"update_data must be a dict mapping field names to values, got {type(update_data)}: {update_data}")
         update_data.pop('_id', None)
         result = await cls._tasks.update_one({"task_id": task_id}, {"$set": update_data})

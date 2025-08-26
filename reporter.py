@@ -165,6 +165,11 @@ class Reporter:
         async with reporter.run_context("task-1") as run_id:
             await reporter.event(...)
         """
+        # # graceful shutdown on signals
+        # loop = asyncio.get_running_loop()
+        # stop = asyncio.Event()
+        # for sig in (signal.SIGINT, signal.SIGTERM):
+        #     loop.add_signal_handler(sig, stop.set)
         class _RunCtx:
             def __init__(self, reporter, task_id, meta):
                 self.reporter = reporter
@@ -195,21 +200,3 @@ async def example_worker(task_id: str, reporter: Reporter):
         # simulate error:
         # raise RuntimeError("Simulated")
         await reporter.event(run_id, task_id, "INFO", "step.finished", "Step 1 done", {"step": 1})
-
-
-
-async def main():
-    reporter = Reporter()
-    await reporter.start()
-
-    # graceful shutdown on signals
-    loop = asyncio.get_running_loop()
-    stop = asyncio.Event()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
-
-    workers = [asyncio.create_task(example_worker(f"task-{i}", reporter)) for i in range(5)]
-    await asyncio.gather(*workers)
-
-    # stop reporter and flush
-    await reporter.stop()

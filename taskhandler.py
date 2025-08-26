@@ -1,7 +1,8 @@
 from pandas import Timestamp
-import re, yaml, asyncio
+import re, yaml, asyncio, datetime
 from enum import Enum, auto
 from agent import Account, Client
+from reporter import Reporter
 from logger import setup_logger
 
 def load_config():
@@ -25,8 +26,21 @@ class Post:
 
     @property
     def is_validated(self):
-        """Check if the post has been validated by checking chat_id and message_id."""
-        return self.chat_id is not None and self.message_id is not None
+        """Check if the post has been validated by checking chat_id and message_id, and updated within 1 day."""
+        if self.chat_id is None or self.message_id is None:
+            return False
+        # Check if updated_at is within 1 day from now
+        now = Timestamp.now()
+        if isinstance(self.updated_at, Timestamp):
+            delta = now - self.updated_at
+            return delta.days <= 1
+        elif isinstance(self.updated_at, str):
+            delta = now - Timestamp(self.updated_at)
+            return delta.days <= 1
+        elif isinstance(self.updated_at, datetime.datetime):
+            delta = now.to_pydatetime() - self.updated_at
+            return delta.days <= 1
+        return False
 
     def to_dict(self):
         """Convert Post object to dictionary with serializable timestamps."""
@@ -75,22 +89,39 @@ class Post:
 
 
 
-    async def validate(self, client):
+    async def validate(self, client, logger=None):
         """Validate the post by fetching its chat_id and message_id, and update the record in file."""
         from database import get_db
         db = get_db()
-        chat_id, message_id = await self._get_message_ids(client, self.message_link)
-        self.chat_id = chat_id
-        self.message_id = message_id
-        self.updated_at = Timestamp.now()
-        await db.update_post(self, {'chat_id': chat_id, 'message_id': message_id})
+        retries = config.get('delays', {}).get('action_retries', 5)
+        delay = config.get('delays', {}).get('action_retry_delay', 3)
+        attempt = 0
+        while attempt < retries:
+            try:
+                chat_id, message_id = await self._get_message_ids(client, self.message_link)
+                self.chat_id = chat_id
+                self.message_id = message_id
+                self.updated_at = Timestamp.now()
+                await db.update_post(self.post_id, {
+                    'chat_id': self.chat_id,
+                    'message_id': self.message_id,
+                    'updated_at': str(self.updated_at)
+                })
+                break  # If you got here - task succeeded
+            except Exception as e:
+                attempt += 1
+                if attempt < retries:
+                    await asyncio.sleep(delay)
+                elif logger:
+                    logger.error(f"Failed to validate post {self.post_id} after {retries} attempts.")
+                    raise e
         return self
     
     @classmethod
     async def mass_validate_posts(cls, posts, client, logger=None):
         """Validate multiple posts asynchronously."""
         if logger:
-            logger.debug(f"Validating {len(posts)} posts...")
+            logger.info(f"Validating {len(posts)} posts...")
         if not posts:
             if logger:
                 logger.warning("No posts to validate.")
@@ -99,16 +130,40 @@ class Post:
             raise ValueError("Posts should be a list of Post objects.")
         if not client:
             raise ValueError("Client is not initialized.")
-        already_validated, newly_validated = 0, 0
+        from database import get_db
+        db = get_db()
+        already_validated, newly_validated, failed_validation = 0, 0, 0
+        new_posts = []
         for post in posts:
-            if post.is_validated:
-                already_validated += 1
-                continue
-            post = await post.validate(client=client.client)
-            if post.is_validated:
-                newly_validated += 1
+            try:               
+                if post.is_validated:
+                    already_validated += 1
+                    new_posts.append(post)
+                    continue
+                
+                if not post.is_validated:
+                    await post.validate(client=client, logger=logger)
+                    new_post = await db.get_post(post.post_id)
+                    new_posts.append(new_post)
+
+                    if new_post.is_validated:
+                        newly_validated += 1
+                        continue
+    
+                    failed_validation += 1
+                    continue
+                    
+                if logger:
+                    logger.warning(f"Post {post.post_id} failed validation after validate(). State: chat_id={post.chat_id}, message_id={post.message_id}, updated_at={post.updated_at}")
+
+            except Exception as e:
+                if logger:
+                    logger.error(f"Exception during validation of post {getattr(post, 'post_id', None)}: {e}")
+        
         if logger:
-            logger.info(f"Validated {len(posts)} posts: {newly_validated} newly validated, {already_validated} already validated.")
+            logger.info(f"Validated {len(posts)} posts: {newly_validated} newly validated, {already_validated} already validated, {failed_validation} failed validation.")
+        
+        return new_posts
 
 
 
@@ -205,44 +260,27 @@ class Task:
             accounts = await self.get_accounts()
             posts = await self.get_posts()
 
-            await self._check_pause()  # Check for pause before connecting clients
+            await self._check_pause()
             self._clients = await Client.connect_clients(accounts, self.logger)
-
-            if self.get_action_type() == 'react':  # Iterate tasks !!!
-
-                current_emojis = self.get_reaction_emojis()  # Get and set reaction palette  TO FIX!!!
-                for client in self._clients:
-                    client.active_emoji_palette = current_emojis
-
-                await self._check_pause()  # Check for pause before validation
-                if self._clients:
-                    await Post.mass_validate_posts(posts, self._clients[0], self.logger)
-
-
-                for post in posts:  # TO REVIEW, should be async
-                    await self._check_pause()  # Check pause before each post
-                    if post.is_validated:
-                        for i, client in enumerate(self._clients):
-                            try:
-                                await client.react(post.message_id, post.chat_id)
-                                self.logger.debug(f"Client {i} reacted to post {post.post_id}")
-                            except Exception as e:
-                                self.logger.warning(f"Client {i} failed to react to post {post.post_id}: {e}")
-                        self.logger.info(f"All clients have reacted to post {post.post_id} with {self.get_reaction_palette_name()}")
-
-
-            if self.get_action_type() == 'comment':  # Logic to handle comment actions can be added here
-                self.logger.info("Comment actions are not implemented yet.")
-                pass
-
+            
+            await self._check_pause()
+            if self._clients:  # Validate posts to get corresponding ids
+                posts = await Post.mass_validate_posts(posts, self._clients[0], self.logger)
 
             if self.get_action() is None:
                 raise ValueError("No action defined for the task.")
-
-
-            # If you get here - task succeeded
-            self.logger.info(f"Task {self.task_id} completed successfully.")
-            self.status = Task.TaskStatus.FINISHED
+            else:
+                reporter = Reporter()
+                await reporter.start()
+                async with await reporter.run_context(self.task_id, meta={"task_name": self.name, "action": self.get_action_type()}) as run_id:
+                    workers = [
+                        asyncio.create_task(self.client_worker(client, posts, reporter, run_id))
+                        for client in self._clients
+                    ]
+                    await asyncio.gather(*workers)
+                
+                # stop reporter and flush
+                await reporter.stop()
 
         except asyncio.CancelledError:
             self.logger.info(f"Task {self.task_id} was cancelled.")
@@ -254,6 +292,67 @@ class Task:
         finally:
             self._clients = await Client.disconnect_clients(self._clients, self.logger)
             self.updated_at = Timestamp.now()
+
+        # If you got here - task succeeded
+        self.logger.info(f"Task {self.task_id} completed successfully.")
+        self.status = Task.TaskStatus.FINISHED
+
+    async def client_worker(self, client, posts, reporter=None, run_id=None):
+        if self.get_action_type() == 'react':
+            client.active_emoji_palette = self.get_reaction_emojis()
+            for post in posts:
+                client = await self._check_pause_single(client)  # Check pause before each post
+                if post.is_validated:
+                    try:
+                        await client.react(post.message_id, post.chat_id)
+                        self.logger.debug(f"Client {client.account_id} reacted to post {post.post_id}")
+                        if reporter and run_id:
+                            await reporter.event(run_id, self.task_id, "INFO", "step.started", "Start step 1", {"step": 1})
+                    except Exception as e:
+                        self.logger.warning(f"Client {client.account_id} failed to react to post {post.post_id}: {e}")
+
+                # add per-post sleep
+
+
+        if self.get_action_type() == 'comment':  # Logic to handle comment actions can be added here
+            self.logger.info("Comment actions are not implemented yet.")
+            pass
+
+    async def _check_pause(self):
+        """Check if task should be paused and wait if needed. Disconnect clients on pause, reconnect on resume."""
+        if not self._pause_event.is_set():
+            self.logger.info(f"Task {self.task_id} is paused, disconnecting clients and waiting to resume...")
+            # Disconnect clients if connected
+            if self._clients:
+                for client in self._clients:
+                    try:
+                        await client.client.disconnect()
+                    except Exception as e:
+                        self.logger.warning(f"Error disconnecting client {client.account_id}: {e}")
+                self._clients = None
+            await self._pause_event.wait()
+            # Reconnect clients
+            self.logger.info(f"Task {self.task_id} resumed. Reconnecting clients...")
+            accounts = self.get_accounts()
+            self._clients = await Client.connect_clients(accounts, self.logger)
+
+    async def _check_pause_single(self, client):
+        if not self._pause_event.is_set():
+            self.logger.info(f"Task {self.task_id} is paused, disconnecting client {client.account_id} and waiting to resume...")
+            try:
+                await client.client.disconnect()
+            except Exception as e:
+                self.logger.warning(f"Error disconnecting client {client.account_id}: {e}")
+            client.client = None
+            self.logger.debug(f"Task {self.task_id} for client {client.account_id} is paused.")
+            await self._pause_event.wait()
+            try:
+                await client.connect()
+            except Exception as e:
+                self.logger.warning(f"Error reconnecting client {client.account_id}: {e}")
+            self.logger.info(f"Task {self.task_id} for client {client.account_id} resumed.")
+            return client
+        return client
 
 
 
@@ -270,40 +369,18 @@ class Task:
         """Pause the task."""
         if self.status == Task.TaskStatus.RUNNING:
             self._pause_event.clear()
-            self.status = Task.TaskStatus.PAUSED  # Add this line
+            self.status = Task.TaskStatus.PAUSED
             self.logger.info(f"Task {self.task_id} paused.")
 
     async def resume(self):
         """Resume the task."""
         if self.status == Task.TaskStatus.PAUSED:
             self._pause_event.set()
-            self.status = Task.TaskStatus.RUNNING  # Add this line
-            self.logger.info(f"Task {self.task_id} resumed.")
-
-    async def _check_pause(self):
-        """Check if task should be paused and wait if needed. Disconnect clients on pause, reconnect on resume."""
-        if not self._pause_event.is_set():
-            self.status = Task.TaskStatus.PAUSED
-            self.logger.info(f"Task {self.task_id} is paused, disconnecting clients and waiting to resume...")
-            # Disconnect clients if connected
-            if self._clients:
-                for client in self._clients:
-                    try:
-                        await client.client.disconnect()
-                    except Exception as e:
-                        self.logger.warning(f"Error disconnecting client: {e}")
-                self._clients = None
-            await self._pause_event.wait()
             self.status = Task.TaskStatus.RUNNING
-            self.logger.info(f"Task {self.task_id} resumed. Reconnecting clients...")
-            # Reconnect clients
-            accounts = self.get_accounts()
-            self._clients = await Client.connect_clients(accounts, self.logger)
-
+            self.logger.info(f"Task {self.task_id} resumed.")
 
     async def get_status(self):
         """Get the current status of the task."""
         # Additional info gathering logic can be added here
         # Will be used to create reports
         return self.status
-    

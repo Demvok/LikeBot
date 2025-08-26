@@ -79,6 +79,7 @@ class Client(object):
         try:
             self.session_name = account.session_name
             self.phone_number = account.phone_number
+            self.account_id = account.account_id
         except KeyError as e:
             raise ValueError(f"Missing key in account configuration: {e}")
         self.active_emoji_palette = config.get('reactions_palettes', []).get('positive', [])  # Default emoji palette, is replaced automatically
@@ -120,7 +121,8 @@ class Client(object):
                 )
                 await self.client.start()
                 self.logger.debug(f"Client for {self.phone_number} started successfully.")
-                await self.update_account_id_from_telegram()
+                if not self.account_id:
+                    await self.update_account_id_from_telegram()
                 return self
             except Exception as e:
                 attempt += 1

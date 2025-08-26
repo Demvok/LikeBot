@@ -12,13 +12,14 @@
 - route account to session creation for first use
 
 - add creation of neccessary files if they dont exist
-- add check for validated posts if they still exist
 - implement proxy logic (import, status, links to accounts)
 
-- check for id data type consistency
 - ? move sessions into MongoDB
 - add passwords into account records + encrypt data
 - update task status during run
+- post ids in task should be sorted!
+- ENSURE DATA TYPES CONSISTENCY
+- rewrite connect clients to async
 
 ### Questions
 - Should I implement 2nd layer of humanisation or drop it?
