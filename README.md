@@ -23,6 +23,7 @@
 
 ## Questions
 - Should i save account passwords in DB?
+- Should i add run/event logic as local json files?
 
 
 ## Changelog

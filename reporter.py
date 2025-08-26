@@ -73,14 +73,28 @@ class Reporter:
             update["$set"]["meta"] = meta_patch
         await self.runs_coll.update_one({"run_id": run_id}, update)
 
-    async def event(self, run_id: str, task_id: str, level: str, code: str, message: str, payload: Optional[Dict[str, Any]] = None):
+    async def event(self, run_id: str, task_id: str, level: str, message: str, code: str = None, payload: Optional[Dict[str, Any]] = None):
+        """
+        Asynchronously reports an event by adding it to the internal queue.
+        Args:
+            run_id (str): Unique identifier for the current run or session.
+            task_id (str): Identifier for the specific task associated with the event.
+            level (str): Severity level of the event (e.g., 'info', 'warning', 'error').
+            code (str): Application-specific code representing the event type.
+            message (str): Human-readable message describing the event.
+            payload (Optional[Dict[str, Any]]): Additional data relevant to the event. Defaults to an empty dictionary if not provided.
+        Raises:
+            asyncio.QueueFull: If the queue is full and cannot accept new items.
+        This method constructs an event dictionary with the provided details, including a timestamp, and enqueues it for further processing or reporting.
+        """
+        
         item = {
             "type": "event",
             "run_id": run_id,
             "task_id": task_id,
             "ts": utc_now(),
             "level": level,
-            "code": code,
+            "code": code or None,
             "message": message,
             "payload": payload or {}
         }
@@ -88,8 +102,8 @@ class Reporter:
 
 
 
-    # ---- Background writer ----
     async def _writer_loop(self):
+        """Background task for writing events to the database."""
         buffer: List[Dict[str, Any]] = []
         last_flush = asyncio.get_running_loop().time()
 
@@ -145,7 +159,6 @@ class Reporter:
                 await asyncio.sleep(0.2)
 
 
-
     async def start(self):
         await self.init()
         self._writer_task = asyncio.create_task(self._writer_loop())
@@ -155,8 +168,7 @@ class Reporter:
         self._stop_event.set()
         if self._writer_task:
             await self._writer_task
-        # optionally close client
-        self.client.close()
+        self.client.close()  # optionally close client
 
     # Convenient context manager for a run
     async def run_context(self, task_id: str, meta: Optional[Dict[str, Any]] = None):
@@ -188,15 +200,3 @@ class Reporter:
         return _RunCtx(self, task_id, meta)
 
 
-
-# ---------------- Example usage ----------------
-
-async def example_worker(task_id: str, reporter: Reporter):
-    # using context manager
-    async with await reporter.run_context(task_id, meta={"info": "demo"}) as run_id:
-        await reporter.event(run_id, task_id, "INFO", "step.started", "Start step 1", {"step": 1})
-        await asyncio.sleep(0.2)
-        await reporter.event(run_id, task_id, "INFO", "step.progress", "50% done", {"progress": 50})
-        # simulate error:
-        # raise RuntimeError("Simulated")
-        await reporter.event(run_id, task_id, "INFO", "step.finished", "Step 1 done", {"step": 1})

@@ -258,35 +258,44 @@ class Task:
         await reporter.start()
         async with await reporter.run_context(self.task_id, meta={"task_name": self.name, "action": self.get_action_type()}) as run_id:
             try:
+                await reporter.event(run_id, self.task_id, "INFO", "info.run_start", f"Starting run for task.")
                 accounts = await self.get_accounts()
                 posts = await self.get_posts()
+                await reporter.event(run_id, self.task_id, "DEBUG", "info.data_loaded", f"Got accounts and posts objects.")
 
                 await self._check_pause()
                 self._clients = await Client.connect_clients(accounts, self.logger)
-                
+                await reporter.event(run_id, self.task_id, "INFO", "info.client_connect", f"Connected {len(self._clients)} clients.")
+
                 await self._check_pause()
                 if self._clients:  # Validate posts to get corresponding ids
                     posts = await Post.mass_validate_posts(posts, self._clients[0], self.logger)
+                await reporter.event(run_id, self.task_id, "INFO", "info.posts_validated", f"Validated {len(posts)} posts.")
 
                 if self.get_action() is None:
+                    await reporter.event(run_id, self.task_id, "ERROR", "info.no_action", "No action defined for the task.")
                     raise ValueError("No action defined for the task.")
                 else:
+                    await reporter.event(run_id, self.task_id, "DEBUG", "info.creating_workers", "Proceeding to worker creation")
                     workers = [
                         asyncio.create_task(self.client_worker(client, posts, reporter, run_id))
                         for client in self._clients
                     ]
                     results = await asyncio.gather(*workers, return_exceptions=True)
+                    await reporter.event(run_id, self.task_id, "INFO", "info.workers_finished", "All workers have finished executing.")
                     for result in results:
                         if isinstance(result, Exception):
-                            # handle/log the exception
-                            pass
+                            self.logger.error(f"Error in worker for client {self._clients[results.index(result)].account_id}: {result}")
+                            await reporter.event(run_id, self.task_id, "WARNING", "error.worker_exception", f"Worker for client {self._clients[results.index(result)].account_id} raised an exception: {result}")
                     workers.clear()
-
+                
             except asyncio.CancelledError:
                 self.logger.info(f"Task {self.task_id} was cancelled.")
+                await reporter.event(run_id, self.task_id, "WARNING", "info.run_cancelled", "Run was cancelled.")
                 self.status = Task.TaskStatus.PENDING
             except Exception as e:
                 self.logger.error(f"Error starting task {self.task_id}: {e}")
+                await reporter.event(run_id, self.task_id, "ERROR", "info.run_failed", f"Run failed: {e}")
                 self.status = Task.TaskStatus.CRASHED
                 raise e
             finally:
@@ -295,11 +304,12 @@ class Task:
                 self.updated_at = Timestamp.now()
                 self._task = None  # Mark task as finished
             
-            await reporter.stop()  # stop reporter and flush
-
+            await reporter.event(run_id, self.task_id, "INFO", "info.run_end", "Run has ended.")
             # If you got here - task succeeded
             self.logger.info(f"Task {self.task_id} completed successfully.")
             self.status = Task.TaskStatus.FINISHED
+            await reporter.stop()  # stop reporter and flush            
+
 
     async def client_worker(self, client, posts, reporter=None, run_id=None):
         if self.get_action_type() == 'react':
