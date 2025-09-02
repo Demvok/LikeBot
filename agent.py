@@ -1,16 +1,13 @@
 import re, yaml, os, random, asyncio
 from telethon.tl.functions.messages import SendReactionRequest, GetMessagesRequest
 from telethon import TelegramClient, functions, types
-from logger import setup_logger
+from logger import setup_logger, load_config
 from dotenv import load_dotenv
 
 load_dotenv()
 api_id = os.getenv('api_id')
 api_hash = os.getenv('api_hash')
 
-def load_config():
-    with open('config.yaml', 'r', encoding='utf-8') as file:
-        return yaml.safe_load(file)
 config = load_config()
 
 

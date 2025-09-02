@@ -1,4 +1,5 @@
-import asyncio, uuid, signal, os
+import pandas as pd
+import asyncio, uuid, signal, os, yaml
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 import motor.motor_asyncio
@@ -6,20 +7,21 @@ from pymongo import IndexModel
 from pymongo import ASCENDING
 from pymongo.write_concern import WriteConcern
 from dotenv import load_dotenv
-from logger import setup_logger
+from logger import setup_logger, load_config
 
 load_dotenv()
 
 logger = setup_logger("reporter", "main.log")
+config = load_config()
 
 # CONFIG
 MONGO_URI = os.getenv("db_url", "mongodb://localhost:27017")
 DB_NAME = os.getenv("db_name")
-EVENTS_COLL = 'events'
-RUNS_COLL = 'runs'
+EVENTS_COLL = config.get('database', {}).get('events_coll', 'events')
+RUNS_COLL = config.get('database', {}).get('runs_coll', 'runs')
 
-BATCH_SIZE = 100
-BATCH_TIMEOUT = 0.5  # seconds
+BATCH_SIZE = config.get('database', {}).get('batch_size', 100)
+BATCH_TIMEOUT = config.get('database', {}).get('batch_timeout', 0.5)
 
 
 def utc_now():
@@ -200,3 +202,100 @@ class Reporter:
         return _RunCtx(self, task_id, meta)
 
 
+# Async class to manage runs and events data from MongoDB
+class RunEventManager:
+    def __init__(self):
+        self.client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+        self.db = self.client[DB_NAME]
+        self.runs_coll = self.db[RUNS_COLL]
+        self.events_coll = self.db[EVENTS_COLL]
+        self.runs_df = pd.DataFrame()
+        self.events_df = pd.DataFrame()
+
+    async def refresh(self):
+        """Reload data from MongoDB asynchronously."""
+        runs_cursor = self.runs_coll.find()
+        events_cursor = self.events_coll.find()
+        runs = await runs_cursor.to_list(length=None)
+        events = await events_cursor.to_list(length=None)
+        self.runs_df = pd.DataFrame(runs)
+        self.events_df = pd.DataFrame(events)
+
+    async def get_tasks(self):
+        """
+        Returns a pandas DataFrame with all unique task_ids and the number of runs for each.
+        Ensures columns are ordered: task_id, run_count.
+        """
+        pipeline = [
+            {"$group": {"_id": "$task_id", "run_count": {"$sum": 1}}},
+            {"$project": {"task_id": "$_id", "run_count": 1, "_id": 0}}
+        ]
+        cursor = self.runs_coll.aggregate(pipeline)
+        results = await cursor.to_list(length=None)
+        df = pd.DataFrame(results)
+        # Ensure columns order
+        df = df.loc[:, ["task_id", "run_count"]] if not df.empty else pd.DataFrame(columns=["task_id", "run_count"])
+        return df
+
+    async def get_runs(self, task_id):
+        """
+        Return all runs for a given task_id, with an additional column 'event_count'
+        indicating the number of events for each run, ordered by started_at descending.
+        """
+        # Get all runs for the task_id, ordered by started_at descending
+        cursor = self.runs_coll.find({'task_id': task_id}).sort('started_at', -1)
+        runs = await cursor.to_list(length=None)
+        if not runs:
+            return pd.DataFrame(columns=["run_id", "task_id", "started_at", "finished_at", "status", "meta", "event_count"])
+
+        # Get event counts for each run_id
+        run_ids = [run["run_id"] for run in runs]
+        pipeline = [
+            {"$match": {"run_id": {"$in": run_ids}}},
+            {"$group": {"_id": "$run_id", "event_count": {"$sum": 1}}}
+        ]
+        event_counts_cursor = self.events_coll.aggregate(pipeline)
+        event_counts = await event_counts_cursor.to_list(length=None)
+        event_count_map = {ec["_id"]: ec["event_count"] for ec in event_counts}
+
+        # Add event_count to each run
+        for run in runs:
+            run["event_count"] = event_count_map.get(run["run_id"], 0)
+
+        return pd.DataFrame(runs)
+
+    async def get_task_details(self, task_id):
+        """Return details for a single task."""
+        cursor = self.runs_coll.find({'task_id': task_id})
+        runs = await cursor.to_list(length=None)
+        return runs
+
+    async def get_events(self, run_id):
+        """Return all events for a given run_id with details."""
+        cursor = self.events_coll.find({'run_id': run_id}).sort('ts', -1)
+        events = await cursor.to_list(length=None)
+        return pd.DataFrame(events)
+
+    async def get_event_details(self, event_id):
+        """Return details for a single event."""
+        cursor = self.events_coll.find({'event_id': event_id})
+        events = await cursor.to_list(length=None)
+        return events
+
+    async def delete_run(self, run_id):
+        """Delete a run by run_id."""
+        result = await self.runs_coll.delete_one({'run_id': run_id})
+        await self.refresh()
+        return result.deleted_count
+
+    async def delete_event(self, event_id):
+        """Delete an event by event_id."""
+        result = await self.events_coll.delete_one({'event_id': event_id})
+        await self.refresh()
+        return result.deleted_count
+
+    async def clear_runs(self, task_id):
+        """Delete all runs for a given task_id and refresh data."""
+        result = await self.runs_coll.delete_many({'task_id': task_id})
+        await self.refresh()
+        return result.deleted_count

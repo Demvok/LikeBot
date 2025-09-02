@@ -10,6 +10,12 @@ filepaths:  # File paths for various resources
   tasks: "tasks.json"
   sessions_folder: "sessions/"
 
+database:
+  events_coll: "events"
+  runs_coll: "runs"
+  batch_size: 100  # Number of events to batch before writing to DB
+  batch_timeout: 0.5  # Timeout for batch flushing
+
 reactions_palettes:
   positive:
     - "👍"

@@ -21,6 +21,10 @@
 - rewrite connect clients to async
 - add signal stops for reporter context
 
+- add object refresh on client for first account_id retrieval or fix logging to use phone number
+- add reaction precondition (exists in chat) check
+- multiple post import
+
 ## Questions
 - Should i save account passwords in DB?
 - Should i add run/event logic as local json files?

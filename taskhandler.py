@@ -3,17 +3,14 @@ import re, yaml, asyncio, datetime
 from enum import Enum, auto
 from agent import Account, Client
 from reporter import Reporter
-from logger import setup_logger
+from logger import setup_logger, load_config
 
-def load_config():
-    with open('config.yaml', 'r', encoding='utf-8') as file:
-        return yaml.safe_load(file)
 config = load_config()
 
 
 class Post:
 
-    def __init__(self, post_id:int, message_link:str, chat_id:int=None, message_id:int=None, created_at=None, updated_at=None):
+    def __init__(self, message_link:str, post_id:int=None, chat_id:int=None, message_id:int=None, created_at=None, updated_at=None):
         self.post_id = post_id
         self.chat_id = chat_id
         self.message_id = message_id
@@ -22,7 +19,7 @@ class Post:
         self.updated_at = updated_at or Timestamp.now()
 
     def __repr__(self):
-        return f"Post({self.post_id}, {'validated' if self.is_validated else 'unvalidated'}, {self.message_link})"
+        return f"Post({self.post_id if self.post_id else 'unassigned'}, {'validated' if self.is_validated else 'unvalidated'}, {self.message_link})"
 
     @property
     def is_validated(self):
@@ -201,14 +198,14 @@ class Task:
     def __str__(self):
         return f"Task: {self.name} (ID: {self.task_id})"
 
-    def to_dict(self, rich=False):
+    def to_dict(self):
         """Convert Task object to dictionary with serializable timestamps."""
         return {
             'task_id': self.task_id,
             'name': self.name,
             'description': self.description,
-            'post_ids': self.post_ids if not rich else self.get_posts(),
-            'accounts': self.accounts if not rich else self.get_accounts(),
+            'post_ids': self.post_ids,
+            'accounts': self.accounts,
             'action': self.action,
             'status': self.status.name if isinstance(self.status, Task.TaskStatus) else self.status,
             'created_at': self.created_at.isoformat() if isinstance(self.created_at, Timestamp) else self.created_at,
@@ -258,31 +255,31 @@ class Task:
         await reporter.start()
         async with await reporter.run_context(self.task_id, meta={"task_name": self.name, "action": self.get_action_type()}) as run_id:
             try:
-                await reporter.event(run_id, self.task_id, "INFO", "info.run_start", f"Starting run for task.")
+                await reporter.event(run_id, self.task_id, "INFO", "info.init.run_start", f"Starting run for task.")
                 accounts = await self.get_accounts()
                 posts = await self.get_posts()
-                await reporter.event(run_id, self.task_id, "DEBUG", "info.data_loaded", f"Got accounts and posts objects.")
+                await reporter.event(run_id, self.task_id, "DEBUG", "info.init.data_loaded", f"Got accounts and posts objects.")
 
                 await self._check_pause()
                 self._clients = await Client.connect_clients(accounts, self.logger)
-                await reporter.event(run_id, self.task_id, "INFO", "info.client_connect", f"Connected {len(self._clients)} clients.")
+                await reporter.event(run_id, self.task_id, "INFO", "info.connecting.client_connect", f"Connected {len(self._clients)} clients.")
 
                 await self._check_pause()
                 if self._clients:  # Validate posts to get corresponding ids
                     posts = await Post.mass_validate_posts(posts, self._clients[0], self.logger)
-                await reporter.event(run_id, self.task_id, "INFO", "info.posts_validated", f"Validated {len(posts)} posts.")
+                await reporter.event(run_id, self.task_id, "INFO", "info.connecting.posts_validated", f"Validated {len(posts)} posts.")
 
                 if self.get_action() is None:
-                    await reporter.event(run_id, self.task_id, "ERROR", "info.no_action", "No action defined for the task.")
+                    await reporter.event(run_id, self.task_id, "WARNING", "warning.no_action", "No action defined for the task.")
                     raise ValueError("No action defined for the task.")
                 else:
-                    await reporter.event(run_id, self.task_id, "DEBUG", "info.creating_workers", "Proceeding to worker creation")
+                    await reporter.event(run_id, self.task_id, "DEBUG", "info.action.creating_workers", "Proceeding to worker creation")
                     workers = [
                         asyncio.create_task(self.client_worker(client, posts, reporter, run_id))
                         for client in self._clients
                     ]
                     results = await asyncio.gather(*workers, return_exceptions=True)
-                    await reporter.event(run_id, self.task_id, "INFO", "info.workers_finished", "All workers have finished executing.")
+                    await reporter.event(run_id, self.task_id, "INFO", "info.action.workers_finished", "All workers have finished executing.")
                     for result in results:
                         if isinstance(result, Exception):
                             self.logger.error(f"Error in worker for client {self._clients[results.index(result)].account_id}: {result}")
@@ -295,7 +292,7 @@ class Task:
                 self.status = Task.TaskStatus.PENDING
             except Exception as e:
                 self.logger.error(f"Error starting task {self.task_id}: {e}")
-                await reporter.event(run_id, self.task_id, "ERROR", "info.run_failed", f"Run failed: {e}")
+                await reporter.event(run_id, self.task_id, "ERROR", "error.run_failed", f"Run failed: {e}")
                 self.status = Task.TaskStatus.CRASHED
                 raise e
             finally:
@@ -311,8 +308,10 @@ class Task:
             await reporter.stop()  # stop reporter and flush            
 
 
-    async def client_worker(self, client, posts, reporter=None, run_id=None):
+    async def client_worker(self, client, posts, reporter, run_id):
+        await reporter.event(run_id, self.task_id, "INFO", "info.worker", f"Worker started for client {client.phone_number}")
         if self.get_action_type() == 'react':
+            await reporter.event(run_id, self.task_id, "DEBUG", "info.worker.react", "Worker proceeds to reacting")
             client.active_emoji_palette = self.get_reaction_emojis()
             for post in posts:
                 client = await self._check_pause_single(client)  # Check pause before each post
@@ -320,17 +319,22 @@ class Task:
                     try:
                         await client.react(post.message_id, post.chat_id)
                         self.logger.debug(f"Client {client.account_id} reacted to post {post.post_id}")
-                        if reporter and run_id:
-                            await reporter.event(run_id, self.task_id, "INFO", "step.started", "Start step 1", {"step": 1})
+                        await reporter.event(run_id, self.task_id, "DEBUG", "info.worker.react", 
+                                             f"Client {client.phone_number} reacted to post {post.post_id} with {self.get_reaction_palette_name()}",
+                                             {"client": client.phone_number, "post_id": post.post_id, "palette": self.get_reaction_palette_name()})
                     except Exception as e:
                         self.logger.warning(f"Client {client.account_id} failed to react to post {post.post_id}: {e}")
+                        await reporter.event(run_id, self.task_id, "WARNING", "info.worker.react", f"Client {client.phone_number} failed to react to post {post.post_id}: {e}")
 
                 # add per-post sleep
 
 
         if self.get_action_type() == 'comment':  # Logic to handle comment actions can be added here
-            self.logger.info("Comment actions are not implemented yet.")
+            self.logger.warning("Comment actions are not implemented yet.")
+            await reporter.event(run_id, self.task_id, "DEBUG", "info.worker.comment", "Worker proceeds to commenting. NYI")
             pass
+
+        await reporter.event(run_id, self.task_id, "INFO", "info.worker", f"Worker finished for client {client.phone_number}")
 
     async def _check_pause(self):
         """Check if task should be paused and wait if needed. Disconnect clients on pause, reconnect on resume."""
@@ -350,21 +354,27 @@ class Task:
             accounts = self.get_accounts()
             self._clients = await Client.connect_clients(accounts, self.logger)
 
-    async def _check_pause_single(self, client):
+    async def _check_pause_single(self, client, reporter, run_id):
         if not self._pause_event.is_set():
             self.logger.info(f"Task {self.task_id} is paused, disconnecting client {client.account_id} and waiting to resume...")
+            await reporter.event(run_id, self.task_id, "INFO", "info.worker", f"Worker paused for client {client.phone_number}, disconnecting...")
             try:
                 await client.client.disconnect()
             except Exception as e:
                 self.logger.warning(f"Error disconnecting client {client.account_id}: {e}")
+                await reporter.event(run_id, self.task_id, "WARNING", "info.worker", f"Worker failed to disconnect for client {client.phone_number}: {e}")
             client.client = None
             self.logger.debug(f"Task {self.task_id} for client {client.account_id} is paused.")
+            await reporter.event(run_id, self.task_id, "DEBUG", "info.worker", f"Worker paused for client {client.phone_number}.")
             await self._pause_event.wait()
+            await reporter.event(run_id, self.task_id, "DEBUG", "info.worker", f"Worker resumed for client {client.phone_number}.")
             try:
                 await client.connect()
             except Exception as e:
                 self.logger.warning(f"Error reconnecting client {client.account_id}: {e}")
+                await reporter.event(run_id, self.task_id, "WARNING", "info.worker", f"Worker failed to reconnect for client {client.phone_number}: {e}")
             self.logger.info(f"Task {self.task_id} for client {client.account_id} resumed.")
+            await reporter.event(run_id, self.task_id, "DEBUG", "info.worker", f"Worker resumed for client {client.phone_number}.")
             return client
         return client
 
