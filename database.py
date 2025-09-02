@@ -856,10 +856,7 @@ class MongoStorage(StorageInterface):
 
 def get_db() -> StorageInterface:
     use_db = config.get('filepaths', {}).get('use_db', False)
-    logger.info(f"get_db called. use_db={use_db}")
     if use_db:
-        logger.debug("Returning MongoStorage instance.")
         return MongoStorage()
     else:
-        logger.debug("Returning FileStorage instance.")
         return FileStorage()

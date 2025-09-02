@@ -33,10 +33,12 @@ if not os.path.exists(accounts_folder):
 
 class CustomFormatter(logging.Formatter):
     def format(self, record):
-        # Set default value for execution_time if not provided
-        if not hasattr(record, 'execution_time'):
-            record.execution_time = 'N/A'
-        return super().format(record)
+            # Set default value for execution_time if not provided
+            if not hasattr(record, 'execution_time'):
+                record.execution_time = 'N/A'
+            # Fixate levelname length to 5 symbols
+            record.levelname = str(record.levelname).ljust(5)[:5]
+            return super().format(record)
 
 def setup_logger(name: str, log_file: str) -> logging.Logger:
     """
@@ -46,7 +48,10 @@ def setup_logger(name: str, log_file: str) -> logging.Logger:
     :param log_file: Path to the log file for this logger.
     :return: Configured Logger object.
     """
-    name = name.ljust(12, ' ')
+    if len(name) < 5:
+        name = name.ljust(4, ' ')
+    else:
+        name = name.ljust(12, ' ')
     # FORCE RESET: Remove any existing logger with this name
     if name in logging.Logger.manager.loggerDict:
         del logging.Logger.manager.loggerDict[name]

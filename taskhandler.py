@@ -51,7 +51,7 @@ class Post:
         }
 
     @classmethod
-    def from_keys(cls, post_id:int, message_link:str, chat_id:int=None, message_id:int=None):
+    def from_keys(cls, message_link:str, post_id:int=None, chat_id:int=None, message_id:int=None):
         """Create a Post object from keys."""
         return cls(
             post_id=post_id,
@@ -177,7 +177,7 @@ class Task:
         def __repr__(self):
             return self.name
 
-    def __init__(self, task_id, name, post_ids, accounts, action, description=None, status=None, created_at=None, updated_at=None):
+    def __init__(self, name, post_ids, accounts, action, task_id=None, description=None, status=None, created_at=None, updated_at=None):
         self.task_id = task_id
         self.name = name
         self.description = description
@@ -251,6 +251,10 @@ class Task:
 # Actions
 
     async def _run(self):
+        if not self.task_id:
+            self.logger.error("Task ID is not set.")
+            raise ValueError("Task ID is not set.")
+
         reporter = Reporter()
         await reporter.start()
         async with await reporter.run_context(self.task_id, meta={"task_name": self.name, "action": self.get_action_type()}) as run_id:
@@ -270,15 +274,19 @@ class Task:
                 await reporter.event(run_id, self.task_id, "INFO", "info.connecting.posts_validated", f"Validated {len(posts)} posts.")
 
                 if self.get_action() is None:
+                    self.logger.error("No action defined for the task.")
                     await reporter.event(run_id, self.task_id, "WARNING", "warning.no_action", "No action defined for the task.")
                     raise ValueError("No action defined for the task.")
                 else:
+                    self.logger.info(f"Task {self.task_id} proceeding with action: {self.get_action_type()}")
                     await reporter.event(run_id, self.task_id, "DEBUG", "info.action.creating_workers", "Proceeding to worker creation")
                     workers = [
                         asyncio.create_task(self.client_worker(client, posts, reporter, run_id))
                         for client in self._clients
                     ]
+                    self.logger.info(f"Created {len(workers)} workers for task {self.task_id}.")
                     results = await asyncio.gather(*workers, return_exceptions=True)
+                    self.logger.info(f"All workers for task {self.task_id} have finished executing.")
                     await reporter.event(run_id, self.task_id, "INFO", "info.action.workers_finished", "All workers have finished executing.")
                     for result in results:
                         if isinstance(result, Exception):
@@ -314,7 +322,7 @@ class Task:
             await reporter.event(run_id, self.task_id, "DEBUG", "info.worker.react", "Worker proceeds to reacting")
             client.active_emoji_palette = self.get_reaction_emojis()
             for post in posts:
-                client = await self._check_pause_single(client)  # Check pause before each post
+                client = await self._check_pause_single(client, reporter, run_id)  # Check pause before each post
                 if post.is_validated:
                     try:
                         await client.react(post.message_id, post.chat_id)

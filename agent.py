@@ -263,7 +263,7 @@ class Client(object):
             if config.get('delays', {}).get('humanisation_level', 1) >= 1:  # If humanisation level is 1 it should consider reading time
                 msg_content = await self.get_message_content(chat_id=target_chat, message_id=message.id)
                 reading_time = self.estimate_reading_time(msg_content)
-                self.logger.debug(f"Estimated reading time: {reading_time} seconds")
+                self.logger.info(f"Estimated reading time: {reading_time} seconds")
                 await asyncio.sleep(reading_time)
 
             discussion = await self.client(functions.messages.GetDiscussionMessageRequest(
