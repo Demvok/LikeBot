@@ -3,7 +3,6 @@
 ### TO DO:
 
 - implement various exception messages for client errors
-- implement task report logic (task, date, status, errors from accounts (async exception handling))
 - add account status as meta (login status)
 
 - add api for task import
@@ -14,8 +13,7 @@
 - add creation of neccessary files if they dont exist
 - implement proxy logic (import, status, links to accounts)
 
-- add passwords into account records + encrypt data
-- update task status during run
+- update task and runs status during run
 - post ids in task should be sorted!
 - ENSURE DATA TYPES CONSISTENCY
 - rewrite connect clients to async
@@ -25,15 +23,11 @@
 - add reaction precondition (exists in chat) check
 - multiple post import
 
-## Questions
-- Should i save account passwords in DB?
-- Should i add run/event logic as local json files?
-
 
 ## Changelog
 
 ### v0.3
-
+- implement task report logic (task, date, status, errors from accounts (async exception handling))
 
 
 ### v0.2

@@ -75,7 +75,7 @@ class Reporter:
             update["$set"]["meta"] = meta_patch
         await self.runs_coll.update_one({"run_id": run_id}, update)
 
-    async def event(self, run_id: str, task_id: str, level: str, message: str, code: str = None, payload: Optional[Dict[str, Any]] = None):
+    async def event(self, run_id: str, task_id: str, level: str, code: str = None, message: str = None, payload: Optional[Dict[str, Any]] = None):
         """
         Asynchronously reports an event by adding it to the internal queue.
         Args:
@@ -271,22 +271,47 @@ class RunEventManager:
         return runs
 
     async def get_events(self, run_id):
-        """Return all events for a given run_id with details."""
-        cursor = self.events_coll.find({'run_id': run_id}).sort('ts', -1)
+        """
+        Return all events for a given run_id with details.
+        Splits the 'code' field into 'event_type', 'action_type', and 'details' columns.
+        Removes the original 'code' column.
+        """
+        cursor = self.events_coll.find({'run_id': run_id}).sort('ts', 1)
         events = await cursor.to_list(length=None)
-        return pd.DataFrame(events)
+        df = pd.DataFrame(events)
+        if not df.empty and "code" in df.columns:
+            split_cols = df["code"].str.split(".", expand=True)
+            df["event_type"] = split_cols[0]
+            df["action_type"] = split_cols[1] if split_cols.shape[1] > 1 else None
+            df["details"] = split_cols[2] if split_cols.shape[1] > 2 else None
+            df = df.drop(columns=["code"])
+        return df
 
     async def get_event_details(self, event_id):
-        """Return details for a single event."""
-        cursor = self.events_coll.find({'event_id': event_id})
+        """
+        Return details for a single event.
+        Splits the 'code' field into 'event_type', 'action_type', and 'details' columns.
+        Removes the original 'code' field.
+        """
+        from bson import ObjectId
+        cursor = self.events_coll.find({'_id': ObjectId(event_id)})
         events = await cursor.to_list(length=None)
+        if events:
+            for event in events:
+                code = event.get("code", "")
+                parts = code.split(".") if code else []
+                event["event_type"] = parts[0] if len(parts) > 0 else None
+                event["action_type"] = parts[1] if len(parts) > 1 else None
+                event["details"] = parts[2] if len(parts) > 2 else None
+                event.pop("code", None)
         return events
 
     async def delete_run(self, run_id):
-        """Delete a run by run_id."""
-        result = await self.runs_coll.delete_one({'run_id': run_id})
+        """Delete a run by run_id and all linked events."""
+        run_result = await self.runs_coll.delete_one({'run_id': run_id})
+        event_result = await self.events_coll.delete_many({'run_id': run_id})
         await self.refresh()
-        return result.deleted_count
+        return {'runs_deleted': run_result.deleted_count, 'events_deleted': event_result.deleted_count}
 
     async def delete_event(self, event_id):
         """Delete an event by event_id."""
@@ -295,7 +320,55 @@ class RunEventManager:
         return result.deleted_count
 
     async def clear_runs(self, task_id):
-        """Delete all runs for a given task_id and refresh data."""
-        result = await self.runs_coll.delete_many({'task_id': task_id})
+        """Delete all runs for a given task_id and all linked events, then refresh data."""
+        # Find all run_ids for the given task_id
+        runs_cursor = self.runs_coll.find({'task_id': task_id}, {'run_id': 1})
+        runs = await runs_cursor.to_list(length=None)
+        run_ids = [run['run_id'] for run in runs]
+
+        # Delete runs
+        runs_result = await self.runs_coll.delete_many({'task_id': task_id})
+
+        # Delete linked events
+        if run_ids:
+            events_result = await self.events_coll.delete_many({'run_id': {'$in': run_ids}})
+            events_deleted = events_result.deleted_count
+        else:
+            events_deleted = 0
+
         await self.refresh()
-        return result.deleted_count
+        return {'runs_deleted': runs_result.deleted_count, 'events_deleted': events_deleted}
+
+async def create_report(data, type='success'):
+    """Create a report from the given data. As data standard uses data from get_events from RunEventManager. Report types are:
+    - success: Report successful events
+    - warnings: Report warning events
+    - errors: Report error events
+    """
+
+    preprocessed_data = data.drop(['_id', 'task_id', 'run_id', 'level'], axis=1).loc[data['action_type'] == 'worker'].dropna(subset=['details']).drop(['action_type', 'details'], axis=1).reset_index(drop=True)
+    preprocessed_data.ts = preprocessed_data.ts.dt.round('s')
+    preprocessed_data.rename({'ts': 'datetime', 'message': 'details'}, axis=1, inplace=True)
+    
+    if type == 'success':
+        success_report = preprocessed_data.loc[preprocessed_data['event_type'] == 'info'].drop('event_type', axis=1)
+        from pandas import Series
+        success_report = success_report.join(success_report['payload'].apply(Series))
+        success_report = success_report.drop('payload', axis=1)
+        import asyncio
+        async def fetch_post_link(post_id):
+            from database import get_db
+            db = get_db()
+            post = await db.get_post(post_id)
+            return post.message_link
+        tasks = [fetch_post_link(post_id) for post_id in success_report['post_id']]
+        results = await asyncio.gather(*tasks)
+
+        success_report['post_id'] = results
+        success_report = success_report.loc[:, ['datetime', 'client', 'post_id', 'palette', 'details']]
+        success_report.rename({'post_id': 'message_link'}, axis=1, inplace=True)
+        return success_report
+    # elif type == 'warnings':
+    #     pass
+    else:
+        return data  # Return the original data for unhandled types

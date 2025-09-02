@@ -191,6 +191,7 @@ class Task:
         self._pause_event.set()  # Initially not paused
         self._task = None
         self._clients = None  # Store connected clients for pause/resume
+        self._current_run_id = None
 
     def __repr__(self):
         return f"Task({self.task_id}, {self.name}, {self.status}, {self.created_at}, {self.updated_at})"
@@ -259,6 +260,7 @@ class Task:
         await reporter.start()
         async with await reporter.run_context(self.task_id, meta={"task_name": self.name, "action": self.get_action_type()}) as run_id:
             try:
+                self._current_run_id = run_id
                 await reporter.event(run_id, self.task_id, "INFO", "info.init.run_start", f"Starting run for task.")
                 accounts = await self.get_accounts()
                 posts = await self.get_posts()
@@ -275,7 +277,7 @@ class Task:
 
                 if self.get_action() is None:
                     self.logger.error("No action defined for the task.")
-                    await reporter.event(run_id, self.task_id, "WARNING", "warning.no_action", "No action defined for the task.")
+                    await reporter.event(run_id, self.task_id, "WARNING", "error.no_action", "No action defined for the task.")
                     raise ValueError("No action defined for the task.")
                 else:
                     self.logger.info(f"Task {self.task_id} proceeding with action: {self.get_action_type()}")
@@ -332,7 +334,7 @@ class Task:
                                              {"client": client.phone_number, "post_id": post.post_id, "palette": self.get_reaction_palette_name()})
                     except Exception as e:
                         self.logger.warning(f"Client {client.account_id} failed to react to post {post.post_id}: {e}")
-                        await reporter.event(run_id, self.task_id, "WARNING", "info.worker.react", f"Client {client.phone_number} failed to react to post {post.post_id}: {e}")
+                        await reporter.event(run_id, self.task_id, "WARNING", "error.worker.react", f"Client {client.phone_number} failed to react to post {post.post_id}: {e}")
 
                 # add per-post sleep
 
@@ -380,7 +382,7 @@ class Task:
                 await client.connect()
             except Exception as e:
                 self.logger.warning(f"Error reconnecting client {client.account_id}: {e}")
-                await reporter.event(run_id, self.task_id, "WARNING", "info.worker", f"Worker failed to reconnect for client {client.phone_number}: {e}")
+                await reporter.event(run_id, self.task_id, "WARNING", "error.worker", f"Worker failed to reconnect for client {client.phone_number}: {e}")
             self.logger.info(f"Task {self.task_id} for client {client.account_id} resumed.")
             await reporter.event(run_id, self.task_id, "DEBUG", "info.worker", f"Worker resumed for client {client.phone_number}.")
             return client
@@ -390,8 +392,13 @@ class Task:
 
     async def start(self):
         """Start the task."""
+        if self._task and not self._task.done():
+            self.logger.warning(f"Task {self.task_id} is already running (run_id={self.current_run_id}).")
+            return
+
         if self._task is None or self._task.done():
             self._pause_event.set()
+            self._current_run_id = None  # Will empty if exists, but if exists and finished will be used for statistics
             self.logger.info(f"Starting task {self.task_id} - {self.name}...")
             self._task = asyncio.create_task(self._run())
             self.updated_at = Timestamp.now()
@@ -413,6 +420,17 @@ class Task:
 
     async def get_status(self):
         """Get the current status of the task."""
-        # Additional info gathering logic can be added here
-        # Will be used to create reports
         return self.status
+    
+    async def get_report(self, type='success'):
+        """Get the report for the current task run. If it is running you will need to refresh."""
+        if not self._current_run_id:
+            self.logger.warning(f'Task {self.task_id} is not currently running or ran previously.')
+            return None
+
+        from reporter import RunEventManager, create_report
+        eventManager = RunEventManager()
+
+        events = await eventManager.get_events(self._current_run_id)
+
+        return await create_report(events, type)
