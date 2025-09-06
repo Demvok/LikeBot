@@ -2,21 +2,16 @@
 
 ### TO DO:
 
-- implement various exception messages for client errors
-- add account status as meta (login status)
-
 - add api for task import
 
+- add account status as meta (login status)
 - automate an provide manual way of session verification
 - route account to session creation for first use
 
 - add creation of neccessary files if they dont exist
 - implement proxy logic (import, status, links to accounts)
 
-- update task and runs status during run
-- post ids in task should be sorted!
 - ENSURE DATA TYPES CONSISTENCY
-- rewrite connect clients to async
 - add signal stops for reporter context
 
 - add object refresh on client for first account_id retrieval or fix logging to use phone number
@@ -27,8 +22,11 @@
 ## Changelog
 
 ### v0.3
-- implement task report logic (task, date, status, errors from accounts (async exception handling))
-
+- implemented task report logic (task, date, status, errors from accounts (async exception handling))
+- updated task and runs status during run
+- rewritten connect clients to async
+- implemented various exception messages for client errors
+- post ids in task now be sorted
 
 ### v0.2
 - configured ALL filepaths in config

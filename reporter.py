@@ -1,5 +1,5 @@
 import pandas as pd
-import asyncio, uuid, signal, os, yaml
+import asyncio, uuid, signal, os
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 import motor.motor_asyncio
@@ -195,8 +195,8 @@ class Reporter:
                 return self.run_id
             async def __aexit__(self, exc_type, exc, tb):
                 if exc:
-                    await self.reporter.event(self.run_id, self.task_id, "ERROR", "exception", str(exc), {"exc_type": str(exc_type)})
-                    await self.reporter.end_run(self.run_id, status="failed", meta_patch={"error": str(exc)})
+                    await self.reporter.event(self.run_id, self.task_id, "ERROR", "error", f'Error: {exc}', {'exc': exc})
+                    await self.reporter.end_run(self.run_id, status="failed", meta_patch={"error": exc.message})
                 else:
                     await self.reporter.end_run(self.run_id, status="success")
         return _RunCtx(self, task_id, meta)
@@ -339,36 +339,35 @@ class RunEventManager:
         await self.refresh()
         return {'runs_deleted': runs_result.deleted_count, 'events_deleted': events_deleted}
 
-async def create_report(data, type='success'):
+async def create_report(data, type=None):
     """Create a report from the given data. As data standard uses data from get_events from RunEventManager. Report types are:
     - success: Report successful events
-    - warnings: Report warning events
-    - errors: Report error events
+    - errors: Report error and warning events
     """
-
-    preprocessed_data = data.drop(['_id', 'task_id', 'run_id', 'level'], axis=1).loc[data['action_type'] == 'worker'].dropna(subset=['details']).drop(['action_type', 'details'], axis=1).reset_index(drop=True)
+    from pandas import Series
+    import asyncio
+    preprocessed_data = data.drop(['_id', 'task_id', 'run_id'], axis=1).reset_index(drop=True)
     preprocessed_data.ts = preprocessed_data.ts.dt.round('s')
-    preprocessed_data.rename({'ts': 'datetime', 'message': 'details'}, axis=1, inplace=True)
-    
-    if type == 'success':
-        success_report = preprocessed_data.loc[preprocessed_data['event_type'] == 'info'].drop('event_type', axis=1)
-        from pandas import Series
-        success_report = success_report.join(success_report['payload'].apply(Series))
-        success_report = success_report.drop('payload', axis=1)
-        import asyncio
-        async def fetch_post_link(post_id):
-            from database import get_db
-            db = get_db()
-            post = await db.get_post(post_id)
-            return post.message_link
-        tasks = [fetch_post_link(post_id) for post_id in success_report['post_id']]
-        results = await asyncio.gather(*tasks)
+    preprocessed_data.rename({'ts': 'datetime'}, axis=1, inplace=True)
+    preprocessed_data = preprocessed_data.join(preprocessed_data['payload'].apply(Series)).drop('payload', axis=1)
 
-        success_report['post_id'] = results
-        success_report = success_report.loc[:, ['datetime', 'client', 'post_id', 'palette', 'details']]
+    async def gather_post_links(post_id: Series):
+            async def fetch_post_link(post_id):
+                from database import get_db
+                db = get_db()
+                post = await db.get_post(post_id) if post_id else None
+                return post.message_link if post else None
+            tasks = [fetch_post_link(post_id) for post_id in success_report['post_id']]
+            return await asyncio.gather(*tasks)
+
+    if type == 'success':
+        success_report = preprocessed_data.loc[data['action_type'] == 'worker'].loc[preprocessed_data['event_type'] == 'info'].dropna(subset=['details']).drop(['action_type', 'event_type', 'level'], axis=1)
+        success_report['post_id'] = await gather_post_links(success_report['post_id'])
         success_report.rename({'post_id': 'message_link'}, axis=1, inplace=True)
-        return success_report
-    # elif type == 'warnings':
-    #     pass
+        return success_report.loc[success_report['details'] != 'action'].reset_index(drop=True)
+    elif type == 'errors':
+        return data.loc[data['event_type'] == 'error'].reset_index(drop=True).dropna(how='all', axis=1)
+    elif type == 'full':
+        return preprocessed_data
     else:
         return data  # Return the original data for unhandled types

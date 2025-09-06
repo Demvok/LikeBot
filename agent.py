@@ -1,6 +1,7 @@
-import re, yaml, os, random, asyncio
-from telethon.tl.functions.messages import SendReactionRequest, GetMessagesRequest
+import re, os, random, asyncio
+from telethon.tl.functions.messages import SendReactionRequest
 from telethon import TelegramClient, functions, types
+from telethon import errors
 from logger import setup_logger, load_config
 from dotenv import load_dotenv
 
@@ -66,8 +67,6 @@ class Account(object):
         return [elem for elem in all_accounts if elem.phone_number in phones]
 
 
-
-
 class Client(object):
 
     def __init__(self, account):
@@ -126,6 +125,7 @@ class Client(object):
                 if attempt < retries:
                     await asyncio.sleep(delay)
                 else:
+                    self.logger.critical(f"All connection attempts failed for {self.phone_number}. Error: {e}")
                     raise
 
     async def disconnect(self):
@@ -144,6 +144,7 @@ class Client(object):
                 if attempt < retries:
                     await asyncio.sleep(delay)
                 else:
+                    self.logger.critical(f"All disconnection attempts failed for {self.phone_number}. Error: {e}")
                     raise
 
     async def ensure_connected(self):
@@ -152,28 +153,29 @@ class Client(object):
             await self.connect()
 
     @classmethod
-    async def connect_clients(cls, accounts, logger):
+    async def connect_clients(cls, accounts: list[Account], logger):
         if logger:
             logger.info(f"Connecting clients for {len(accounts)} accounts...")
+
+        clients = [Client(account) for account in accounts]
         
-        clients = []
-        for account in accounts:  # Connect clients sequentially to avoid database lock
-            client = Client(account)
-            await client.connect()
-            clients.append(client)
-        
+        await asyncio.gather(*(client.connect() for client in clients))  # Connect all clients in parallel
+
         if logger:
             logger.info(f"Connected clients for {len(clients)} accounts.")
-        
+
         return clients if clients else None
     
     @classmethod
-    async def disconnect_clients(cls, clients, logger):
-        for client in clients:
-            try:
-               await client.disconnect()
-            except Exception as e:
-                logger.warning(f"Error disconnecting client: {e}")
+    async def disconnect_clients(cls, clients: list["Client"], logger):
+        if logger:
+            logger.info(f"Disconnecting {len(clients)} clients...")
+
+        await asyncio.gather(*(client.disconnect() for client in clients))
+
+        if logger:
+            logger.info(f"Disconnected {len(clients)} clients.")
+
         return None  # Return None to indicate all clients are disconnected
 
     async def get_message_content(self, chat_id=None, message_id=None, message_link=None) -> str | None:
@@ -194,21 +196,25 @@ class Client(object):
             return message.message if message else None
         except Exception as e:
             self.logger.warning(f"Error retrieving message content: {e}")
-            return None
+            raise
 
     async def update_account_id_from_telegram(self):
         """Fetch account id from Telegram and update the account record in accounts file."""
-        await self.ensure_connected()
-        me = await self.client.get_me()
-        account_id = me.id if hasattr(me, 'id') else None
-        if account_id:
-            from database import get_db  # Avoid circular import if any
-            db = get_db()
-            await db.update_account(self.phone_number, {'account_id': account_id})
-            self.logger.info(f"Updated account_id for {self.phone_number} to {account_id}")
-            self.account.account_id = account_id
-        else:
-            self.logger.warning("Could not fetch account_id from Telegram.")
+        try:
+            await self.ensure_connected()
+            me = await self.client.get_me()
+            account_id = me.id if hasattr(me, 'id') else None
+            if account_id:
+                from database import get_db  # Avoid circular import if any
+                db = get_db()
+                await db.update_account(self.phone_number, {'account_id': account_id})
+                self.logger.info(f"Updated account_id for {self.phone_number} to {account_id}")
+                self.account.account_id = account_id
+            else:
+                self.logger.warning("Could not fetch account_id from Telegram.")
+        except Exception as e:
+            self.logger.error(f"Error updating account_id from Telegram: {e}")
+            raise
 
     @staticmethod
     def estimate_reading_time(text:str, wpm=None) -> float:
@@ -232,120 +238,109 @@ class Client(object):
     # Basic actions
 
     async def _react(self, message, target_chat):
-        try:
-            await self.ensure_connected()
-            if config.get('delays', {}).get('humanisation_level', 1) >= 1:  # If humanisation level is 1 it should consider reading time
-                msg_content = await self.get_message_content(chat_id=target_chat, message_id=message.id)
-                if not msg_content:
-                    self.logger.warning("Message content is empty, skipping reaction.")
-                    return
-                reading_time = self.estimate_reading_time(msg_content)
-                self.logger.debug(f"Estimated reading time: {reading_time} seconds")
-                await asyncio.sleep(reading_time)
+        await self.ensure_connected()
+        if config.get('delays', {}).get('humanisation_level', 1) >= 1:  # If humanisation level is 1 it should consider reading time
+            msg_content = await self.get_message_content(chat_id=target_chat, message_id=message.id)
+            if not msg_content:
+                self.logger.warning("Message content is empty, skipping reaction.")
+                return
+            reading_time = self.estimate_reading_time(msg_content)
+            self.logger.debug(f"Estimated reading time: {reading_time} seconds")
+            await asyncio.sleep(reading_time)
 
-            emoticon = random.choice(self.active_emoji_palette)
+        emoticon = random.choice(self.active_emoji_palette)
 
-            await asyncio.sleep(random.uniform(0.5, 2))  # Simulate human-like delay and prevent spam
+        await asyncio.sleep(random.uniform(0.5, 2))  # Simulate human-like delay and prevent spam
 
-            await self.client(SendReactionRequest(
-                peer=target_chat,
-                msg_id=message.id,
-                reaction=[types.ReactionEmoji(emoticon=emoticon)],
-                add_to_recent=True
-            ))
-            self.logger.info("Reaction added successfully")
-        except Exception as e:
-            self.logger.warning(f"Error adding reaction: {e}")
+        await self.client(SendReactionRequest(
+            peer=target_chat,
+            msg_id=message.id,
+            reaction=[types.ReactionEmoji(emoticon=emoticon)],
+            add_to_recent=True
+        ))
 
     async def _comment(self, message, target_chat, content):
-        try:
-            await self.ensure_connected()
-            if config.get('delays', {}).get('humanisation_level', 1) >= 1:  # If humanisation level is 1 it should consider reading time
-                msg_content = await self.get_message_content(chat_id=target_chat, message_id=message.id)
-                reading_time = self.estimate_reading_time(msg_content)
-                self.logger.info(f"Estimated reading time: {reading_time} seconds")
-                await asyncio.sleep(reading_time)
+        await self.ensure_connected()
+        if config.get('delays', {}).get('humanisation_level', 1) >= 1:  # If humanisation level is 1 it should consider reading time
+            msg_content = await self.get_message_content(chat_id=target_chat, message_id=message.id)
+            reading_time = self.estimate_reading_time(msg_content)
+            self.logger.info(f"Estimated reading time: {reading_time} seconds")
+            await asyncio.sleep(reading_time)
 
-            discussion = await self.client(functions.messages.GetDiscussionMessageRequest(
-                peer=target_chat,
-                msg_id=message.id
-            ))
-            self.logger.debug(f"Discussion found: {discussion.messages[0].id}")
-            
-            # Use the discussion message ID, not the original channel message ID
-            discussion_message_id = discussion.messages[0].id
-            discussion_chat = discussion.chats[0]
-            
-            # Text typing speed should be added to simulate properly
+        discussion = await self.client(functions.messages.GetDiscussionMessageRequest(
+            peer=target_chat,
+            msg_id=message.id
+        ))
+        self.logger.debug(f"Discussion found: {discussion.messages[0].id}")
+        
+        # Use the discussion message ID, not the original channel message ID
+        discussion_message_id = discussion.messages[0].id
+        discussion_chat = discussion.chats[0]
+        
+        # Text typing speed should be added to simulate properly
 
-            await asyncio.sleep(random.uniform(0.5, 2))  # Prevent spam if everything is broken
+        await asyncio.sleep(random.uniform(0.5, 2))  # Prevent spam if everything is broken
 
-            await self.client.send_message(
-                entity=discussion_chat,
-                message=content,
-                reply_to=discussion_message_id  # Use discussion message ID, not original message.id
-            )
-            self.logger.info("Comment added successfully!")
-        except Exception as e:
-            self.logger.warning(f"Error adding comment: {e}")
+        await self.client.send_message(
+            entity=discussion_chat,
+            message=content,
+            reply_to=discussion_message_id  # Use discussion message ID, not original message.id
+        )
 
     async def _undo_reaction(self, message, target_chat):
-        try:
-            await self.ensure_connected()
-            await asyncio.sleep(random.uniform(0.5, 1))  # Prevent spam if everything is broken
-            await self.client(SendReactionRequest(
-                peer=target_chat,
-                msg_id=message.id,
-                reaction=[],  # Empty list removes reaction
-                add_to_recent=False
-            ))
-            self.logger.info("Reaction removed successfully")
-        except Exception as e:
-            self.logger.warning(f"Error removing reaction: {e}")
+        await self.ensure_connected()
+        await asyncio.sleep(random.uniform(0.5, 1))  # Prevent spam if everything is broken
+        await self.client(SendReactionRequest(
+            peer=target_chat,
+            msg_id=message.id,
+            reaction=[],  # Empty list removes reaction
+            add_to_recent=False
+        ))
 
     async def _undo_comment(self, message, target_chat):
         """
         Deletes all user comments on given post.
         """
-        try:
-            await self.ensure_connected()
-            await asyncio.sleep(random.uniform(0.5, 1))  # Prevent spam if everything is broken
-            discussion = await self.client(functions.messages.GetDiscussionMessageRequest(
-                peer=target_chat,
-                msg_id=message.id
-            ))
-            discussion_chat = discussion.chats[0]
-            # Find comments by this user on this discussion
-            async for msg in self.client.iter_messages(discussion_chat, reply_to=discussion.messages[0].id, from_user='me'):
-                await msg.delete()
-                self.logger.info(f"Comment {msg.id} deleted successfully!")
-        except Exception as e:
-            self.logger.warning(f"Error deleting comment: {e}")
-
-    async def _get_message_ids(self, link):
-        # Example link: https://t.me/c/123456789/12345 or https://t.me/username/12345
-        match = re.match(r'https://t\.me/(c/)?([\w\d_]+)/(\d+)', link)
-        if not match:
-            raise ValueError("Invalid Telegram message link format.")
-
-        is_private = match.group(1) == 'c/'
-        chat_part = match.group(2)
-        message_id = int(match.group(3))
-
-        if is_private:
-            # For private groups/channels, chat_id is -100 + chat_part
-            chat_id = int(f"-100{chat_part}")
-        else:
-            # For public, chat_part is username
-            chat_id = chat_part
-        
         await self.ensure_connected()
-        # Get entity and message using TelegramClient
-        entity = await self.client.get_entity(chat_id)
-        message = await self.client.get_messages(entity, ids=message_id)
-        self.logger.debug(f"Retrieved message {message_id} from chat {chat_id}")
-        return entity, message
+        await asyncio.sleep(random.uniform(0.5, 1))  # Prevent spam if everything is broken
+        discussion = await self.client(functions.messages.GetDiscussionMessageRequest(
+            peer=target_chat,
+            msg_id=message.id
+        ))
+        discussion_chat = discussion.chats[0]
+        # Find comments by this user on this discussion
+        async for msg in self.client.iter_messages(discussion_chat, reply_to=discussion.messages[0].id, from_user='me'):
+            await msg.delete()
 
+    async def get_message_ids(self, link):
+        """
+        Extract integer chat_id and message_id from a Telegram message link.
+        Returns (int chat_id, int message_id).
+        Example link: https://t.me/c/123456789/12345 or https://t.me/username/12345
+        """
+        try:
+            match = re.match(r'https://t\.me/(c/)?([\w\d_]+)/(\d+)', link)
+            if not match:
+                raise ValueError("Invalid Telegram message link format.")
+
+            is_private = match.group(1) == 'c/'
+            chat_part = match.group(2)
+            message_id = int(match.group(3))
+
+            if is_private:
+                # For private groups/channels, chat_id is -100 + chat_part
+                chat_id = int(f"-100{chat_part}")
+            else:
+                # For public, chat_part is username, need to resolve to int id
+                await self.ensure_connected()
+                entity = await self.client.get_entity(chat_part)
+                chat_id = entity.id
+
+            self.logger.debug(f"Extracted chat_id {chat_id} and message_id {message_id} from link")
+            return chat_id, message_id
+        except Exception as e:
+            self.logger.warning(f"Error extracting message IDs from link: {e}")
+            raise
 
     # Actions
 
@@ -356,15 +351,16 @@ class Client(object):
         while attempt < retries:
             try:
                 if message_link:
-                    entity, message = await self._get_message_ids(message_link)
+                    entity, message = await self.get_message_ids(message_link)
                 else:
                     entity = await self.client.get_entity(chat_id)
                     message = await self.client.get_messages(entity, ids=message_id)
                 await self._undo_reaction(message, entity)
+                self.logger.info("Reaction removed successfully")
                 return
             except Exception as e:
                 attempt += 1
-                self.logger.warning(f"undo_reaction failed (attempt {attempt}/{retries}): {e}")
+                self.logger.warning(f"Undo reaction failed (attempt {attempt}/{retries}): {e}")
                 if attempt < retries:
                     await asyncio.sleep(delay)
                 else:
@@ -377,11 +373,12 @@ class Client(object):
         while attempt < retries:
             try:
                 if message_link:
-                    entity, message = await self._get_message_ids(message_link)
+                    entity, message = await self.get_message_ids(message_link)
                 else:
                     entity = await self.client.get_entity(chat_id)
                     message = await self.client.get_messages(entity, ids=message_id)
                 await self._undo_comment(message, entity)
+                self.logger.info(f"Comment {message} deleted successfully!")
                 return
             except Exception as e:
                 attempt += 1
@@ -399,20 +396,21 @@ class Client(object):
         while attempt < retries:
             try:
                 if message_link:
-                    entity, message = await self._get_message_ids(message_link)
+                    entity, message = await self.get_message_ids(message_link)
                 else:
                     entity = await self.client.get_entity(chat_id)
                     message = await self.client.get_messages(entity, ids=message_id)
                 await self._react(message, entity)
+                self.logger.info("Reaction added successfully")
                 return
             except Exception as e:
                 attempt += 1
-                self.logger.warning(f"react failed (attempt {attempt}/{retries}): {e}")
+                self.logger.warning(f"React failed (attempt {attempt}/{retries}): {e}")
                 if attempt < retries:
                     await asyncio.sleep(delay)
                 else:
                     raise
-
+        
     async def comment(self, content, message_id:int=None, chat_id:str=None, message_link:str=None):
         """Comment on a message by its ID in a specific chat."""
         retries = config.get('delays', {}).get('action_retries', 3)
@@ -421,15 +419,16 @@ class Client(object):
         while attempt < retries:
             try:
                 if message_link:
-                    entity, message = await self._get_message_ids(message_link)
+                    entity, message = await self.get_message_ids(message_link)
                 else:
                     entity = await self.client.get_entity(chat_id)
                     message = await self.client.get_messages(entity, ids=message_id)
-                await self._comment(message=message, entity=entity, content=content)
+                await self._comment(message=message, target_chat=entity, content=content)
+                self.logger.info("Comment added successfully!")
                 return
             except Exception as e:
                 attempt += 1
-                self.logger.warning(f"comment failed (attempt {attempt}/{retries}): {e}")
+                self.logger.warning(f"Comment failed (attempt {attempt}/{retries}): {e}")
                 if attempt < retries:
                     await asyncio.sleep(delay)
                 else:

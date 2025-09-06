@@ -1,6 +1,7 @@
 from pandas import Timestamp
-import re, yaml, asyncio, datetime
+import asyncio, datetime
 from enum import Enum, auto
+from telethon import errors
 from agent import Account, Client
 from reporter import Reporter
 from logger import setup_logger, load_config
@@ -61,30 +62,8 @@ class Post:
         )
 
 
-    async def _get_message_ids(self, client, link):
-        # Example link: https://t.me/c/123456789/12345 or https://t.me/username/12345
-        match = re.match(r'https://t\.me/(c/)?([\w\d_]+)/(\d+)', link)
-        if not match:
-            raise ValueError("Invalid Telegram message link format.")
 
-        is_private = match.group(1) == 'c/'
-        chat_part = match.group(2)
-        message_id = int(match.group(3))
-
-        if is_private:
-            # For private groups/channels, chat_id is -100 + chat_part
-            chat_id = int(f"-100{chat_part}")
-        else:
-            # For public, chat_part is username
-            chat_id = chat_part
-
-        # Get entity and message using TelegramClient
-        entity = await client.client.get_entity(chat_id)
-        message = await client.client.get_messages(entity, ids=message_id)
-        # Return only the IDs, not the objects
-        return entity.id if hasattr(entity, 'id') else entity, message.id if hasattr(message, 'id') else message
-
-    async def validate(self, client, logger=None):
+    async def validate(self, client: Client, logger=None):
         """Validate the post by fetching its chat_id and message_id, and update the record in file."""
         from database import get_db
         db = get_db()
@@ -93,7 +72,7 @@ class Post:
         attempt = 0
         while attempt < retries:
             try:
-                chat_id, message_id = await self._get_message_ids(client, self.message_link)
+                chat_id, message_id = await client.get_message_ids(self.message_link)
                 self.chat_id = chat_id
                 self.message_id = message_id
                 self.updated_at = Timestamp.now()
@@ -108,8 +87,8 @@ class Post:
                 if attempt < retries:
                     await asyncio.sleep(delay)
                 elif logger:
-                    logger.error(f"Failed to validate post {self.post_id} after {retries} attempts.")
-                    raise e
+                    logger.error(f"Failed to validate post {self.post_id} after {retries} attempts. Error: {e}")
+                    raise
         return self
     
     @classmethod
@@ -154,6 +133,7 @@ class Post:
             except Exception as e:
                 if logger:
                     logger.error(f"Exception during validation of post {getattr(post, 'post_id', None)}: {e}")
+                raise
         
         if logger:
             logger.info(f"Validated {len(posts)} posts: {newly_validated} newly validated, {already_validated} already validated, {failed_validation} failed validation.")
@@ -181,7 +161,7 @@ class Task:
         self.task_id = task_id
         self.name = name
         self.description = description
-        self.post_ids = post_ids
+        self.post_ids = sorted(post_ids)
         self.accounts = accounts
         self.action = action
         self.status = status or Task.TaskStatus.PENDING
@@ -249,6 +229,11 @@ class Task:
         else:
             raise ValueError(f"Unknown reaction palette: {palette}")
 
+    async def _update_status(self):
+        from database import get_db
+        db = get_db()
+        await db.update_task(self.task_id, {'status': self.status.name if isinstance(self.status, Task.TaskStatus) else self.status})
+
 # Actions
 
     async def _run(self):
@@ -266,11 +251,11 @@ class Task:
                 posts = await self.get_posts()
                 await reporter.event(run_id, self.task_id, "DEBUG", "info.init.data_loaded", f"Got accounts and posts objects.")
 
-                await self._check_pause()
+                await self._check_pause(reporter, run_id)
                 self._clients = await Client.connect_clients(accounts, self.logger)
                 await reporter.event(run_id, self.task_id, "INFO", "info.connecting.client_connect", f"Connected {len(self._clients)} clients.")
 
-                await self._check_pause()
+                await self._check_pause(reporter, run_id)
                 if self._clients:  # Validate posts to get corresponding ids
                     posts = await Post.mass_validate_posts(posts, self._clients[0], self.logger)
                 await reporter.event(run_id, self.task_id, "INFO", "info.connecting.posts_validated", f"Validated {len(posts)} posts.")
@@ -300,10 +285,15 @@ class Task:
                 self.logger.info(f"Task {self.task_id} was cancelled.")
                 await reporter.event(run_id, self.task_id, "WARNING", "info.run_cancelled", "Run was cancelled.")
                 self.status = Task.TaskStatus.PENDING
+                await self._update_status()
+            except errors.PhoneNumberInvalidError as e:
+                self.logger.error(f"Task {self.task_id} encountered a PhoneNumberInvalidError: {e}")
+                await reporter.event(run_id, self.task_id, "ERROR", "error.phone_number_invalid", f"Encountered PhoneNumberInvalidError: {e}", {'error': e})
             except Exception as e:
                 self.logger.error(f"Error starting task {self.task_id}: {e}")
-                await reporter.event(run_id, self.task_id, "ERROR", "error.run_failed", f"Run failed: {e}")
+                await reporter.event(run_id, self.task_id, "ERROR", "error.run_failed", f"Unhandled error, run failed: {e}", {'error': e})
                 self.status = Task.TaskStatus.CRASHED
+                await self._update_status()
                 raise e
             finally:
                 self._clients = await Client.disconnect_clients(self._clients, self.logger)
@@ -313,43 +303,130 @@ class Task:
             
             await reporter.event(run_id, self.task_id, "INFO", "info.run_end", "Run has ended.")
             # If you got here - task succeeded
-            self.logger.info(f"Task {self.task_id} completed successfully.")
             self.status = Task.TaskStatus.FINISHED
-            await reporter.stop()  # stop reporter and flush            
+            await self._update_status()
+            self.logger.info(f"Task {self.task_id} completed successfully.")
+            return
+        await reporter.stop()  # stop reporter and flush            
 
 
     async def client_worker(self, client, posts, reporter, run_id):
         await reporter.event(run_id, self.task_id, "INFO", "info.worker", f"Worker started for client {client.phone_number}")
         if self.get_action_type() == 'react':
-            await reporter.event(run_id, self.task_id, "DEBUG", "info.worker.react", "Worker proceeds to reacting")
+            await reporter.event(run_id, self.task_id, "DEBUG", "info.worker.action", "Worker proceeds to reacting")
             client.active_emoji_palette = self.get_reaction_emojis()
+            retries = config.get('delays', {}).get('action_retries', 5)
             for post in posts:
                 client = await self._check_pause_single(client, reporter, run_id)  # Check pause before each post
                 if post.is_validated:
-                    try:
-                        await client.react(post.message_id, post.chat_id)
-                        self.logger.debug(f"Client {client.account_id} reacted to post {post.post_id}")
-                        await reporter.event(run_id, self.task_id, "DEBUG", "info.worker.react", 
-                                             f"Client {client.phone_number} reacted to post {post.post_id} with {self.get_reaction_palette_name()}",
-                                             {"client": client.phone_number, "post_id": post.post_id, "palette": self.get_reaction_palette_name()})
-                    except Exception as e:
-                        self.logger.warning(f"Client {client.account_id} failed to react to post {post.post_id}: {e}")
-                        await reporter.event(run_id, self.task_id, "WARNING", "error.worker.react", f"Client {client.phone_number} failed to react to post {post.post_id}: {e}")
-
+                    attempt = 0
+                    while attempt < retries:
+                        try:
+                            await client.react(post.message_id, post.chat_id)
+                            self.logger.debug(f"Client {client.account_id} reacted to post {post.post_id}")
+                            await reporter.event(run_id, self.task_id, "DEBUG", "info.worker.react", 
+                                                 f"Client {client.phone_number} reacted to post {post.post_id} with {self.get_reaction_palette_name()}",
+                                                 {"client": client.phone_number, "post_id": post.post_id, "palette": self.get_reaction_palette_name()})
+                            break  # Success, exit retry loop
+                        except errors.FloodWaitError as e:
+                            attempt += 1
+                            self.logger.error(f"Client {client.account_id} hit FloodWaitError on post {post.post_id}: wait for {e.seconds} seconds. Attempt {attempt}/{retries}")
+                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.flood_wait", 
+                                                 f"Client {client.phone_number} hit FloodWaitError on post {post.post_id}: wait for {e.seconds} seconds. Attempt {attempt}/{retries}",
+                                                 {"client": client.phone_number, "post_id": post.post_id, "wait_seconds": e.seconds, "attempt": attempt})
+                            await asyncio.sleep(e.seconds + 5)  # Sleep for the required time plus a buffer
+                        except errors.SessionPasswordNeededError:
+                            self.logger.error(f"Client {client.account_id} requires 2FA password to proceed. Stopping worker.")
+                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.2fa_required", 
+                                                 f"Client {client.phone_number} requires 2FA password to proceed. Stopping worker.",
+                                                 {"client": client.phone_number})
+                            return
+                        except (errors.PhoneCodeInvalidError, errors.PhoneCodeExpiredError):  # To move to auth codeblock
+                            self.logger.error(f"Client {client.account_id} has invalid or expired phone code. Stopping worker.")
+                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.phone_code_invalid", 
+                                                 f"Client {client.phone_number} has invalid or expired phone code. Stopping worker.",
+                                                 {"client": client.phone_number})
+                            return
+                        except errors.UserNotParticipantError:
+                            self.logger.error(f"Client {client.account_id} is not a participant of the chat for post {post.post_id}. Cannot react. Skipping post.")
+                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.not_participant", 
+                                                 f"Client {client.phone_number} is not a participant of the chat for post {post.post_id}. Cannot react. Skipping post.",
+                                                 {"client": client.phone_number, "post_id": post.post_id})
+                            break  # Skip to next post
+                        except errors.ChatAdminRequiredError:
+                            self.logger.error(f"Client {client.account_id} requires admin privileges to react in the chat for post {post.post_id}. Skipping post.")
+                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.admin_required", 
+                                                 f"Client {client.phone_number} requires admin privileges to react in the chat for post {post.post_id}. Skipping post.",
+                                                 {"client": client.phone_number, "post_id": post.post_id})
+                            break
+                        except errors.ChannelPrivateError:
+                            self.logger.error(f"Client {client.account_id} cannot access the chat for post {post.post_id} (channel might be private). Skipping post.")
+                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.channel_private", 
+                                                 f"Client {client.phone_number} cannot access the chat for post {post.post_id} (channel might be private). Skipping post.",
+                                                 {"client": client.phone_number, "post_id": post.post_id})
+                            break
+                        except errors.PhoneNumberBannedError:
+                            self.logger.error(f"Client {client.account_id} is banned. Stopping worker.")
+                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.phone_banned", 
+                                                 f"Client {client.phone_number} is banned. Stopping worker.",
+                                                 {"client": client.phone_number})
+                            return
+                        except ConnectionError as e:
+                            attempt += 1
+                            self.logger.error(f"Client {client.account_id} encountered ConnectionError on post {post.post_id}: {e}. Attempt {attempt}/{retries}")
+                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.connection_error", 
+                                                 f"Client {client.phone_number} encountered ConnectionError on post {post.post_id}: {e}. Attempt {attempt}/{retries}",
+                                                 {"client": client.phone_number, "post_id": post.post_id, "error": str(e), "attempt": attempt})
+                            await asyncio.sleep(5)
+                        except TimeoutError as e:
+                            attempt += 1
+                            self.logger.error(f"Client {client.account_id} encountered TimeoutError on post {post.post_id}: {e}. Attempt {attempt}/{retries}")
+                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.timeout_error", 
+                                                 f"Client {client.phone_number} encountered TimeoutError on post {post.post_id}: {e}. Attempt {attempt}/{retries}",
+                                                 {"client": client.phone_number, "post_id": post.post_id, "error": str(e), "attempt": attempt})
+                            await asyncio.sleep(5)
+                        except errors.RPCError as e:
+                            attempt += 1
+                            self.logger.error(f"Client {client.account_id} encountered RPCError on post {post.post_id}: {e}. Attempt {attempt}/{retries}")
+                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.rpc_error", 
+                                                 f"Client {client.phone_number} encountered RPCError on post {post.post_id}: {e}. Attempt {attempt}/{retries}",
+                                                 {"client": client.phone_number, "post_id": post.post_id, "error": str(e), "attempt": attempt})
+                            await asyncio.sleep(5)
+                        except errors.ServerError as e:
+                            attempt += 1
+                            self.logger.error(f"Client {client.account_id} encountered ServerError on post {post.post_id}: {e}. Attempt {attempt}/{retries}")
+                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.server_error", 
+                                                 f"Client {client.phone_number} encountered ServerError on post {post.post_id}: {e}. Attempt {attempt}/{retries}",
+                                                 {"client": client.phone_number, "post_id": post.post_id, "error": str(e), "attempt": attempt})
+                            await asyncio.sleep(5)
+                        except errors.MessageIdInvalidError:
+                            self.logger.error(f"Client {client.account_id} encountered MessageIdInvalidError on post {post.post_id}. Skipping post.")
+                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.message_id_invalid", 
+                                                 f"Client {client.phone_number} encountered MessageIdInvalidError on post {post.post_id}. Skipping post.",
+                                                 {"client": client.phone_number, "post_id": post.post_id})
+                            break                        
+                        except Exception as e:
+                            self.logger.warning(f"Client {client.account_id} failed to react to post {post.post_id}: {e}")
+                            await reporter.event(run_id, self.task_id, "WARNING", "error.worker.react", f"Client {client.phone_number} failed to react to post {post.post_id}: {e}", {'error': e})
+                            raise  # On other errors, do not retry
+                    if attempt == retries:   # Optionally, log/report if all retries failed
+                        self.logger.error(f"Client {client.account_id} failed to react to post {post.post_id} after {retries} attempts due to repeated FloodWaitError.")
+                        await reporter.event(run_id, self.task_id, "ERROR", "error.worker.react.max_retries", f"Client {client.phone_number} failed to react to post {post.post_id} after {retries} FloodWaitError retries.", {"client": client.phone_number, "post_id": post.post_id, "retries": retries})
                 # add per-post sleep
 
 
         if self.get_action_type() == 'comment':  # Logic to handle comment actions can be added here
             self.logger.warning("Comment actions are not implemented yet.")
-            await reporter.event(run_id, self.task_id, "DEBUG", "info.worker.comment", "Worker proceeds to commenting. NYI")
+            await reporter.event(run_id, self.task_id, "DEBUG", "info.worker.action", "Worker proceeds to commenting. NYI")
             pass
 
         await reporter.event(run_id, self.task_id, "INFO", "info.worker", f"Worker finished for client {client.phone_number}")
 
-    async def _check_pause(self):
+    async def _check_pause(self, reporter, run_id):
         """Check if task should be paused and wait if needed. Disconnect clients on pause, reconnect on resume."""
         if not self._pause_event.is_set():
             self.logger.info(f"Task {self.task_id} is paused, disconnecting clients and waiting to resume...")
+            await reporter.event(run_id, self.task_id, "INFO", "info.status", f"Task {self.task_id} is paused.")
             # Disconnect clients if connected
             if self._clients:
                 for client in self._clients:
@@ -357,12 +434,15 @@ class Task:
                         await client.client.disconnect()
                     except Exception as e:
                         self.logger.warning(f"Error disconnecting client {client.account_id}: {e}")
+                        await reporter.event(run_id, self.task_id, "ERROR", "error", f"Task {self.task_id} failed to disconnect: {e}", {'error': e})
                 self._clients = None
             await self._pause_event.wait()
             # Reconnect clients
             self.logger.info(f"Task {self.task_id} resumed. Reconnecting clients...")
-            accounts = self.get_accounts()
+            await reporter.event(run_id, self.task_id, "INFO", "info.status", f"Task {self.task_id} is resumed.")
+            accounts = await self.get_accounts()
             self._clients = await Client.connect_clients(accounts, self.logger)
+            await reporter.event(run_id, self.task_id, "INFO", "info.status", f"Successfully reconnected {len(self._clients)} clients.")
 
     async def _check_pause_single(self, client, reporter, run_id):
         if not self._pause_event.is_set():
@@ -402,13 +482,15 @@ class Task:
             self.logger.info(f"Starting task {self.task_id} - {self.name}...")
             self._task = asyncio.create_task(self._run())
             self.updated_at = Timestamp.now()
-            self.status = Task.TaskStatus.RUNNING       
+            self.status = Task.TaskStatus.RUNNING
+            await self._update_status()
 
     async def pause(self):
         """Pause the task."""
         if self.status == Task.TaskStatus.RUNNING:
             self._pause_event.clear()
             self.status = Task.TaskStatus.PAUSED
+            await self._update_status()
             self.logger.info(f"Task {self.task_id} paused.")
 
     async def resume(self):
@@ -416,6 +498,7 @@ class Task:
         if self.status == Task.TaskStatus.PAUSED:
             self._pause_event.set()
             self.status = Task.TaskStatus.RUNNING
+            await self._update_status()
             self.logger.info(f"Task {self.task_id} resumed.")
 
     async def get_status(self):
