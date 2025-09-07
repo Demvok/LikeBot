@@ -434,7 +434,7 @@ class FileStorage(StorageInterface):
         from pandas import DataFrame
         import json
         file_path = config.get('filepaths', {}).get('tasks', 'tasks.json')
-        data = [task.to_dict(rich=False) for task in tasks]
+        data = [task.to_dict() for task in tasks]
         if file_path.endswith('.json'):
             with open(file_path, 'w', encoding='utf-8') as file:
                 json.dump(data, file, indent=4)

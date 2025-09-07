@@ -167,6 +167,11 @@ class Client(object):
     
     @classmethod
     async def disconnect_clients(cls, clients: list["Client"], logger):
+        if not clients:
+            if logger:
+                logger.info("No clients to disconnect.")
+            return None
+            
         if logger:
             logger.info(f"Disconnecting {len(clients)} clients...")
 

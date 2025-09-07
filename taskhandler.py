@@ -258,8 +258,7 @@ class Task:
                 try:
                     accounts = await self.get_accounts()
                     posts = await self.get_posts()
-                    # raise ConnectionError("Testing connection error handling.")
-                except (mg_errors.PyMongoError, AsyncIOMotorClient, ConnectionError) as db_exc:
+                except (mg_errors.PyMongoError, ConnectionError) as db_exc:
                     self.logger.error(f"MongoDB error while loading accounts or posts for task {self.task_id}: {db_exc}")
                     await reporter.event(run_id, self.task_id, "ERROR", "error.db_mongo_load_failed", f"MongoDB error while loading accounts or posts: {db_exc}", {'error': repr(db_exc)})
                     self.status = Task.TaskStatus.CRASHED
@@ -293,7 +292,7 @@ class Task:
                 if self._clients:  # Validate posts to get corresponding ids
                     try:
                         posts = await Post.mass_validate_posts(posts, self._clients[0], self.logger)
-                    except (mg_errors.PyMongoError, AsyncIOMotorClient, ConnectionError) as db_exc:
+                    except (mg_errors.PyMongoError, ConnectionError) as db_exc:
                         self.logger.error(f"MongoDB error while validating posts for task {self.task_id}: {db_exc}")
                         await reporter.event(run_id, self.task_id, "ERROR", "error.db_mongo_post_validation_failed", f"MongoDB error while validating posts: {db_exc}", {'error': repr(db_exc)})
                         self.status = Task.TaskStatus.CRASHED
@@ -546,10 +545,19 @@ class Task:
             self._current_run_id = None  # Will empty if exists, but if exists and finished will be used for statistics
             self.logger.info(f"Starting task {self.task_id} - {self.name}...")
             self._task = asyncio.create_task(self._run())
-            self._task.add_done_callback(handle_task_exception)
             self.updated_at = Timestamp.now()
             self.status = Task.TaskStatus.RUNNING
             await self._update_status()
+
+    async def run_and_wait(self):  # I'm not sure about this, maybe not needed
+        """Start the task and wait for it to complete."""
+        await self.start()
+        if self._task:
+            try:
+                await self._task
+            except Exception as e:
+                self.logger.error(f"Task {self.task_id} failed: {e}")
+                raise
 
     async def pause(self):
         """Pause the task."""

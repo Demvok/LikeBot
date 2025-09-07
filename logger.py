@@ -118,6 +118,17 @@ def _ensure_listener(log_file):
             _main_listener = QueueListener(_log_queue, *_listener_handlers, respect_handler_level=True)
             _main_listener.start()
 
+def cleanup_logging():
+    """Clean up logging resources"""
+    global _main_listener
+    with _main_listener_lock:
+        if _main_listener is not None:
+            try:
+                _main_listener.stop()
+                _main_listener = None
+            except:
+                pass
+
 def setup_logger(name: str, log_file: str) -> logging.Logger:
     """
     Sets up a logger that puts records into a multiprocessing queue.

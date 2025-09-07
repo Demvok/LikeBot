@@ -195,8 +195,8 @@ class Reporter:
                 return self.run_id
             async def __aexit__(self, exc_type, exc, tb):
                 if exc:
-                    await self.reporter.event(self.run_id, self.task_id, "ERROR", "error", f'Error: {exc}', {'exc': exc})
-                    await self.reporter.end_run(self.run_id, status="failed", meta_patch={"error": exc.message})
+                    await self.reporter.event(self.run_id, self.task_id, "ERROR", "error", f'Error: {exc}', {'exc': str(exc)})
+                    await self.reporter.end_run(self.run_id, status="failed", meta_patch={"error": str(exc)})
                 else:
                     await self.reporter.end_run(self.run_id, status="success")
         return _RunCtx(self, task_id, meta)
