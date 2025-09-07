@@ -21,8 +21,13 @@
 
 ## Changelog
 
+### v.0.4
+
+
+
 ### v0.3
 - implemented task report logic (task, date, status, errors from accounts (async exception handling))
+- implemented crash report logic
 - updated task and runs status during run
 - rewritten connect clients to async
 - implemented various exception messages for client errors

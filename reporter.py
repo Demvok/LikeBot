@@ -143,7 +143,7 @@ class Reporter:
                         await self.events_coll.insert_many(docs, ordered=False)
                     except Exception as e:
                         # handle partial failures — you might want to log this to stderr or another collection
-                        print("Warning: insert_many failed:", e)
+                        logger.warning("Warning: insert_many failed:", e)
                         # fallback: try inserting one-by-one (so nothing is silently lost)
                         for doc in docs:
                             try:
@@ -151,13 +151,13 @@ class Reporter:
                             except Exception as ex:
                                 # If even single insert fails, store minimal failure record in runs collection
                                 await self.runs_coll.update_one({"run_id": doc["run_id"]}, {"$set": {"status": "persist_error"}})
-                                print("Failed to persist doc:", ex)
+                                logger.error("Failed to persist doc:", ex)
                     buffer = []
                     last_flush = now
 
             except Exception as exc:
                 # transient writer-level errors; avoid tight loop
-                print("Writer loop error:", exc)
+                logger.error("Writer loop error:", exc)
                 await asyncio.sleep(0.2)
 
 

@@ -1,10 +1,15 @@
 from pandas import Timestamp
 import asyncio, datetime
 from enum import Enum, auto
+
 from telethon import errors
+from pymongo import errors as mg_errors
+from motor.motor_asyncio import AsyncIOMotorClient
+from pandas import errors as pd_errors
+
 from agent import Account, Client
 from reporter import Reporter
-from logger import setup_logger, load_config
+from logger import setup_logger, load_config, crash_handler, handle_task_exception
 
 config = load_config()
 
@@ -236,6 +241,7 @@ class Task:
 
 # Actions
 
+    @crash_handler
     async def _run(self):
         if not self.task_id:
             self.logger.error("Task ID is not set.")
@@ -247,8 +253,36 @@ class Task:
             try:
                 self._current_run_id = run_id
                 await reporter.event(run_id, self.task_id, "INFO", "info.init.run_start", f"Starting run for task.")
-                accounts = await self.get_accounts()
-                posts = await self.get_posts()
+                
+                # Load accounts and posts with specific DB error handling
+                try:
+                    accounts = await self.get_accounts()
+                    posts = await self.get_posts()
+                    # raise ConnectionError("Testing connection error handling.")
+                except (mg_errors.PyMongoError, AsyncIOMotorClient, ConnectionError) as db_exc:
+                    self.logger.error(f"MongoDB error while loading accounts or posts for task {self.task_id}: {db_exc}")
+                    await reporter.event(run_id, self.task_id, "ERROR", "error.db_mongo_load_failed", f"MongoDB error while loading accounts or posts: {db_exc}", {'error': repr(db_exc)})
+                    self.status = Task.TaskStatus.CRASHED
+                    await self._update_status()
+                    raise
+                except (FileNotFoundError, PermissionError, OSError) as file_exc:
+                    self.logger.error(f"File error while loading accounts or posts for task {self.task_id}: {file_exc}")
+                    await reporter.event(run_id, self.task_id, "ERROR", "error.db_file_load_failed", f"File error while loading accounts or posts: {file_exc}", {'error': repr(file_exc)})
+                    self.status = Task.TaskStatus.CRASHED
+                    await self._update_status()
+                    raise
+                except (pd_errors.ParserError, ValueError) as parse_exc:
+                    self.logger.error(f"Parsing error while loading accounts or posts for task {self.task_id}: {parse_exc}")
+                    await reporter.event(run_id, self.task_id, "ERROR", "error.db_parse_load_failed", f"Parsing error while loading accounts or posts: {parse_exc}", {'error': repr(parse_exc)})
+                    self.status = Task.TaskStatus.CRASHED
+                    await self._update_status()
+                    raise
+                except Exception as db_exc:
+                    self.logger.error(f"Unknown database error while loading accounts or posts for task {self.task_id}: {db_exc}")
+                    await reporter.event(run_id, self.task_id, "ERROR", "error.db_load_failed", f"Unknown database error while loading accounts or posts: {db_exc}", {'error': repr(db_exc)})
+                    self.status = Task.TaskStatus.CRASHED
+                    await self._update_status()
+                    raise
                 await reporter.event(run_id, self.task_id, "DEBUG", "info.init.data_loaded", f"Got accounts and posts objects.")
 
                 await self._check_pause(reporter, run_id)
@@ -257,7 +291,32 @@ class Task:
 
                 await self._check_pause(reporter, run_id)
                 if self._clients:  # Validate posts to get corresponding ids
-                    posts = await Post.mass_validate_posts(posts, self._clients[0], self.logger)
+                    try:
+                        posts = await Post.mass_validate_posts(posts, self._clients[0], self.logger)
+                    except (mg_errors.PyMongoError, AsyncIOMotorClient, ConnectionError) as db_exc:
+                        self.logger.error(f"MongoDB error while validating posts for task {self.task_id}: {db_exc}")
+                        await reporter.event(run_id, self.task_id, "ERROR", "error.db_mongo_post_validation_failed", f"MongoDB error while validating posts: {db_exc}", {'error': repr(db_exc)})
+                        self.status = Task.TaskStatus.CRASHED
+                        await self._update_status()
+                        raise
+                    except (FileNotFoundError, PermissionError, OSError) as file_exc:
+                        self.logger.error(f"File error while validating posts for task {self.task_id}: {file_exc}")
+                        await reporter.event(run_id, self.task_id, "ERROR", "error.db_file_post_validation_failed", f"File error while validating posts: {file_exc}", {'error': repr(file_exc)})
+                        self.status = Task.TaskStatus.CRASHED
+                        await self._update_status()
+                        raise
+                    except (pd_errors.ParserError, ValueError) as parse_exc:
+                        self.logger.error(f"Parsing error while validating posts for task {self.task_id}: {parse_exc}")
+                        await reporter.event(run_id, self.task_id, "ERROR", "error.db_parse_post_validation_failed", f"Parsing error while validating posts: {parse_exc}", {'error': repr(parse_exc)})
+                        self.status = Task.TaskStatus.CRASHED
+                        await self._update_status()
+                        raise
+                    except Exception as db_exc:
+                        self.logger.error(f"Unknown database error while validating posts for task {self.task_id}: {db_exc}")
+                        await reporter.event(run_id, self.task_id, "ERROR", "error.db_post_validation_failed", f"Unknown database error while validating posts: {db_exc}", {'error': repr(db_exc)})
+                        self.status = Task.TaskStatus.CRASHED
+                        await self._update_status()
+                        raise
                 await reporter.event(run_id, self.task_id, "INFO", "info.connecting.posts_validated", f"Validated {len(posts)} posts.")
 
                 if self.get_action() is None:
@@ -271,6 +330,9 @@ class Task:
                         asyncio.create_task(self.client_worker(client, posts, reporter, run_id))
                         for client in self._clients
                     ]
+                    for worker in workers:
+                        worker.add_done_callback(handle_task_exception)
+
                     self.logger.info(f"Created {len(workers)} workers for task {self.task_id}.")
                     results = await asyncio.gather(*workers, return_exceptions=True)
                     self.logger.info(f"All workers for task {self.task_id} have finished executing.")
@@ -288,10 +350,11 @@ class Task:
                 await self._update_status()
             except errors.PhoneNumberInvalidError as e:
                 self.logger.error(f"Task {self.task_id} encountered a PhoneNumberInvalidError: {e}")
-                await reporter.event(run_id, self.task_id, "ERROR", "error.phone_number_invalid", f"Encountered PhoneNumberInvalidError: {e}", {'error': e})
+                await reporter.event(run_id, self.task_id, "ERROR", "error.phone_number_invalid", f"Encountered PhoneNumberInvalidError: {e}", {'error': repr(e)})
             except Exception as e:
+                import sys
                 self.logger.error(f"Error starting task {self.task_id}: {e}")
-                await reporter.event(run_id, self.task_id, "ERROR", "error.run_failed", f"Unhandled error, run failed: {e}", {'error': e})
+                await reporter.event(run_id, self.task_id, "ERROR", "error.run_failed", f"Unhandled error, run failed: {e}", {'error': repr(e)})
                 self.status = Task.TaskStatus.CRASHED
                 await self._update_status()
                 raise e
@@ -309,7 +372,7 @@ class Task:
             return
         await reporter.stop()  # stop reporter and flush            
 
-
+    @crash_handler
     async def client_worker(self, client, posts, reporter, run_id):
         await reporter.event(run_id, self.task_id, "INFO", "info.worker", f"Worker started for client {client.phone_number}")
         if self.get_action_type() == 'react':
@@ -407,7 +470,7 @@ class Task:
                             break                        
                         except Exception as e:
                             self.logger.warning(f"Client {client.account_id} failed to react to post {post.post_id}: {e}")
-                            await reporter.event(run_id, self.task_id, "WARNING", "error.worker.react", f"Client {client.phone_number} failed to react to post {post.post_id}: {e}", {'error': e})
+                            await reporter.event(run_id, self.task_id, "WARNING", "error.worker.react", f"Client {client.phone_number} failed to react to post {post.post_id}: {e}", {'error': repr(e)})
                             raise  # On other errors, do not retry
                     if attempt == retries:   # Optionally, log/report if all retries failed
                         self.logger.error(f"Client {client.account_id} failed to react to post {post.post_id} after {retries} attempts due to repeated FloodWaitError.")
@@ -422,6 +485,7 @@ class Task:
 
         await reporter.event(run_id, self.task_id, "INFO", "info.worker", f"Worker finished for client {client.phone_number}")
 
+    @crash_handler
     async def _check_pause(self, reporter, run_id):
         """Check if task should be paused and wait if needed. Disconnect clients on pause, reconnect on resume."""
         if not self._pause_event.is_set():
@@ -434,7 +498,7 @@ class Task:
                         await client.client.disconnect()
                     except Exception as e:
                         self.logger.warning(f"Error disconnecting client {client.account_id}: {e}")
-                        await reporter.event(run_id, self.task_id, "ERROR", "error", f"Task {self.task_id} failed to disconnect: {e}", {'error': e})
+                        await reporter.event(run_id, self.task_id, "ERROR", "error", f"Task {self.task_id} failed to disconnect: {e}", {'error': repr(e)})
                 self._clients = None
             await self._pause_event.wait()
             # Reconnect clients
@@ -444,6 +508,7 @@ class Task:
             self._clients = await Client.connect_clients(accounts, self.logger)
             await reporter.event(run_id, self.task_id, "INFO", "info.status", f"Successfully reconnected {len(self._clients)} clients.")
 
+    @crash_handler
     async def _check_pause_single(self, client, reporter, run_id):
         if not self._pause_event.is_set():
             self.logger.info(f"Task {self.task_id} is paused, disconnecting client {client.account_id} and waiting to resume...")
@@ -481,6 +546,7 @@ class Task:
             self._current_run_id = None  # Will empty if exists, but if exists and finished will be used for statistics
             self.logger.info(f"Starting task {self.task_id} - {self.name}...")
             self._task = asyncio.create_task(self._run())
+            self._task.add_done_callback(handle_task_exception)
             self.updated_at = Timestamp.now()
             self.status = Task.TaskStatus.RUNNING
             await self._update_status()
@@ -505,6 +571,7 @@ class Task:
         """Get the current status of the task."""
         return self.status
     
+    @crash_handler
     async def get_report(self, type='success'):
         """Get the report for the current task run. If it is running you will need to refresh."""
         if not self._current_run_id:

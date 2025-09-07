@@ -13,7 +13,6 @@ config = load_config()
 
 
 
-
 class Account(object):
     
     def __init__(self, account_data):
