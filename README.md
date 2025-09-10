@@ -3,6 +3,7 @@
 ### TO DO:
 
 - add api for task import
+- review data handling on process terminations (shutdowns, cancels, etc.)
 
 - add account status as meta (login status)
 - automate an provide manual way of session verification

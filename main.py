@@ -1,35 +1,814 @@
-import asyncio
-import sys
 import atexit
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
+from typing import Optional, List, Dict, Any
+from pydantic import BaseModel, Field
 from agent import *
 from logger import setup_logger, crash_handler, cleanup_logging
-
 from taskhandler import *
 from database import get_db
 
+atexit.register(cleanup_logging)  # Register cleanup function
 
-# Register cleanup function
-atexit.register(cleanup_logging)
+app = FastAPI(title="LikeBot API", description="Full CRUD API for LikeBot automation", version="1.0.0")
 
-@crash_handler
-async def main():
-    logger = setup_logger("main", "main.log")
-    logger.info("System is starting...")
-    
+# Pydantic models for request/response validation
+class AccountCreate(BaseModel):
+    phone_number: str = Field(..., description="Phone number for the account")
+    account_id: Optional[str] = Field(None, description="Account ID from Telegram")
+    session_name: Optional[str] = Field(None, description="Session name for Telegram client")
+
+class AccountUpdate(BaseModel):
+    account_id: Optional[str] = Field(None, description="Account ID from Telegram")
+    session_name: Optional[str] = Field(None, description="Session name for Telegram client")
+
+class PostCreate(BaseModel):
+    message_link: str = Field(..., description="Telegram message link")
+    post_id: Optional[int] = Field(None, description="Post ID (auto-generated if not provided)")
+    chat_id: Optional[int] = Field(None, description="Chat ID from Telegram")
+    message_id: Optional[int] = Field(None, description="Message ID from Telegram")
+
+class PostUpdate(BaseModel):
+    message_link: Optional[str] = Field(None, description="Telegram message link")
+    chat_id: Optional[int] = Field(None, description="Chat ID from Telegram")
+    message_id: Optional[int] = Field(None, description="Message ID from Telegram")
+
+class TaskCreate(BaseModel):
+    name: str = Field(..., description="Task name")
+    post_ids: List[int] = Field(..., description="List of post IDs")
+    accounts: List[str] = Field(..., description="List of phone numbers")
+    action: Dict[str, Any] = Field(..., description="Action configuration")
+    description: Optional[str] = Field(None, description="Task description")
+
+class TaskUpdate(BaseModel):
+    name: Optional[str] = Field(None, description="Task name")
+    post_ids: Optional[List[int]] = Field(None, description="List of post IDs")
+    accounts: Optional[List[str]] = Field(None, description="List of phone numbers")
+    action: Optional[Dict[str, Any]] = Field(None, description="Action configuration")
+    description: Optional[str] = Field(None, description="Task description")
+    status: Optional[str] = Field(None, description="Task status")
+
+@app.get("/", summary="Health check")
+async def root():
+    return {"message": "LikeBot API Server is running", "version": "1.0.0"}
+
+# ============= ACCOUNTS CRUD =============
+
+@app.get('/accounts', summary="Get all accounts", response_model=List[Dict])
+async def get_accounts(
+    phone_number: Optional[str] = Query(None, description="Filter by phone number")
+):
+    """Get all accounts with optional filtering by phone number."""
     try:
         db = get_db()
-        task = await db.get_task(3)
-
-        await task.run_and_wait()    
+        accounts = await db.load_all_accounts()
         
+        # Convert to dict format for JSON response
+        accounts_data = [account.to_dict() for account in accounts]
+        
+        # Apply filtering if phone_number is provided
+        if phone_number:
+            accounts_data = [acc for acc in accounts_data if acc.get('phone_number') == phone_number]
+        
+        return accounts_data
     except Exception as e:
-        logger.error(f"Error in main: {e}")
-        raise
-    finally:
-        logger.info("Main function completed")
+        raise HTTPException(status_code=500, detail=f"Failed to load accounts: {str(e)}")
 
-if __name__ == "__main__":
+@app.get('/accounts/{phone_number}', summary="Get account by phone number")
+async def get_account(phone_number: str):
+    """Get a specific account by phone number."""
     try:
-        asyncio.run(main())
+        db = get_db()
+        account = await db.get_account(phone_number)
+        if not account:
+            raise HTTPException(status_code=404, detail=f"Account with phone number {phone_number} not found")
+        return account.to_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get account: {str(e)}")
+
+@app.post('/accounts', summary="Create new account", status_code=201)
+async def create_account(account_data: AccountCreate):
+    """Create a new account."""
+    try:
+        db = get_db()
+        
+        # Check if account already exists
+        existing_account = await db.get_account(account_data.phone_number)
+        if existing_account:
+            raise HTTPException(status_code=409, detail=f"Account with phone number {account_data.phone_number} already exists")
+        
+        # Create account
+        account_dict = account_data.model_dump()
+        success = await db.add_account(account_dict)
+        
+        if success:
+            return {"message": f"Account {account_data.phone_number} created successfully"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to create account")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create account: {str(e)}")
+
+@app.put('/accounts/{phone_number}', summary="Update account")
+async def update_account(phone_number: str, account_data: AccountUpdate):
+    """Update an existing account."""
+    try:
+        db = get_db()
+        
+        # Check if account exists
+        existing_account = await db.get_account(phone_number)
+        if not existing_account:
+            raise HTTPException(status_code=404, detail=f"Account with phone number {phone_number} not found")
+        
+        # Update account with only provided fields
+        update_dict = {k: v for k, v in account_data.model_dump().items() if v is not None}
+        
+        if not update_dict:
+            raise HTTPException(status_code=400, detail="No update data provided")
+        
+        success = await db.update_account(phone_number, update_dict)
+        
+        if success:
+            return {"message": f"Account {phone_number} updated successfully"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to update account")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update account: {str(e)}")
+
+@app.delete('/accounts/{phone_number}', summary="Delete account")
+async def delete_account(phone_number: str):
+    """Delete an account by phone number."""
+    try:
+        db = get_db()
+        
+        # Check if account exists
+        existing_account = await db.get_account(phone_number)
+        if not existing_account:
+            raise HTTPException(status_code=404, detail=f"Account with phone number {phone_number} not found")
+        
+        success = await db.delete_account(phone_number)
+        
+        if success:
+            return {"message": f"Account {phone_number} deleted successfully"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to delete account")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete account: {str(e)}")
+
+# ============= POSTS CRUD =============
+
+@app.get('/posts', summary="Get all posts", response_model=List[Dict])
+async def get_posts(
+    post_id: Optional[int] = Query(None, description="Filter by post ID"),
+    chat_id: Optional[int] = Query(None, description="Filter by chat ID"),
+    validated_only: Optional[bool] = Query(None, description="Filter by validation status")
+):
+    """Get all posts with optional filtering."""
+    try:
+        db = get_db()
+        posts = await db.load_all_posts()
+        
+        # Convert to dict format for JSON response
+        posts_data = [post.to_dict() for post in posts]
+        
+        # Apply filtering
+        if post_id is not None:
+            posts_data = [post for post in posts_data if post.get('post_id') == post_id]
+        
+        if chat_id is not None:
+            posts_data = [post for post in posts_data if post.get('chat_id') == chat_id]
+        
+        if validated_only is not None:
+            if validated_only:
+                posts_data = [post for post in posts_data if post.get('chat_id') is not None and post.get('message_id') is not None]
+            else:
+                posts_data = [post for post in posts_data if post.get('chat_id') is None or post.get('message_id') is None]
+        
+        return posts_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load posts: {str(e)}")
+
+@app.get('/posts/{post_id}', summary="Get post by ID")
+async def get_post(post_id: int):
+    """Get a specific post by ID."""
+    try:
+        db = get_db()
+        post = await db.get_post(post_id)
+        if not post:
+            raise HTTPException(status_code=404, detail=f"Post with ID {post_id} not found")
+        return post.to_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get post: {str(e)}")
+
+@app.post('/posts', summary="Create new post", status_code=201)
+async def create_post(post_data: PostCreate):
+    """Create a new post."""
+    try:
+        db = get_db()
+        
+        # If post_id is provided, check if it already exists
+        if post_data.post_id:
+            existing_post = await db.get_post(post_data.post_id)
+            if existing_post:
+                raise HTTPException(status_code=409, detail=f"Post with ID {post_data.post_id} already exists")
+        
+        # Create post
+        post_dict = post_data.model_dump()
+        success = await db.add_post(post_dict)
+        
+        if success:
+            return {"message": f"Post created successfully", "post_id": post_dict.get('post_id')}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to create post")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create post: {str(e)}")
+
+@app.put('/posts/{post_id}', summary="Update post")
+async def update_post(post_id: int, post_data: PostUpdate):
+    """Update an existing post."""
+    try:
+        db = get_db()
+        
+        # Check if post exists
+        existing_post = await db.get_post(post_id)
+        if not existing_post:
+            raise HTTPException(status_code=404, detail=f"Post with ID {post_id} not found")
+        
+        # Update post with only provided fields
+        update_dict = {k: v for k, v in post_data.model_dump().items() if v is not None}
+        
+        if not update_dict:
+            raise HTTPException(status_code=400, detail="No update data provided")
+        
+        success = await db.update_post(post_id, update_dict)
+        
+        if success:
+            return {"message": f"Post {post_id} updated successfully"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to update post")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update post: {str(e)}")
+
+@app.delete('/posts/{post_id}', summary="Delete post")
+async def delete_post(post_id: int):
+    """Delete a post by ID."""
+    try:
+        db = get_db()
+        
+        # Check if post exists
+        existing_post = await db.get_post(post_id)
+        if not existing_post:
+            raise HTTPException(status_code=404, detail=f"Post with ID {post_id} not found")
+        
+        success = await db.delete_post(post_id)
+        
+        if success:
+            return {"message": f"Post {post_id} deleted successfully"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to delete post")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete post: {str(e)}")
+
+# ============= TASKS CRUD =============
+
+@app.get('/tasks', summary="Get all tasks", response_model=List[Dict])
+async def get_tasks(
+    task_id: Optional[int] = Query(None, description="Filter by task ID"),
+    status: Optional[str] = Query(None, description="Filter by task status"),
+    name: Optional[str] = Query(None, description="Filter by task name (partial match)")
+):
+    """Get all tasks with optional filtering."""
+    try:
+        db = get_db()
+        tasks = await db.load_all_tasks()
+        
+        # Convert to dict format for JSON response
+        tasks_data = [task.to_dict() for task in tasks]
+        
+        # Apply filtering
+        if task_id is not None:
+            tasks_data = [task for task in tasks_data if task.get('task_id') == task_id]
+        
+        if status:
+            tasks_data = [task for task in tasks_data if task.get('status', '').upper() == status.upper()]
+        
+        if name:
+            tasks_data = [task for task in tasks_data if name.lower() in task.get('name', '').lower()]
+        
+        return tasks_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load tasks: {str(e)}")
+
+@app.get('/tasks/{task_id}', summary="Get task by ID")
+async def get_task(task_id: int):
+    """Get a specific task by ID."""
+    try:
+        db = get_db()
+        task = await db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
+        return task.to_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get task: {str(e)}")
+
+@app.post('/tasks', summary="Create new task", status_code=201)
+async def create_task(task_data: TaskCreate):
+    """Create a new task."""
+    try:
+        db = get_db()
+        
+        # Validate that accounts exist
+        for phone_number in task_data.accounts:
+            account = await db.get_account(phone_number)
+            if not account:
+                raise HTTPException(status_code=400, detail=f"Account with phone number {phone_number} not found")
+        
+        # Validate that posts exist
+        for post_id in task_data.post_ids:
+            post = await db.get_post(post_id)
+            if not post:
+                raise HTTPException(status_code=400, detail=f"Post with ID {post_id} not found")
+        
+        # Create task
+        task_dict = task_data.model_dump()
+        success = await db.add_task(task_dict)
+        
+        if success:
+            return {"message": f"Task '{task_data.name}' created successfully", "task_id": task_dict.get('task_id')}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to create task")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create task: {str(e)}")
+
+@app.put('/tasks/{task_id}', summary="Update task")
+async def update_task(task_id: int, task_data: TaskUpdate):
+    """Update an existing task."""
+    try:
+        db = get_db()
+        
+        # Check if task exists
+        existing_task = await db.get_task(task_id)
+        if not existing_task:
+            raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
+        
+        # Update task with only provided fields
+        update_dict = {k: v for k, v in task_data.model_dump().items() if v is not None}
+        
+        if not update_dict:
+            raise HTTPException(status_code=400, detail="No update data provided")
+        
+        # Validate accounts if provided
+        if 'accounts' in update_dict:
+            for phone_number in update_dict['accounts']:
+                account = await db.get_account(phone_number)
+                if not account:
+                    raise HTTPException(status_code=400, detail=f"Account with phone number {phone_number} not found")
+        
+        # Validate posts if provided
+        if 'post_ids' in update_dict:
+            for post_id in update_dict['post_ids']:
+                post = await db.get_post(post_id)
+                if not post:
+                    raise HTTPException(status_code=400, detail=f"Post with ID {post_id} not found")
+        
+        success = await db.update_task(task_id, update_dict)
+        
+        if success:
+            return {"message": f"Task {task_id} updated successfully"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to update task")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update task: {str(e)}")
+
+@app.delete('/tasks/{task_id}', summary="Delete task")
+async def delete_task(task_id: int):
+    """Delete a task by ID."""
+    try:
+        db = get_db()
+        
+        # Check if task exists
+        existing_task = await db.get_task(task_id)
+        if not existing_task:
+            raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
+        
+        success = await db.delete_task(task_id)
+        
+        if success:
+            return {"message": f"Task {task_id} deleted successfully"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to delete task")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete task: {str(e)}")
+
+# ============= TASK ACTIONS =============
+
+@app.get('/tasks/{task_id}/status', summary="Get task status")
+async def get_task_status(task_id: int):
+    """Get the current status of a task."""
+    try:
+        db = get_db()
+        task = await db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
+        
+        status = await task.get_status()
+        return {"task_id": task_id, "status": status.name if hasattr(status, 'name') else str(status)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get task status: {str(e)}")
+
+@app.post('/tasks/{task_id}/start', summary="Start task execution")
+async def start_task(task_id: int):
+    """Start task execution."""
+    try:
+        db = get_db()
+        task = await db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
+        
+        await task.start()
+        return {"message": f"Task {task_id} started successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start task: {str(e)}")
+
+@app.post('/tasks/{task_id}/pause', summary="Pause task execution")
+async def pause_task(task_id: int):
+    """Pause task execution."""
+    try:
+        db = get_db()
+        task = await db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
+        
+        await task.pause()
+        return {"message": f"Task {task_id} paused successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to pause task: {str(e)}")
+
+@app.post('/tasks/{task_id}/resume', summary="Resume task execution")
+async def resume_task(task_id: int):
+    """Resume task execution."""
+    try:
+        db = get_db()
+        task = await db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
+        
+        await task.resume()
+        return {"message": f"Task {task_id} resumed successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to resume task: {str(e)}")
+
+@app.get('/tasks/{task_id}/report', summary="Get task execution report")
+async def get_task_report(
+    task_id: int,
+    report_type: str = Query("success", description="Type of report (success, all, errors)")
+):
+    """Get execution report for a task."""
+    try:
+        db = get_db()
+        task = await db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
+        
+        report = await task.get_report(type=report_type)
+        if report is None:
+            return {"message": f"No report available for task {task_id}", "task_id": task_id}
+        
+        return {"task_id": task_id, "report": report}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get task report: {str(e)}")
+
+# ============= LEGACY ENDPOINTS (for backward compatibility) =============
+
+@app.post('/actions/run_task', summary="Run task (legacy endpoint)")
+async def run_task(
+    task_id: int
+):
+    """Legacy endpoint to run a task. Use POST /tasks/{task_id}/start instead."""
+
+    @crash_handler
+    async def run_task_internal():
+        logger = setup_logger("main", "main.log")
+        logger.info(f"Task {task_id} starting...")
+
+        try:
+            db = get_db()
+            task = await db.get_task(task_id)
+
+            if not task:
+                raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
+
+            await task.run_and_wait()    
+            
+        except Exception as e:
+            logger.error(f"Error in main: {e}")
+            raise
+        finally:
+            logger.info(f"Task {task_id} completed")
+
+    try:
+        await run_task_internal()
+        return {"status": f"Task {task_id} completed successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Task {task_id} failed: {str(e)}")
     finally:
         cleanup_logging()
+
+# ============= BULK OPERATIONS =============
+
+@app.post('/accounts/bulk', summary="Create multiple accounts", status_code=201)
+async def create_accounts_bulk(accounts_data: List[AccountCreate]):
+    """Create multiple accounts in bulk."""
+    try:
+        db = get_db()
+        results = []
+        
+        for account_data in accounts_data:
+            try:
+                # Check if account already exists
+                existing_account = await db.get_account(account_data.phone_number)
+                if existing_account:
+                    results.append({
+                        "phone_number": account_data.phone_number,
+                        "status": "skipped",
+                        "message": "Account already exists"
+                    })
+                    continue
+                
+                # Create account
+                account_dict = account_data.model_dump()
+                success = await db.add_account(account_dict)
+                
+                if success:
+                    results.append({
+                        "phone_number": account_data.phone_number,
+                        "status": "success",
+                        "message": "Account created successfully"
+                    })
+                else:
+                    results.append({
+                        "phone_number": account_data.phone_number,
+                        "status": "failed",
+                        "message": "Failed to create account"
+                    })
+            except Exception as e:
+                results.append({
+                    "phone_number": account_data.phone_number,
+                    "status": "error",
+                    "message": f"Error: {str(e)}"
+                })
+        
+        return {"results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create accounts in bulk: {str(e)}")
+
+@app.post('/posts/bulk', summary="Create multiple posts", status_code=201)
+async def create_posts_bulk(posts_data: List[PostCreate]):
+    """Create multiple posts in bulk."""
+    try:
+        db = get_db()
+        results = []
+        
+        for post_data in posts_data:
+            try:
+                # If post_id is provided, check if it already exists
+                if post_data.post_id:
+                    existing_post = await db.get_post(post_data.post_id)
+                    if existing_post:
+                        results.append({
+                            "post_id": post_data.post_id,
+                            "status": "skipped",
+                            "message": "Post already exists"
+                        })
+                        continue
+                
+                # Create post
+                post_dict = post_data.model_dump()
+                success = await db.add_post(post_dict)
+                
+                if success:
+                    results.append({
+                        "post_id": post_dict.get('post_id'),
+                        "status": "success",
+                        "message": "Post created successfully"
+                    })
+                else:
+                    results.append({
+                        "post_id": post_data.post_id,
+                        "status": "failed",
+                        "message": "Failed to create post"
+                    })
+            except Exception as e:
+                results.append({
+                    "post_id": post_data.post_id,
+                    "status": "error",
+                    "message": f"Error: {str(e)}"
+                })
+        
+        return {"results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create posts in bulk: {str(e)}")
+
+@app.delete('/accounts/bulk', summary="Delete multiple accounts")
+async def delete_accounts_bulk(phone_numbers: List[str]):
+    """Delete multiple accounts in bulk."""
+    try:
+        db = get_db()
+        results = []
+        
+        for phone_number in phone_numbers:
+            try:
+                # Check if account exists
+                existing_account = await db.get_account(phone_number)
+                if not existing_account:
+                    results.append({
+                        "phone_number": phone_number,
+                        "status": "not_found",
+                        "message": "Account not found"
+                    })
+                    continue
+                
+                success = await db.delete_account(phone_number)
+                
+                if success:
+                    results.append({
+                        "phone_number": phone_number,
+                        "status": "success",
+                        "message": "Account deleted successfully"
+                    })
+                else:
+                    results.append({
+                        "phone_number": phone_number,
+                        "status": "failed",
+                        "message": "Failed to delete account"
+                    })
+            except Exception as e:
+                results.append({
+                    "phone_number": phone_number,
+                    "status": "error",
+                    "message": f"Error: {str(e)}"
+                })
+        
+        return {"results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete accounts in bulk: {str(e)}")
+
+@app.delete('/posts/bulk', summary="Delete multiple posts")
+async def delete_posts_bulk(post_ids: List[int]):
+    """Delete multiple posts in bulk."""
+    try:
+        db = get_db()
+        results = []
+        
+        for post_id in post_ids:
+            try:
+                # Check if post exists
+                existing_post = await db.get_post(post_id)
+                if not existing_post:
+                    results.append({
+                        "post_id": post_id,
+                        "status": "not_found",
+                        "message": "Post not found"
+                    })
+                    continue
+                
+                success = await db.delete_post(post_id)
+                
+                if success:
+                    results.append({
+                        "post_id": post_id,
+                        "status": "success",
+                        "message": "Post deleted successfully"
+                    })
+                else:
+                    results.append({
+                        "post_id": post_id,
+                        "status": "failed",
+                        "message": "Failed to delete post"
+                    })
+            except Exception as e:
+                results.append({
+                    "post_id": post_id,
+                    "status": "error",
+                    "message": f"Error: {str(e)}"
+                })
+        
+        return {"results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete posts in bulk: {str(e)}")
+
+# ============= UTILITY ENDPOINTS =============
+
+@app.get('/stats', summary="Get database statistics")
+async def get_stats():
+    """Get statistics about accounts, posts, and tasks."""
+    try:
+        db = get_db()
+        
+        accounts = await db.load_all_accounts()
+        posts = await db.load_all_posts()
+        tasks = await db.load_all_tasks()
+        
+        # Task status breakdown
+        task_statuses = {}
+        for task in tasks:
+            status = str(task.status)
+            task_statuses[status] = task_statuses.get(status, 0) + 1
+        
+        # Post validation status
+        validated_posts = sum(1 for post in posts if post.is_validated)
+        unvalidated_posts = len(posts) - validated_posts
+        
+        return {
+            "accounts": {
+                "total": len(accounts)
+            },
+            "posts": {
+                "total": len(posts),
+                "validated": validated_posts,
+                "unvalidated": unvalidated_posts
+            },
+            "tasks": {
+                "total": len(tasks),
+                "by_status": task_statuses
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get statistics: {str(e)}")
+
+@app.post('/posts/{post_id}/validate', summary="Validate a specific post")
+async def validate_post(post_id: int):
+    """Validate a specific post by extracting chat_id and message_id from its link."""
+    try:
+        db = get_db()
+        
+        # Get the post
+        post = await db.get_post(post_id)
+        if not post:
+            raise HTTPException(status_code=404, detail=f"Post with ID {post_id} not found")
+        
+        if post.is_validated:
+            return {"message": f"Post {post_id} is already validated"}
+        
+        # Get an account to use for validation
+        accounts = await db.load_all_accounts()
+        if not accounts:
+            raise HTTPException(status_code=400, detail="No accounts available for validation")
+        
+        # Create a client and validate the post
+        client = Client(accounts[0])
+        await client.connect()
+        
+        try:
+            validated_post = await post.validate(client)
+            return {
+                "message": f"Post {post_id} validated successfully",
+                "chat_id": validated_post.chat_id,
+                "message_id": validated_post.message_id
+            }
+        finally:
+            await client.disconnect()
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to validate post: {str(e)}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)

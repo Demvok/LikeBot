@@ -4,3 +4,7 @@ PyYAML
 pandas
 pymongo
 motor
+fastapi
+uvicorn
+pydantic
+requests
