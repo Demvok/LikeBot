@@ -4,6 +4,7 @@
 
 - add api for task import
 - review data handling on process terminations (shutdowns, cancels, etc.)
+- add neccessary filtering on db loading, not loading all and filtering
 
 - add account status as meta (login status)
 - automate an provide manual way of session verification

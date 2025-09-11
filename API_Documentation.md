@@ -395,15 +395,107 @@ Get execution report for a task.
 
 **Query Parameters:**
 - `report_type` (optional): Type of report (success, all, errors). Default: "success"
+- `run_id` (optional): Specific run ID to get report for. If not provided, returns latest run report.
 
 **Response:**
 ```json
 {
   "task_id": 1,
+  "run_id": "abc123-def456-ghi789",
   "report": {
     "events": [...],
     "summary": {...}
   }
+}
+```
+
+### GET /tasks/{task_id}/runs
+Get all execution runs for a specific task.
+
+**Response:**
+```json
+{
+  "task_id": 1,
+  "total_runs": 5,
+  "runs": [
+    {
+      "run_id": "abc123-def456-ghi789",
+      "task_id": "1",
+      "started_at": "2025-01-01T10:00:00Z",
+      "finished_at": "2025-01-01T10:05:00Z",
+      "status": "success",
+      "event_count": 25,
+      "meta": {
+        "task_name": "React to posts",
+        "action": "react"
+      }
+    }
+  ]
+}
+```
+
+### GET /tasks/{task_id}/runs/{run_id}/report
+Get execution report for a specific run of a task.
+
+**Query Parameters:**
+- `report_type` (optional): Type of report (success, all, errors). Default: "success"
+
+**Response:**
+```json
+{
+  "task_id": 1,
+  "run_id": "abc123-def456-ghi789",
+  "report": {
+    "events": [...],
+    "summary": {...}
+  }
+}
+```
+
+### GET /runs
+Get all execution runs across all tasks.
+
+**Response:**
+```json
+{
+  "total_tasks": 3,
+  "total_runs": 15,
+  "tasks": [
+    {
+      "task_id": "1",
+      "run_count": 5,
+      "runs": [...]
+    },
+    {
+      "task_id": "2", 
+      "run_count": 10,
+      "runs": [...]
+    }
+  ]
+}
+```
+
+### DELETE /tasks/{task_id}/runs/{run_id}
+Delete a specific run and all its events.
+
+**Response:**
+```json
+{
+  "message": "Run abc123-def456-ghi789 deleted successfully",
+  "runs_deleted": 1,
+  "events_deleted": 25
+}
+```
+
+### DELETE /tasks/{task_id}/runs
+Delete all runs and their events for a specific task.
+
+**Response:**
+```json
+{
+  "message": "All runs for task 1 deleted successfully",
+  "runs_deleted": 5,
+  "events_deleted": 125
 }
 ```
 

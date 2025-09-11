@@ -237,7 +237,7 @@ class RunEventManager:
         df = df.loc[:, ["task_id", "run_count"]] if not df.empty else pd.DataFrame(columns=["task_id", "run_count"])
         return df
 
-    async def get_runs(self, task_id):
+    async def get_runs(self, task_id) -> pd.DataFrame:
         """
         Return all runs for a given task_id, with an additional column 'event_count'
         indicating the number of events for each run, ordered by started_at descending.
@@ -362,8 +362,9 @@ async def create_report(data, type=None):
 
     if type == 'success':
         success_report = preprocessed_data.loc[data['action_type'] == 'worker'].loc[preprocessed_data['event_type'] == 'info'].dropna(subset=['details']).drop(['action_type', 'event_type', 'level'], axis=1)
-        success_report['post_id'] = await gather_post_links(success_report['post_id'])
-        success_report.rename({'post_id': 'message_link'}, axis=1, inplace=True)
+        if 'post_id' in success_report.columns:
+            success_report['post_id'] = await gather_post_links(success_report['post_id'])
+            success_report.rename({'post_id': 'message_link'}, axis=1, inplace=True)
         return success_report.loc[success_report['details'] != 'action'].reset_index(drop=True)
     elif type == 'errors':
         return data.loc[data['event_type'] == 'error'].reset_index(drop=True).dropna(how='all', axis=1)

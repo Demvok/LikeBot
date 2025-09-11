@@ -12,6 +12,34 @@ atexit.register(cleanup_logging)  # Register cleanup function
 
 app = FastAPI(title="LikeBot API", description="Full CRUD API for LikeBot automation", version="1.0.0")
 
+def convert_to_serializable(obj):
+    """Convert non-JSON-serializable objects to serializable format."""
+    if obj is None:
+        return None
+    
+    # Handle ObjectId specifically
+    if hasattr(obj, 'binary') and hasattr(obj, '__str__'):  # ObjectId check
+        return str(obj)
+    
+    # Handle numpy types
+    if hasattr(obj, 'item'):
+        return obj.item()
+    
+    # Handle datetime objects
+    if hasattr(obj, 'isoformat'):
+        return obj.isoformat()
+    
+    # Handle dictionaries
+    if isinstance(obj, dict):
+        return {key: convert_to_serializable(value) for key, value in obj.items()}
+    
+    # Handle lists and tuples
+    if isinstance(obj, (list, tuple)):
+        return [convert_to_serializable(item) for item in obj]
+    
+    # Return as-is for basic types
+    return obj
+
 # Pydantic models for request/response validation
 class AccountCreate(BaseModel):
     phone_number: str = Field(..., description="Phone number for the account")
@@ -55,6 +83,7 @@ async def root():
 # ============= ACCOUNTS CRUD =============
 
 @app.get('/accounts', summary="Get all accounts", response_model=List[Dict])
+@crash_handler
 async def get_accounts(
     phone_number: Optional[str] = Query(None, description="Filter by phone number")
 ):
@@ -75,6 +104,7 @@ async def get_accounts(
         raise HTTPException(status_code=500, detail=f"Failed to load accounts: {str(e)}")
 
 @app.get('/accounts/{phone_number}', summary="Get account by phone number")
+@crash_handler
 async def get_account(phone_number: str):
     """Get a specific account by phone number."""
     try:
@@ -89,6 +119,7 @@ async def get_account(phone_number: str):
         raise HTTPException(status_code=500, detail=f"Failed to get account: {str(e)}")
 
 @app.post('/accounts', summary="Create new account", status_code=201)
+@crash_handler
 async def create_account(account_data: AccountCreate):
     """Create a new account."""
     try:
@@ -113,6 +144,7 @@ async def create_account(account_data: AccountCreate):
         raise HTTPException(status_code=500, detail=f"Failed to create account: {str(e)}")
 
 @app.put('/accounts/{phone_number}', summary="Update account")
+@crash_handler
 async def update_account(phone_number: str, account_data: AccountUpdate):
     """Update an existing account."""
     try:
@@ -141,6 +173,7 @@ async def update_account(phone_number: str, account_data: AccountUpdate):
         raise HTTPException(status_code=500, detail=f"Failed to update account: {str(e)}")
 
 @app.delete('/accounts/{phone_number}', summary="Delete account")
+@crash_handler
 async def delete_account(phone_number: str):
     """Delete an account by phone number."""
     try:
@@ -165,6 +198,7 @@ async def delete_account(phone_number: str):
 # ============= POSTS CRUD =============
 
 @app.get('/posts', summary="Get all posts", response_model=List[Dict])
+@crash_handler
 async def get_posts(
     post_id: Optional[int] = Query(None, description="Filter by post ID"),
     chat_id: Optional[int] = Query(None, description="Filter by chat ID"),
@@ -196,6 +230,7 @@ async def get_posts(
         raise HTTPException(status_code=500, detail=f"Failed to load posts: {str(e)}")
 
 @app.get('/posts/{post_id}', summary="Get post by ID")
+@crash_handler
 async def get_post(post_id: int):
     """Get a specific post by ID."""
     try:
@@ -210,6 +245,7 @@ async def get_post(post_id: int):
         raise HTTPException(status_code=500, detail=f"Failed to get post: {str(e)}")
 
 @app.post('/posts', summary="Create new post", status_code=201)
+@crash_handler
 async def create_post(post_data: PostCreate):
     """Create a new post."""
     try:
@@ -235,6 +271,7 @@ async def create_post(post_data: PostCreate):
         raise HTTPException(status_code=500, detail=f"Failed to create post: {str(e)}")
 
 @app.put('/posts/{post_id}', summary="Update post")
+@crash_handler
 async def update_post(post_id: int, post_data: PostUpdate):
     """Update an existing post."""
     try:
@@ -263,6 +300,7 @@ async def update_post(post_id: int, post_data: PostUpdate):
         raise HTTPException(status_code=500, detail=f"Failed to update post: {str(e)}")
 
 @app.delete('/posts/{post_id}', summary="Delete post")
+@crash_handler
 async def delete_post(post_id: int):
     """Delete a post by ID."""
     try:
@@ -287,6 +325,7 @@ async def delete_post(post_id: int):
 # ============= TASKS CRUD =============
 
 @app.get('/tasks', summary="Get all tasks", response_model=List[Dict])
+@crash_handler
 async def get_tasks(
     task_id: Optional[int] = Query(None, description="Filter by task ID"),
     status: Optional[str] = Query(None, description="Filter by task status"),
@@ -315,6 +354,7 @@ async def get_tasks(
         raise HTTPException(status_code=500, detail=f"Failed to load tasks: {str(e)}")
 
 @app.get('/tasks/{task_id}', summary="Get task by ID")
+@crash_handler
 async def get_task(task_id: int):
     """Get a specific task by ID."""
     try:
@@ -329,6 +369,7 @@ async def get_task(task_id: int):
         raise HTTPException(status_code=500, detail=f"Failed to get task: {str(e)}")
 
 @app.post('/tasks', summary="Create new task", status_code=201)
+@crash_handler
 async def create_task(task_data: TaskCreate):
     """Create a new task."""
     try:
@@ -360,6 +401,7 @@ async def create_task(task_data: TaskCreate):
         raise HTTPException(status_code=500, detail=f"Failed to create task: {str(e)}")
 
 @app.put('/tasks/{task_id}', summary="Update task")
+@crash_handler
 async def update_task(task_id: int, task_data: TaskUpdate):
     """Update an existing task."""
     try:
@@ -402,6 +444,7 @@ async def update_task(task_id: int, task_data: TaskUpdate):
         raise HTTPException(status_code=500, detail=f"Failed to update task: {str(e)}")
 
 @app.delete('/tasks/{task_id}', summary="Delete task")
+@crash_handler
 async def delete_task(task_id: int):
     """Delete a task by ID."""
     try:
@@ -426,6 +469,7 @@ async def delete_task(task_id: int):
 # ============= TASK ACTIONS =============
 
 @app.get('/tasks/{task_id}/status', summary="Get task status")
+@crash_handler
 async def get_task_status(task_id: int):
     """Get the current status of a task."""
     try:
@@ -442,6 +486,7 @@ async def get_task_status(task_id: int):
         raise HTTPException(status_code=500, detail=f"Failed to get task status: {str(e)}")
 
 @app.post('/tasks/{task_id}/start', summary="Start task execution")
+@crash_handler
 async def start_task(task_id: int):
     """Start task execution."""
     try:
@@ -458,6 +503,7 @@ async def start_task(task_id: int):
         raise HTTPException(status_code=500, detail=f"Failed to start task: {str(e)}")
 
 @app.post('/tasks/{task_id}/pause', summary="Pause task execution")
+@crash_handler
 async def pause_task(task_id: int):
     """Pause task execution."""
     try:
@@ -474,6 +520,7 @@ async def pause_task(task_id: int):
         raise HTTPException(status_code=500, detail=f"Failed to pause task: {str(e)}")
 
 @app.post('/tasks/{task_id}/resume', summary="Resume task execution")
+@crash_handler
 async def resume_task(task_id: int):
     """Resume task execution."""
     try:
@@ -490,68 +537,252 @@ async def resume_task(task_id: int):
         raise HTTPException(status_code=500, detail=f"Failed to resume task: {str(e)}")
 
 @app.get('/tasks/{task_id}/report', summary="Get task execution report")
+@crash_handler
 async def get_task_report(
     task_id: int,
-    report_type: str = Query("success", description="Type of report (success, all, errors)")
+    report_type: str = Query("success", description="Type of report (success, all, errors)"),
+    run_id: Optional[str] = Query(None, description="Specific run ID to get report for. If not provided, returns latest run report.")
 ):
-    """Get execution report for a task."""
+    """Get execution report for a task. By default returns the latest run report."""
     try:
         db = get_db()
         task = await db.get_task(task_id)
         if not task:
             raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
         
-        report = await task.get_report(type=report_type)
+        from reporter import RunEventManager, create_report
+        import json
+        eventManager = RunEventManager()        
+
+        if run_id is not None:
+            events = await eventManager.get_events(run_id)
+        else:
+            runs = await eventManager.get_runs(task_id) if run_id is None else None
+            events = await eventManager.get_events(runs.iloc[0].loc['run_id']) if run_id is None and not runs.empty else None
+        
+        report = await create_report(events, report_type) if events is not None else None
+        
         if report is None:
             return {"message": f"No report available for task {task_id}", "task_id": task_id}
         
-        return {"task_id": task_id, "report": report}
+        if '_id' in report.columns:
+            report = report.drop('_id', axis=1)
+
+        report = json.loads(report.to_json(orient='records'))
+
+        return {"task_id": task_id, "report": report, "run_id": run_id}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get task report: {str(e)}")
 
-# ============= LEGACY ENDPOINTS (for backward compatibility) =============
-
-@app.post('/actions/run_task', summary="Run task (legacy endpoint)")
-async def run_task(
-    task_id: int
-):
-    """Legacy endpoint to run a task. Use POST /tasks/{task_id}/start instead."""
-
-    @crash_handler
-    async def run_task_internal():
-        logger = setup_logger("main", "main.log")
-        logger.info(f"Task {task_id} starting...")
-
-        try:
-            db = get_db()
-            task = await db.get_task(task_id)
-
-            if not task:
-                raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
-
-            await task.run_and_wait()    
-            
-        except Exception as e:
-            logger.error(f"Error in main: {e}")
-            raise
-        finally:
-            logger.info(f"Task {task_id} completed")
-
+@app.get('/tasks/{task_id}/runs', summary="Get all runs for a task")
+@crash_handler
+async def get_task_runs(task_id: int):
+    """Get all execution runs for a specific task, ordered by most recent first."""
     try:
-        await run_task_internal()
-        return {"status": f"Task {task_id} completed successfully"}
+        db = get_db()
+        task = await db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
+        
+        from reporter import RunEventManager
+        from pandas import DataFrame
+        import json
+
+        eventManager = RunEventManager()
+        runs: DataFrame = await eventManager.get_runs(task_id)
+        runs_json = json.loads(runs.drop(['_id'], axis=1).to_json(orient='records'))
+
+        return {
+            "task_id": task_id,
+            "total_runs": len(runs_json),
+            "runs": runs_json
+        }
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Task {task_id} failed: {str(e)}")
-    finally:
-        cleanup_logging()
+        raise HTTPException(status_code=500, detail=f"Failed to get task runs: {str(e)}")
+
+@app.get('/tasks/{task_id}/runs/{run_id}/report', summary="Get report for specific run")
+@crash_handler
+async def get_run_report(
+    task_id: int,
+    run_id: str,
+    report_type: str = Query("success", description="Type of report (success, all, errors)")
+):
+    """Get execution report for a specific run of a task."""
+    try:
+        db = get_db()  # May be deleted as so it is only an unnecessary check
+        task = await db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
+        
+        from reporter import RunEventManager, create_report
+        from pandas import DataFrame
+        import json
+
+        eventManager = RunEventManager()
+        events: DataFrame = await eventManager.get_events(run_id)
+
+        if events.empty:
+            raise HTTPException(status_code=404, detail=f"Run with ID {run_id} not found.")
+
+        report = await create_report(data=events, type=report_type) if events is not None else None
+
+        if report is None:
+            return {"message": f"No report available for run {run_id}", "task_id": task_id, "run_id": run_id}
+
+        if '_id' in report.columns:
+            report = report.drop('_id', axis=1)
+
+        report_json = json.loads(report.to_json(orient='records'))
+
+        return {"task_id": task_id, "run_id": run_id, "report": report_json}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get run report: {str(e)}")
+
+@app.get('/runs', summary="Get all runs across all tasks")
+@crash_handler
+async def get_all_runs():
+    """Get all execution runs across all tasks."""
+    try:
+        from reporter import RunEventManager
+        eventManager = RunEventManager()
+        
+        # Get all tasks
+        tasks_df = await eventManager.get_tasks()
+        if tasks_df.empty:
+            return {"total_tasks": 0, "total_runs": 0, "tasks": []}
+        
+        all_tasks_data = []
+        total_runs = 0
+        
+        for _, task_row in tasks_df.iterrows():
+            # Convert numpy types to native Python types
+            task_id = int(task_row['task_id'])  # Convert np.int64 to int
+            run_count = int(task_row['run_count'])  # Convert np.int64 to int
+            
+            # Get runs for this task
+            runs_df = await eventManager.get_runs(task_id)
+            runs = []
+            
+            if not runs_df.empty:
+                runs = runs_df.to_dict('records')
+                # Convert all non-serializable types using our helper function
+                runs = convert_to_serializable(runs)
+            
+            all_tasks_data.append({
+                "task_id": task_id,
+                "run_count": run_count,
+                "runs": runs
+            })
+            total_runs += run_count
+        
+        return {
+            "total_tasks": len(all_tasks_data),
+            "total_runs": total_runs,
+            "tasks": all_tasks_data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get all runs: {str(e)}")
+
+@app.delete('/tasks/{task_id}/runs/{run_id}', summary="Delete a specific run")
+@crash_handler
+async def delete_run(task_id: int, run_id: str):
+    """Delete a specific run and all its events."""
+    try:
+        db = get_db()
+        task = await db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
+        
+        from reporter import RunEventManager
+        eventManager = RunEventManager()
+
+        res = await eventManager.delete_run(run_id)
+        
+        if res['runs_deleted'] == 0:
+            raise HTTPException(status_code=404, detail=f"Run with ID {run_id} not found")
+        
+        return {
+            "message": f"Run {run_id} deleted successfully",
+            "runs_deleted": res['runs_deleted'],
+            "events_deleted": res['events_deleted']
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete run: {str(e)}")
+
+@app.delete('/tasks/{task_id}/runs', summary="Delete all runs for a task")
+@crash_handler
+async def delete_all_task_runs(task_id: int):
+    """Delete all runs and their events for a specific task."""
+    try:
+        db = get_db()
+        task = await db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
+        
+        from reporter import RunEventManager
+        eventManager = RunEventManager()
+        result = await eventManager.clear_runs(str(task_id))
+        
+        return {
+            "message": f"All runs for task {task_id} deleted successfully",
+            "runs_deleted": result['runs_deleted'],
+            "events_deleted": result['events_deleted']
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete task runs: {str(e)}")
+
+# ============= LEGACY ENDPOINTS (for backward compatibility) =============
+
+# @app.post('/actions/run_task', summary="Run task (legacy endpoint)")
+# async def run_task(
+#     task_id: int
+# ):
+#     """Legacy endpoint to run a task. Use POST /tasks/{task_id}/start instead."""
+
+#     @crash_handler
+#     async def run_task_internal():
+#         logger = setup_logger("main", "main.log")
+#         logger.info(f"Task {task_id} starting...")
+
+#         try:
+#             db = get_db()
+#             task = await db.get_task(task_id)
+
+#             if not task:
+#                 raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
+
+#             await task.run_and_wait()    
+            
+#         except Exception as e:
+#             logger.error(f"Error in main: {e}")
+#             raise
+#         finally:
+#             logger.info(f"Task {task_id} completed")
+
+#     try:
+#         await run_task_internal()
+#         return {"status": f"Task {task_id} completed successfully"}
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Task {task_id} failed: {str(e)}")
+#     finally:
+#         cleanup_logging()
 
 # ============= BULK OPERATIONS =============
 
 @app.post('/accounts/bulk', summary="Create multiple accounts", status_code=201)
+@crash_handler
 async def create_accounts_bulk(accounts_data: List[AccountCreate]):
     """Create multiple accounts in bulk."""
     try:
@@ -598,6 +829,7 @@ async def create_accounts_bulk(accounts_data: List[AccountCreate]):
         raise HTTPException(status_code=500, detail=f"Failed to create accounts in bulk: {str(e)}")
 
 @app.post('/posts/bulk', summary="Create multiple posts", status_code=201)
+@crash_handler
 async def create_posts_bulk(posts_data: List[PostCreate]):
     """Create multiple posts in bulk."""
     try:
@@ -645,6 +877,7 @@ async def create_posts_bulk(posts_data: List[PostCreate]):
         raise HTTPException(status_code=500, detail=f"Failed to create posts in bulk: {str(e)}")
 
 @app.delete('/accounts/bulk', summary="Delete multiple accounts")
+@crash_handler
 async def delete_accounts_bulk(phone_numbers: List[str]):
     """Delete multiple accounts in bulk."""
     try:
@@ -689,6 +922,7 @@ async def delete_accounts_bulk(phone_numbers: List[str]):
         raise HTTPException(status_code=500, detail=f"Failed to delete accounts in bulk: {str(e)}")
 
 @app.delete('/posts/bulk', summary="Delete multiple posts")
+@crash_handler
 async def delete_posts_bulk(post_ids: List[int]):
     """Delete multiple posts in bulk."""
     try:
@@ -735,6 +969,7 @@ async def delete_posts_bulk(post_ids: List[int]):
 # ============= UTILITY ENDPOINTS =============
 
 @app.get('/stats', summary="Get database statistics")
+@crash_handler
 async def get_stats():
     """Get statistics about accounts, posts, and tasks."""
     try:
@@ -772,6 +1007,7 @@ async def get_stats():
         raise HTTPException(status_code=500, detail=f"Failed to get statistics: {str(e)}")
 
 @app.post('/posts/{post_id}/validate', summary="Validate a specific post")
+@crash_handler
 async def validate_post(post_id: int):
     """Validate a specific post by extracting chat_id and message_id from its link."""
     try:
@@ -811,4 +1047,4 @@ async def validate_post(post_id: int):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8080)
