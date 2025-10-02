@@ -659,6 +659,7 @@ class MongoStorage(StorageInterface):
         posts = []
         async for post in cursor:
             post.pop('_id', None)
+            post.pop('is_validated', None)
             posts.append(Post(**post))
         logger.debug(f"Loaded {len(posts)} posts from MongoDB.")
         return posts
