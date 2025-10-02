@@ -1056,5 +1056,11 @@ async def validate_post(post_id: int):
         raise HTTPException(status_code=500, detail=f"Failed to validate post: {str(e)}")
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8080)
+    import uvicorn, os
+    from dotenv import load_dotenv
+    load_dotenv()
+    
+    backend_ip = os.getenv("backend_ip", "127.0.0.1")
+    backend_port = os.getenv("backend_port", "8080")
+
+    uvicorn.run(app, host=backend_ip, port=backend_port)
