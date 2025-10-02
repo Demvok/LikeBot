@@ -49,7 +49,28 @@ class CustomFormatter(logging.Formatter):
             record.execution_time = 'N/A'
         # Fixate levelname length to 7 symbols
         record.levelname = str(record.levelname).ljust(7)[:7]
-        return super().format(record)
+        
+        try:
+            return super().format(record)
+        except (TypeError, ValueError) as e:
+            # Handle format errors gracefully
+            try:
+                # Try to get the basic message without formatting
+                if hasattr(record, 'msg') and hasattr(record, 'args'):
+                    if record.args:
+                        # Convert all args to strings to avoid format errors
+                        safe_args = tuple(str(arg) for arg in record.args)
+                        record.args = safe_args
+                        return super().format(record)
+                    else:
+                        # No args, just format the message as-is
+                        return super().format(record)
+                else:
+                    # Fallback: create a basic formatted message
+                    return f"{record.asctime if hasattr(record, 'asctime') else 'N/A'} - {record.name} - {record.levelname} - FORMAT_ERROR: {str(record.msg)}"
+            except:
+                # Ultimate fallback
+                return f"LOGGING_FORMAT_ERROR: {str(record.msg)} (original error: {str(e)})"
 
 class BufferingHandler(logging.Handler):
     """
