@@ -7,10 +7,20 @@ from agent import *
 from logger import setup_logger, crash_handler, cleanup_logging
 from taskhandler import *
 from database import get_db
+from fastapi.middleware.cors import CORSMiddleware
 
 atexit.register(cleanup_logging)  # Register cleanup function
 
 app = FastAPI(title="LikeBot API", description="Full CRUD API for LikeBot automation", version="1.0.0")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:4200"],  # Or ["*"] for all origins (development only)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def convert_to_serializable(obj):
     """Convert non-JSON-serializable objects to serializable format."""

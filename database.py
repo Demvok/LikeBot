@@ -13,6 +13,7 @@ logger = setup_logger("DB", "main.log")
 
 load_dotenv()
 db_url = os.getenv('db_url')
+db_name = os.getenv('db_name', 'LikeBot')
 
 def ensure_async(func):
     if inspect.iscoroutinefunction(func):
@@ -566,7 +567,7 @@ class MongoStorage(StorageInterface):
         if cls._accounts is None:
             logger.info("Initializing MongoDB client and collections.")
             client = AsyncIOMotorClient(db_url)
-            cls._db = client["LikeBot"]
+            cls._db = client[db_name]
             cls._accounts = cls._db["accounts"]
             cls._posts = cls._db["posts"]
             cls._tasks = cls._db["tasks"]
@@ -744,7 +745,7 @@ class MongoStorage(StorageInterface):
     async def load_all_tasks(cls):
         cls._init()
         logger.info("Loading all tasks from MongoDB.")
-        cursor = cls._tasks.find()
+        cursor = cls._tasks.find().sort('updated_at', -1)
         tasks = []
         async for task in cursor:
             task.pop('_id', None)

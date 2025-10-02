@@ -52,6 +52,7 @@ class Post:
             'chat_id': self.chat_id,
             'message_id': self.message_id,
             'message_link': self.message_link,
+            'is_validated': self.is_validated,
             'created_at': self.created_at.isoformat() if isinstance(self.created_at, Timestamp) else self.created_at,
             'updated_at': self.updated_at.isoformat() if isinstance(self.updated_at, Timestamp) else self.updated_at
         }

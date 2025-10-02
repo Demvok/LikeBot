@@ -343,6 +343,8 @@ async def create_report(data, type=None):
     """Create a report from the given data. As data standard uses data from get_events from RunEventManager. Report types are:
     - success: Report successful events
     - errors: Report error and warning events
+    - full: Full report with all events
+    - None: Raw data
     """
     from pandas import Series
     import asyncio
