@@ -67,7 +67,8 @@ def write_crash_report(pid=None, exc_info=None, extra_info=None):
     if pid is None:
         pid = os.getpid()
     timestamp = time.strftime('%Y%m%d_%H%M%S')
-    crash_file = os.path.join(crashes_folder, f"crash_{pid}_{timestamp}.log")
+    crash_file = f'./logs/crashes/crash_{pid}_{timestamp}.log'
+    os.makedirs(os.path.dirname(crash_file), exist_ok=True)  # Ensure the directory exists
     with _log_buffers_lock:
         buffer = list(_log_buffers.get(pid, []))
     with open(crash_file, 'w', encoding='utf-8') as f:
