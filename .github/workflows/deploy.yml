@@ -23,5 +23,4 @@ jobs:
             cd /home/ivand/LikeBot
             git fetch --all
             git reset --hard origin/main
-            systemctl daemon-reload
-            systemctl restart mybot
+            sudo systemctl restart mybot
