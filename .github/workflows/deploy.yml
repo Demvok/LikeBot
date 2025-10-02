@@ -1,0 +1,27 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main  # тригер на пуш у main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_KEY }}
+          script: |
+            cd /home/ubuntu/LikeBot
+            git fetch --all
+            git reset --hard origin/main
+            sudo systemctl daemon-reload
+            sudo systemctl restart mybot
