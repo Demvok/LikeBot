@@ -3,7 +3,7 @@ name: Deploy to VPS
 on:
   push:
     branches:
-      - main  # тригер на пуш у main
+      - main  # triggen on push to main
 
 jobs:
   deploy:
@@ -23,4 +23,11 @@ jobs:
             cd /home/ivand/LikeBot
             git fetch --all
             git reset --hard origin/main
-            sudo systemctl restart mybot
+
+            # Installing XDG_RUNTIME_DIR manually for user services
+            export XDG_RUNTIME_DIR=/run/user/$(id -u)
+            
+            # Reloading service as user-unit
+            systemctl --user daemon-reload
+            systemctl --user restart LikeBot
+            systemctl --user status LikeBot --no-pager --lines=20
