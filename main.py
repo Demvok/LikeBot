@@ -1061,6 +1061,6 @@ if __name__ == "__main__":
     load_dotenv()
     
     backend_ip = os.getenv("backend_ip", "127.0.0.1")
-    backend_port = os.getenv("backend_port", "8080")
+    backend_port = int(os.getenv("backend_port", "8080"))
 
     uvicorn.run(app, host=backend_ip, port=backend_port)
