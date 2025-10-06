@@ -1,17 +1,16 @@
 import atexit
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
 from agent import *
-from logger import setup_logger, crash_handler, cleanup_logging
+from logger import crash_handler, cleanup_logging
 from taskhandler import *
 from database import get_db
 from fastapi.middleware.cors import CORSMiddleware
 
 atexit.register(cleanup_logging)  # Register cleanup function
 
-app = FastAPI(title="LikeBot API", description="Full CRUD API for LikeBot automation", version="1.0.0")
+app = FastAPI(title="LikeBot API", description="Full CRUD API for LikeBot automation", version="1.0.1")
 
 # Add CORS middleware
 app.add_middleware(
@@ -88,7 +87,7 @@ class TaskUpdate(BaseModel):
 
 @app.get("/", summary="Health check")
 async def root():
-    return {"message": "LikeBot API Server is running", "version": "1.0.0"}
+    return {"message": "LikeBot API Server is running", "version": app.version}
 
 # ============= ACCOUNTS CRUD =============
 

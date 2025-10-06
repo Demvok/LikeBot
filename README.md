@@ -2,30 +2,39 @@
 
 ### TO DO:
 
-- add api for task import
-- review data handling on process terminations (shutdowns, cancels, etc.)
-- add neccessary filtering on db loading, not loading all and filtering
-
 - add account status as meta (login status)
 - automate an provide manual way of session verification
 - route account to session creation for first use
+- add object refresh on client for first account_id retrieval or fix logging to use phone number
 
-- add creation of neccessary files if they dont exist
+- add reaction precondition (exists in chat) check
+- ensure views on posts correct counting
 - implement proxy logic (import, status, links to accounts)
 
+- add neccessary filtering on db loading, not loading all and filtering
 - ENSURE DATA TYPES CONSISTENCY
-- add signal stops for reporter context
 
-- add object refresh on client for first account_id retrieval or fix logging to use phone number
-- add reaction precondition (exists in chat) check
-- multiple post import
+- add creation of neccessary files if they dont exist
+- add signal stops for reporter context?
 
 
 ## Changelog
 
-### v.0.4
+### v.1.0.1
+- removed semi-funtional file data storage logic
 
 
+
+### v1.0.0 - RELEASE
+- full API for basic tasks
+- moved to production server
+- some API quickfixes for interface calls
+- auto-deployment script
+
+### v0.4
+- add api for task import
+- review data handling on process terminations (shutdowns, cancels, etc.)
+- multiple post import
 
 ### v0.3
 - implemented task report logic (task, date, status, errors from accounts (async exception handling))

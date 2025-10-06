@@ -1,9 +1,5 @@
 .venv
 .env
-.github/
 logs/
 sessions/
 __pycache__
-accounts.json
-posts.json
-examples/
