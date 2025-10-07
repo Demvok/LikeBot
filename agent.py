@@ -1,9 +1,10 @@
 import re, os, random, asyncio
 from telethon.tl.functions.messages import SendReactionRequest
 from telethon import TelegramClient, functions, types
-from telethon import errors
+from telethon.sessions import StringSession
 from logger import setup_logger, load_config
 from dotenv import load_dotenv
+from schemas import AccountStatus
 
 load_dotenv()
 api_id = os.getenv('api_id')
@@ -14,14 +15,30 @@ config = load_config()
 
 
 class Account(object):
+
+    AccountStatus = AccountStatus
     
     def __init__(self, account_data):
         try:
             self.account_id = account_data.get('account_id', None)
             self.session_name = account_data.get('session_name', None)
             self.phone_number = account_data.get('phone_number')
+            self.status = account_data.get('status', self.AccountStatus.NEW)
+
+            self.session_encrypted = None  # Placeholder for TelegramClient session
+            self.session_meta = None  # Placeholder for session metadata
+            self.twofa = account_data.get('2fa', False)
+            self.password_encrypted = account_data.get('password_encrypted', None)
+            
+            self.notes = account_data.get('notes', ""),
+            self.created_at = account_data.get('created_at', None)
+            self.updated_at = account_data.get('updated_at', None)
+
         except KeyError as e:
             raise ValueError(f"Missing key in account configuration: {e}")
+
+        if self.twofa and not self.password_encrypted:
+            raise ValueError("2FA is enabled but no password provided in account configuration.")
 
         if  self.session_name is None:  # Session creation should be linked somewhere here
             self.session_name = self.phone_number
@@ -48,12 +65,16 @@ class Account(object):
         return client
 
     @classmethod
-    def from_keys(cls, phone_number, account_id=None, session_name=None):
+    def from_keys(cls, phone_number, account_id=None, session_name=None, status=None, twofa=False, password_encrypted=None, notes=None):
         """Create an Account object from a dictionary."""
         account_data = {
             'account_id': account_id,
             'session_name': session_name,
-            'phone_number': phone_number
+            'phone_number': phone_number,
+            'status': status,
+            '2fa': twofa,
+            'password_encrypted': password_encrypted,
+            'notes': notes
         }
         return cls(account_data)
 
@@ -71,14 +92,15 @@ class Client(object):
     def __init__(self, account):
         self.account = account
         try:
-            self.session_name = account.session_name
-            self.phone_number = account.phone_number
-            self.account_id = account.account_id
+            for attr in vars(account):  # Copy all fields from account
+                setattr(self, attr, getattr(account, attr))
         except KeyError as e:
             raise ValueError(f"Missing key in account configuration: {e}")
+        
         self.active_emoji_palette = config.get('reactions_palettes', []).get('positive', [])  # Default emoji palette, is replaced automatically
         if not self.active_emoji_palette:
             raise ValueError("Emoji palette is empty in the configuration.")
+        
         self.logger = setup_logger(f"{self.phone_number}", f"accounts/account_{self.phone_number}.log")
         self.logger.info(f"Initializing client for {self.phone_number}. Awaiting connection...")
         self.client = None

@@ -10,6 +10,7 @@ from pandas import errors as pd_errors
 from agent import Account, Client
 from reporter import Reporter
 from logger import setup_logger, load_config, crash_handler, handle_task_exception
+from schemas import TaskStatus
 
 config = load_config()
 
@@ -152,16 +153,8 @@ class Task:
 
     logger = setup_logger("main", "main.log")
 
-    class TaskStatus(Enum):
-        PENDING = auto()
-        RUNNING = auto()
-        PAUSED = auto()
-        FINISHED = auto()
-        CRASHED = auto()
-        def __str__(self):
-            return self.name
-        def __repr__(self):
-            return self.name
+    # Use centralized TaskStatus from schemas.py
+    TaskStatus = TaskStatus
 
     def __init__(self, name, post_ids, accounts, action, task_id=None, description=None, status=None, created_at=None, updated_at=None):
         self.task_id = task_id

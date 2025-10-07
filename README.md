@@ -12,7 +12,6 @@
 - implement proxy logic (import, status, links to accounts)
 
 - add neccessary filtering on db loading, not loading all and filtering
-- ENSURE DATA TYPES CONSISTENCY
 
 - add creation of neccessary files if they dont exist
 - add signal stops for reporter context?
@@ -22,7 +21,7 @@
 
 ### v.1.0.1
 - removed semi-funtional file data storage logic
-
+- ensured data type consistency via pydantic
 
 
 ### v1.0.0 - RELEASE

@@ -1,12 +1,18 @@
 import atexit
 from fastapi import FastAPI, HTTPException, Query
-from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field
+from typing import Optional, List, Dict
 from agent import *
 from logger import crash_handler, cleanup_logging
 from taskhandler import *
 from database import get_db
 from fastapi.middleware.cors import CORSMiddleware
+from schemas import (
+    AccountCreate, AccountUpdate, AccountResponse,
+    PostCreate, PostUpdate, PostResponse,
+    TaskCreate, TaskUpdate, TaskResponse,
+    SuccessResponse, ErrorResponse, BulkOperationResult,
+    DatabaseStats, ValidationResult, serialize_for_json
+)
 
 atexit.register(cleanup_logging)  # Register cleanup function
 
@@ -21,69 +27,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def convert_to_serializable(obj):
-    """Convert non-JSON-serializable objects to serializable format."""
-    if obj is None:
-        return None
-    
-    # Handle ObjectId specifically
-    if hasattr(obj, 'binary') and hasattr(obj, '__str__'):  # ObjectId check
-        return str(obj)
-    
-    # Handle numpy types
-    if hasattr(obj, 'item'):
-        return obj.item()
-    
-    # Handle datetime objects
-    if hasattr(obj, 'isoformat'):
-        return obj.isoformat()
-    
-    # Handle dictionaries
-    if isinstance(obj, dict):
-        return {key: convert_to_serializable(value) for key, value in obj.items()}
-    
-    # Handle lists and tuples
-    if isinstance(obj, (list, tuple)):
-        return [convert_to_serializable(item) for item in obj]
-    
-    # Return as-is for basic types
-    return obj
-
-# Pydantic models for request/response validation
-class AccountCreate(BaseModel):
-    phone_number: str = Field(..., description="Phone number for the account")
-    account_id: Optional[str] = Field(None, description="Account ID from Telegram")
-    session_name: Optional[str] = Field(None, description="Session name for Telegram client")
-
-class AccountUpdate(BaseModel):
-    account_id: Optional[str] = Field(None, description="Account ID from Telegram")
-    session_name: Optional[str] = Field(None, description="Session name for Telegram client")
-
-class PostCreate(BaseModel):
-    message_link: str = Field(..., description="Telegram message link")
-    post_id: Optional[int] = Field(None, description="Post ID (auto-generated if not provided)")
-    chat_id: Optional[int] = Field(None, description="Chat ID from Telegram")
-    message_id: Optional[int] = Field(None, description="Message ID from Telegram")
-
-class PostUpdate(BaseModel):
-    message_link: Optional[str] = Field(None, description="Telegram message link")
-    chat_id: Optional[int] = Field(None, description="Chat ID from Telegram")
-    message_id: Optional[int] = Field(None, description="Message ID from Telegram")
-
-class TaskCreate(BaseModel):
-    name: str = Field(..., description="Task name")
-    post_ids: List[int] = Field(..., description="List of post IDs")
-    accounts: List[str] = Field(..., description="List of phone numbers")
-    action: Dict[str, Any] = Field(..., description="Action configuration")
-    description: Optional[str] = Field(None, description="Task description")
-
-class TaskUpdate(BaseModel):
-    name: Optional[str] = Field(None, description="Task name")
-    post_ids: Optional[List[int]] = Field(None, description="List of post IDs")
-    accounts: Optional[List[str]] = Field(None, description="List of phone numbers")
-    action: Optional[Dict[str, Any]] = Field(None, description="Action configuration")
-    description: Optional[str] = Field(None, description="Task description")
-    status: Optional[str] = Field(None, description="Task status")
+convert_to_serializable = serialize_for_json  # Use centralized serialization function from schemas
 
 @app.get("/", summary="Health check")
 async def root():
