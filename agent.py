@@ -1,8 +1,9 @@
 import re, os, random, asyncio
+from pandas import Timestamp 
 from telethon.tl.functions.messages import SendReactionRequest
-from telethon import TelegramClient, functions, types
+from telethon import TelegramClient, functions, types, errors
 from telethon.sessions import StringSession
-from logger import setup_logger, load_config
+from logger import SAVE_TO, setup_logger, load_config
 from dotenv import load_dotenv
 from schemas import AccountStatus
 from encryption import decrypt_secret, encrypt_secret
@@ -21,18 +22,16 @@ class Account(object):
     
     def __init__(self, account_data):
         try:
+            self.phone_number = account_data.get('phone_number')
             self.account_id = account_data.get('account_id', None)
             self.session_name = account_data.get('session_name', None)
-            self.phone_number = account_data.get('phone_number')
-            self.status = account_data.get('status', self.AccountStatus.NEW)
-
             self.session_encrypted = account_data.get('session_encrypted', None)
-            self.twofa = account_data.get('2fa', False)
+            self.twofa = account_data.get('twofa', False)
             self.password_encrypted = account_data.get('password_encrypted', None)
-            
-            self.notes = account_data.get('notes', ""),
-            self.created_at = account_data.get('created_at', None)
-            self.updated_at = account_data.get('updated_at', None)
+            self.notes = account_data.get('notes', "")
+            self.status = account_data.get('status', self.AccountStatus.NEW)
+            self.created_at = account_data.get('created_at', Timestamp.now())
+            self.updated_at = account_data.get('updated_at', Timestamp.now())
 
         except KeyError as e:
             raise ValueError(f"Missing key in account configuration: {e}")
@@ -40,7 +39,7 @@ class Account(object):
         if self.twofa and not self.password_encrypted:
             raise ValueError("2FA is enabled but no password provided in account configuration.")
 
-        if  self.session_name is None:  # Session creation should be linked somewhere here
+        if self.session_name is None:
             self.session_name = self.phone_number
     
     def __repr__(self):
@@ -50,15 +49,16 @@ class Account(object):
         return f"Account ID: {self.account_id}, phone: {self.phone_number}, session: {self.session_name}"
     
     def to_dict(self):
-        """Convert Account object to dictionary."""
+        """Convert Account object to dictionary matching AccountDict schema."""
         return {
             'account_id': self.account_id,
             'session_name': self.session_name,
             'phone_number': self.phone_number,
-            'status': self.status,
-            '2fa': self.twofa,
+            'session_encrypted': self.session_encrypted,
+            'twofa': self.twofa,
             'password_encrypted': self.password_encrypted,
             'notes': self.notes,
+            'status': self.status.name if isinstance(self.status, AccountStatus) else self.status,
             'created_at': self.created_at,
             'updated_at': self.updated_at
         }
@@ -79,19 +79,35 @@ class Account(object):
 
         from database import get_db  # Avoid circular import if any
         db = get_db()
-        await db.update_account(self.phone_number, {'password_encrypted': self.password_encrypted, '2fa': self.twofa})
+        await db.update_account(self.phone_number, {'password_encrypted': self.password_encrypted, 'twofa': self.twofa})
 
     @classmethod
-    def from_keys(cls, phone_number, account_id=None, session_name=None, status=None, twofa=False, password_encrypted=None, password=None, notes=None):
-        """Create an Account object from a dictionary."""
+    def from_keys(
+        cls,
+        phone_number,
+        account_id=None,
+        session_name=None,
+        session_encrypted=None,
+        twofa=False,
+        password_encrypted=None,
+        password=None,
+        notes=None,
+        status=None,
+        created_at=None,
+        updated_at=None
+    ):
+        """Create an Account object from keys, matching AccountBase schema."""
         account_data = {
+            'phone_number': phone_number,
             'account_id': account_id,
             'session_name': session_name,
-            'phone_number': phone_number,
-            'status': status,
-            '2fa': twofa,
+            'session_encrypted': session_encrypted,
+            'twofa': twofa,
             'password_encrypted': password_encrypted if password_encrypted else encrypt_secret(password, b'Password') if password else None,
-            'notes': notes
+            'notes': notes if notes is not None else "",
+            'status': status if status is not None else cls.AccountStatus.NEW,
+            'created_at': created_at or Timestamp.now(),
+            'updated_at': updated_at or Timestamp.now()
         }
         return cls(account_data)
 
@@ -155,48 +171,75 @@ class Client(object):
         else:
             self.logger.info(f"Creating new session for {self.phone_number}.")
 
-            self.client = TelegramClient(
-                f"{config.get('filepaths', {}).get('sessions_folder', 'sessions/')}{self.session_name}",
-                api_id=api_id,
-                api_hash=api_hash
-            )
+            try:
+                session_folder = config.get('filepaths', {}).get('sessions_folder', 'sessions/')
 
-            if await self.client.is_user_authorized():
-                self.logger.info(f"Client for {self.phone_number} is already authorized.")
-            else:
-                self.logger.info(f"Client for {self.phone_number} is not authorized. Sending code...")
+                if not os.path.exists(session_folder):
+                    os.makedirs(session_folder)
+
+                self.client = TelegramClient(
+                    f"{session_folder}{self.session_name}",
+                    api_id=api_id,
+                    api_hash=api_hash
+                )
+
+                await self.client.connect()  # Connect before checking authorization
                 
-                sent = await self.client.send_code_request(self.phone_number)  # Sending the verification code
-                self.logger.debug(f"Verification code sent to {self.phone_number}.")
-
-
-                code = await self._fetch_verification_code()
-                if not code:
-                    self.logger.warning("No verification code provided.")
-                    raise ValueError("Verification code cannot be empty.")
-                
-                if self.twofa and self.password_encrypted:
-                    password = decrypt_secret(self.password_encrypted, b'Password')
-                    me = await self.client.sign_in(self.phone_number, code, password=password)
+                if await self.client.is_user_authorized():
+                    self.logger.info(f"Client for {self.phone_number} is already authorized.")
                 else:
-                    me = await self.client.sign_in(self.phone_number, code)
+                    self.logger.info(f"Client for {self.phone_number} is not authorized. Sending code...")
+                    
+                    await self.client.send_code_request(self.phone_number)  # Sending the verification code
+                    self.logger.debug(f"Verification code sent to {self.phone_number}.")
 
-            self.session_encrypted = encrypt_secret(StringSession.save(self.client.session))
-            await self.client.disconnect()  # Ensure the session file is closed before deleting
-            
-            from database import get_db  # Avoid circular import if any
-            db = get_db()
-            await db.update_account(self.phone_number, {'session_encrypted': self.session_encrypted})
-            
-            self.logger.info(f"Session for {self.phone_number} saved.")
-            
-            try:                
-                os.remove(f"{config.get('filepaths', {}).get('sessions_folder', 'sessions/')}{self.session_name}.session")
-                self.logger.info(f"Temporary session file deleted for {self.phone_number}.")
+                    code = await self._fetch_verification_code()
+                    if not code:
+                        self.logger.warning("No verification code provided.")
+                        raise ValueError("Verification code cannot be empty.")
+                    else:
+                        self.logger.debug(f"Received verification code: {code}")
+
+                    try:
+                        self.logger.debug("Attempting to sign in with verification code.")
+                        await self.client.sign_in(phone=self.phone_number, code=code)
+                    except errors.SessionPasswordNeededError:
+                        self.logger.info(f"2FA is enabled for {self.phone_number}, password required.")
+                        if not self.password_encrypted:
+                            self.logger.error("2FA is required but no password is configured.")
+                            raise ValueError("2FA password is required but not provided.")
+                        
+                        password = decrypt_secret(self.password_encrypted, b'Password')
+                        if not password:
+                            self.logger.error("Failed to decrypt 2FA password.")
+                            raise ValueError("Failed to decrypt 2FA password.")
+                        
+                        self.logger.debug("Signing in with 2FA password.")
+                        await self.client.sign_in(password=password)
+                    except Exception as e:
+                        self.logger.error(f"Error during sign-in for {self.phone_number}: {e}")
+                        raise
+
+                self.session_encrypted = encrypt_secret(StringSession.save(self.client.session))
+                await self.client.disconnect()  # Ensure the session file is closed before deleting
+                
+                from database import get_db  # Avoid circular import if any
+                db = get_db()
+                await db.update_account(self.phone_number, {'session_encrypted': self.session_encrypted, 'status': AccountStatus.LOGGED_IN.name})
+                
+                self.logger.info(f"Session for {self.phone_number} saved.")
+
+                return StringSession(decrypt_secret(self.session_encrypted))
             except Exception as e:
-                self.logger.error(f"Failed to delete temporary session file for {self.phone_number}: {e}")
-            
-            return StringSession(decrypt_secret(self.session_encrypted))
+                raise e
+            finally:
+                try:                
+                    await self.client.disconnect()
+                    os.remove(f"{config.get('filepaths', {}).get('sessions_folder', 'sessions/')}{self.session_name}.session")
+                    self.logger.info(f"Temporary session file deleted for {self.phone_number}.")
+                except Exception as e:
+                    self.logger.error(f"Failed to delete temporary session file for {self.phone_number}: {e}")
+        
 
 
     async def connect(self):
@@ -204,13 +247,13 @@ class Client(object):
         delay = config.get('delays', {}).get('reconnect_delay', 3)
         attempt = 0
         while attempt < retries:  # Actually this could be implemented via inbuilt TelegramClient properties, but I'm not sure how to log it
-            try:                
+            try:    
                 try:
                     session = await self._get_session()
-                except Exception as e: # If session_encrypted is invalid, delete it and retry session creation                    
-                    self.logger.warning(f"Session creation failed: {e}. Attempting to delete invalid session and retry.")
+                except Exception as e:
+                    self.logger.error(f"Session creation attempt failed: {e}")
                     self.session_encrypted = None
-                    session = await self._get_session()
+                    raise
                 
                 self.client = TelegramClient(
                     session=session,
@@ -229,6 +272,8 @@ class Client(object):
                     await self.update_account_id_from_telegram()
             
                 return self
+            except ValueError as e:
+                self.logger.error(f"Failed to create session for {self.phone_number}: {e}")
             except Exception as e:
                 attempt += 1
                 self.logger.error(f"Failed to connect client for {self.phone_number} (attempt {attempt}/{retries}): {e}")
@@ -355,7 +400,7 @@ class Client(object):
     async def _react(self, message, target_chat):
         await self.ensure_connected()
         if config.get('delays', {}).get('humanisation_level', 1) >= 1:  # If humanisation level is 1 it should consider reading time
-            msg_content = await self.get_message_content(chat_id=target_chat, message_id=message.id)
+            msg_content = await self.get_message_content(chat_id=target_chat.id if hasattr(target_chat, 'id') else target_chat, message_id=message.id)
             if not msg_content:
                 self.logger.warning("Message content is empty, skipping reaction.")
                 return
@@ -377,7 +422,7 @@ class Client(object):
     async def _comment(self, message, target_chat, content):
         await self.ensure_connected()
         if config.get('delays', {}).get('humanisation_level', 1) >= 1:  # If humanisation level is 1 it should consider reading time
-            msg_content = await self.get_message_content(chat_id=target_chat, message_id=message.id)
+            msg_content = await self.get_message_content(chat_id=target_chat.id if hasattr(target_chat, 'id') else target_chat, message_id=message.id)
             reading_time = self.estimate_reading_time(msg_content)
             self.logger.info(f"Estimated reading time: {reading_time} seconds")
             await asyncio.sleep(reading_time)
@@ -466,7 +511,9 @@ class Client(object):
         while attempt < retries:
             try:
                 if message_link:
-                    entity, message = await self.get_message_ids(message_link)
+                    chat_id, message_id = await self.get_message_ids(message_link)
+                    entity = await self.client.get_entity(chat_id)
+                    message = await self.client.get_messages(entity, ids=message_id)
                 else:
                     entity = await self.client.get_entity(chat_id)
                     message = await self.client.get_messages(entity, ids=message_id)
@@ -488,7 +535,9 @@ class Client(object):
         while attempt < retries:
             try:
                 if message_link:
-                    entity, message = await self.get_message_ids(message_link)
+                    chat_id, message_id = await self.get_message_ids(message_link)
+                    entity = await self.client.get_entity(chat_id)
+                    message = await self.client.get_messages(entity, ids=message_id)
                 else:
                     entity = await self.client.get_entity(chat_id)
                     message = await self.client.get_messages(entity, ids=message_id)
@@ -511,7 +560,9 @@ class Client(object):
         while attempt < retries:
             try:
                 if message_link:
-                    entity, message = await self.get_message_ids(message_link)
+                    chat_id, message_id = await self.get_message_ids(message_link)
+                    entity = await self.client.get_entity(chat_id)
+                    message = await self.client.get_messages(entity, ids=message_id)
                 else:
                     entity = await self.client.get_entity(chat_id)
                     message = await self.client.get_messages(entity, ids=message_id)
@@ -525,7 +576,7 @@ class Client(object):
                     await asyncio.sleep(delay)
                 else:
                     raise
-        
+    
     async def comment(self, content, message_id:int=None, chat_id:str=None, message_link:str=None):
         """Comment on a message by its ID in a specific chat."""
         retries = config.get('delays', {}).get('action_retries', 3)
@@ -534,7 +585,9 @@ class Client(object):
         while attempt < retries:
             try:
                 if message_link:
-                    entity, message = await self.get_message_ids(message_link)
+                    chat_id, message_id = await self.get_message_ids(message_link)
+                    entity = await self.client.get_entity(chat_id)
+                    message = await self.client.get_messages(entity, ids=message_id)
                 else:
                     entity = await self.client.get_entity(chat_id)
                     message = await self.client.get_messages(entity, ids=message_id)

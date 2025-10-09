@@ -61,6 +61,12 @@ class MongoStorage():
         logger.info(f"Adding account to MongoDB: {account_data}")
         if hasattr(account_data, 'to_dict'):
             account_data = account_data.to_dict()
+        # Ensure all AccountBase/AccountDict fields are present
+        for field in [
+            'phone_number', 'account_id', 'session_name', 'session_encrypted', 'twofa',
+            'password_encrypted', 'notes', 'status', 'created_at', 'updated_at'
+        ]:
+            account_data.setdefault(field, None)
         phone_number = account_data.get('phone_number')
         existing_account = await cls.get_account(phone_number)
         if existing_account:
@@ -80,6 +86,12 @@ class MongoStorage():
         if acc and '_id' in acc:
             acc.pop('_id')
         if acc:
+            # Ensure all AccountBase/AccountDict fields are present
+            for field in [
+                'phone_number', 'account_id', 'session_name', 'session_encrypted', 'twofa',
+                'password_encrypted', 'notes', 'status', 'created_at', 'updated_at'
+            ]:
+                acc.setdefault(field, None)
             logger.debug(f"Account found in MongoDB: {acc}")
         return Account(acc) if acc else None
 
@@ -91,7 +103,6 @@ class MongoStorage():
         if not isinstance(update_data, dict):
             raise ValueError(f"update_data must be a dict mapping field names to values, got {type(update_data)}: {update_data}")
         update_data.pop('_id', None)
-        # Ensure phone_number is set in the update data for upserts
         update_data['phone_number'] = phone_number
         result = await cls._accounts.update_one({"phone_number": phone_number}, {"$set": update_data}, upsert=True)
         logger.debug(f"Account {phone_number} upsert result: modified={result.modified_count}, upserted_id={result.upserted_id}")

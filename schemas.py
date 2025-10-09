@@ -97,6 +97,10 @@ class AccountBase(BaseModel):
     phone_number: str = Field(..., description="Phone number with country code (e.g., +1234567890)")
     account_id: Optional[str] = Field(None, description="Telegram account ID")
     session_name: Optional[str] = Field(None, description="Telegram session name")
+    session_encrypted: Optional[str] = Field(None, description="Encrypted Telegram session string")
+    twofa: bool = Field(False, description="Is 2FA enabled for this account?")
+    password_encrypted: Optional[str] = Field(None, description="Encrypted password for 2FA")
+    notes: Optional[str] = Field("", description="Account notes")
 
     @field_validator('phone_number')
     def validate_phone_number(cls, v):
@@ -124,6 +128,7 @@ class AccountResponse(AccountBase, TimestampMixin):
 
     class Config:
         use_enum_values = True
+        validate_by_name = True
 
 
 class AccountDict(BaseModel):
@@ -131,6 +136,17 @@ class AccountDict(BaseModel):
     account_id: Optional[str]
     session_name: Optional[str]
     phone_number: str
+    session_encrypted: Optional[str]
+    twofa: bool = Field(False)
+    password_encrypted: Optional[str]
+    notes: Optional[str]
+    status: Optional[AccountStatus]
+    created_at: Optional[Union[str, datetime]]
+    updated_at: Optional[Union[str, datetime]]
+
+    class Config:
+        use_enum_values = True
+        validate_by_name = True
 
 
 # ============= POST SCHEMAS =============

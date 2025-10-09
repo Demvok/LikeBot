@@ -15,9 +15,16 @@ Currently, no authentication is required for API endpoints.
 ### Account
 ```json
 {
-  "phone_number": "string",
+  "phone_number": "+1234567890",
   "account_id": "string (optional)",
-  "session_name": "string (optional)"
+  "session_name": "string (optional)",
+  "session_encrypted": "string (optional)",
+  "twofa": false,
+  "password_encrypted": "string (optional)",
+  "notes": "string (optional)",
+  "status": "NEW|ACTIVE|LOGGED_IN|BANNED|ERROR (optional)",
+  "created_at": "string (ISO timestamp, optional)",
+  "updated_at": "string (ISO timestamp, optional)"
 }
 ```
 
