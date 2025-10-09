@@ -148,6 +148,39 @@ async def delete_account(phone_number: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete account: {str(e)}")
 
+@app.put('/accounts/{phone_number}/validate', summary="Validate account connection")
+@crash_handler
+async def validate_account(phone_number: str):
+    """Validate an account by testing its connection to Telegram."""
+    try:
+        db = get_db()
+        
+        # Check if account exists
+        existing_account = await db.get_account(phone_number)
+        if not existing_account:
+            raise HTTPException(status_code=404, detail=f"Account with phone number {phone_number} not found")
+        
+        # Create connection and test it
+        client = await existing_account.create_connection()
+        
+        try:
+            # Test connection by trying to get user info
+            if client.is_connected:
+                return {
+                    "message": f"Account {phone_number} validated successfully",
+                    "account_id": existing_account.account_id or client.account.account_id,
+                    "account_status": existing_account.status,
+                }
+            else:
+                raise HTTPException(status_code=500, detail="Failed to establish connection")
+        finally:
+            await client.disconnect()
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to validate account: {str(e)}")
+
 # ============= POSTS CRUD =============
 
 @app.get('/posts', summary="Get all posts", response_model=List[Dict])

@@ -95,7 +95,7 @@ class TimestampMixin(BaseModel):
 class AccountBase(BaseModel):
     """Base schema for Account data."""
     phone_number: str = Field(..., description="Phone number with country code (e.g., +1234567890)")
-    account_id: Optional[str] = Field(None, description="Telegram account ID")
+    account_id: Optional[int] = Field(None, description="Telegram account ID")
     session_name: Optional[str] = Field(None, description="Telegram session name")
     session_encrypted: Optional[str] = Field(None, description="Encrypted Telegram session string")
     twofa: bool = Field(False, description="Is 2FA enabled for this account?")
@@ -118,8 +118,16 @@ class AccountCreate(AccountBase):
 
 class AccountUpdate(BaseModel):
     """Schema for updating existing accounts."""
-    account_id: Optional[str] = Field(None, description="Telegram account ID")
+    account_id: Optional[int] = Field(None, description="Telegram account ID")
     session_name: Optional[str] = Field(None, description="Telegram session name")
+    session_encrypted: Optional[str] = Field(None, description="Encrypted Telegram session string")
+    twofa: Optional[bool] = Field(None, description="Is 2FA enabled for this account?")
+    password_encrypted: Optional[str] = Field(None, description="Encrypted password for 2FA")
+    notes: Optional[str] = Field(None, description="Account notes")
+    status: Optional[AccountStatus] = Field(None, description="Account status")
+
+    class Config:
+        use_enum_values = True
 
 
 class AccountResponse(AccountBase, TimestampMixin):
@@ -133,7 +141,7 @@ class AccountResponse(AccountBase, TimestampMixin):
 
 class AccountDict(BaseModel):
     """Schema for Account.to_dict() output."""
-    account_id: Optional[str]
+    account_id: Optional[int]
     session_name: Optional[str]
     phone_number: str
     session_encrypted: Optional[str]
@@ -509,6 +517,7 @@ class SchemaMigration:
             'agent.py:Account.__init__',
             'agent.py:Account.to_dict',
             'agent.py:Account.from_keys',
+            'agent.py:Client.update_account_id_from_telegram',
             'database.py:*Storage.add_account',
             'database.py:*Storage.get_account',
             'database.py:*Storage.update_account',
