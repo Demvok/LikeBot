@@ -56,18 +56,6 @@ class MongoStorage():
 
     @classmethod
     @ensure_async
-    async def save_all_accounts(cls, accounts):
-        # cls._init()
-        # await cls._accounts.delete_many({})
-        # docs = [acc.to_dict() if hasattr(acc, 'to_dict') else acc for acc in accounts]
-        # for doc in docs:
-        #     doc.pop('_id', None)
-        # if docs:
-        #     await cls._accounts.insert_many(docs)
-        pass
-
-    @classmethod
-    @ensure_async
     async def add_account(cls, account_data):
         cls._init()
         logger.info(f"Adding account to MongoDB: {account_data}")
@@ -99,13 +87,15 @@ class MongoStorage():
     @ensure_async
     async def update_account(cls, phone_number, update_data):
         cls._init()
-        logger.info(f"Updating account {phone_number} in MongoDB with data: {update_data}")
+        logger.info(f"Upserting account {phone_number} in MongoDB with data: {update_data}")
         if not isinstance(update_data, dict):
             raise ValueError(f"update_data must be a dict mapping field names to values, got {type(update_data)}: {update_data}")
         update_data.pop('_id', None)
-        result = await cls._accounts.update_one({"phone_number": phone_number}, {"$set": update_data})
-        logger.debug(f"Account {phone_number} update result: {result.modified_count}")
-        return result.modified_count > 0
+        # Ensure phone_number is set in the update data for upserts
+        update_data['phone_number'] = phone_number
+        result = await cls._accounts.update_one({"phone_number": phone_number}, {"$set": update_data}, upsert=True)
+        logger.debug(f"Account {phone_number} upsert result: modified={result.modified_count}, upserted_id={result.upserted_id}")
+        return result.modified_count > 0 or result.upserted_id is not None
 
     @classmethod
     @ensure_async
@@ -132,18 +122,6 @@ class MongoStorage():
             posts.append(Post(**post))
         logger.debug(f"Loaded {len(posts)} posts from MongoDB.")
         return posts
-
-    @classmethod
-    @ensure_async
-    async def save_all_posts(cls, posts):
-        # cls._init()
-        # await cls._posts.delete_many({})
-        # docs = [post.to_dict() if hasattr(post, 'to_dict') else post for post in posts]
-        # for doc in docs:
-        #     doc.pop('_id', None)
-        # if docs:
-        #     await cls._posts.insert_many(docs)
-        pass
 
     @classmethod
     @ensure_async
@@ -190,13 +168,15 @@ class MongoStorage():
     @ensure_async
     async def update_post(cls, post_id, update_data):
         cls._init()
-        logger.info(f"Updating post {post_id} in MongoDB with data: {update_data}")
+        logger.info(f"Upserting post {post_id} in MongoDB with data: {update_data}")
         if not isinstance(update_data, dict):
             raise ValueError(f"update_data must be a dict mapping field names to values, got {type(update_data)}: {update_data}")
         update_data.pop('_id', None)
-        result = await cls._posts.update_one({"post_id": post_id}, {"$set": update_data})
-        logger.debug(f"Post {post_id} update result: {result.modified_count}")
-        return result.modified_count > 0
+        # Ensure post_id is set in the update data for upserts
+        update_data['post_id'] = post_id
+        result = await cls._posts.update_one({"post_id": post_id}, {"$set": update_data}, upsert=True)
+        logger.debug(f"Post {post_id} upsert result: modified={result.modified_count}, upserted_id={result.upserted_id}")
+        return result.modified_count > 0 or result.upserted_id is not None
 
     @classmethod
     @ensure_async
@@ -248,18 +228,6 @@ class MongoStorage():
 
     @classmethod
     @ensure_async
-    async def save_all_tasks(cls, tasks):
-        # cls._init()
-        # await cls._tasks.delete_many({})
-        # docs = [task.to_dict() if hasattr(task, 'to_dict') else task for task in tasks]
-        # for doc in docs:
-        #     doc.pop('_id', None)
-        # if docs:
-        #     await cls._tasks.insert_many(docs)
-        pass
-
-    @classmethod
-    @ensure_async
     async def add_task(cls, task):
         cls._init()
         logger.info(f"Adding task to MongoDB: {task}")
@@ -302,13 +270,15 @@ class MongoStorage():
     @ensure_async
     async def update_task(cls, task_id, update_data):
         cls._init()
-        logger.info(f"Updating task {task_id} in MongoDB with data: {update_data}")
+        logger.info(f"Upserting task {task_id} in MongoDB with data: {update_data}")
         if not isinstance(update_data, dict):
             raise ValueError(f"update_data must be a dict mapping field names to values, got {type(update_data)}: {update_data}")
         update_data.pop('_id', None)
-        result = await cls._tasks.update_one({"task_id": task_id}, {"$set": update_data})
-        logger.debug(f"Task {task_id} update result: {result.modified_count}")
-        return result.modified_count > 0
+        # Ensure task_id is set in the update data for upserts
+        update_data['task_id'] = task_id
+        result = await cls._tasks.update_one({"task_id": task_id}, {"$set": update_data}, upsert=True)
+        logger.debug(f"Task {task_id} upsert result: modified={result.modified_count}, upserted_id={result.upserted_id}")
+        return result.modified_count > 0 or result.upserted_id is not None
 
     @classmethod
     @ensure_async

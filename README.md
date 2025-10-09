@@ -2,9 +2,8 @@
 
 ### TO DO:
 
-- add account status as meta (login status)
 - automate an provide manual way of session verification
-- route account to session creation for first use
+
 - add object refresh on client for first account_id retrieval or fix logging to use phone number
 
 - add reaction precondition (exists in chat) check
@@ -22,7 +21,8 @@
 ### v.1.0.1
 - removed semi-funtional file data storage logic
 - ensured data type consistency via pydantic
-
+- routed account to session creation for first use
+- added account status as meta (login status)
 
 ### v1.0.0 - RELEASE
 - full API for basic tasks

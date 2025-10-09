@@ -5,6 +5,7 @@ from telethon.sessions import StringSession
 from logger import setup_logger, load_config
 from dotenv import load_dotenv
 from schemas import AccountStatus
+from encryption import decrypt_secret, encrypt_secret
 
 load_dotenv()
 api_id = os.getenv('api_id')
@@ -25,8 +26,7 @@ class Account(object):
             self.phone_number = account_data.get('phone_number')
             self.status = account_data.get('status', self.AccountStatus.NEW)
 
-            self.session_encrypted = None  # Placeholder for TelegramClient session
-            self.session_meta = None  # Placeholder for session metadata
+            self.session_encrypted = account_data.get('session_encrypted', None)
             self.twofa = account_data.get('2fa', False)
             self.password_encrypted = account_data.get('password_encrypted', None)
             
@@ -54,7 +54,13 @@ class Account(object):
         return {
             'account_id': self.account_id,
             'session_name': self.session_name,
-            'phone_number': self.phone_number
+            'phone_number': self.phone_number,
+            'status': self.status,
+            '2fa': self.twofa,
+            'password_encrypted': self.password_encrypted,
+            'notes': self.notes,
+            'created_at': self.created_at,
+            'updated_at': self.updated_at
         }
 
     async def create_connection(self):
@@ -64,8 +70,19 @@ class Account(object):
         client.logger.info(f"Client for {self.phone_number} connected successfully.")  # Use self.logger instead of client.logger
         return client
 
+    async def add_password(self, password):
+        """Add or update the encrypted password for 2FA."""
+        if not password:
+            raise ValueError("Password cannot be empty.")
+        self.password_encrypted = encrypt_secret(password, b'Password')
+        self.twofa = True
+
+        from database import get_db  # Avoid circular import if any
+        db = get_db()
+        await db.update_account(self.phone_number, {'password_encrypted': self.password_encrypted, '2fa': self.twofa})
+
     @classmethod
-    def from_keys(cls, phone_number, account_id=None, session_name=None, status=None, twofa=False, password_encrypted=None, notes=None):
+    def from_keys(cls, phone_number, account_id=None, session_name=None, status=None, twofa=False, password_encrypted=None, password=None, notes=None):
         """Create an Account object from a dictionary."""
         account_data = {
             'account_id': account_id,
@@ -73,7 +90,7 @@ class Account(object):
             'phone_number': phone_number,
             'status': status,
             '2fa': twofa,
-            'password_encrypted': password_encrypted,
+            'password_encrypted': password_encrypted if password_encrypted else encrypt_secret(password, b'Password') if password else None,
             'notes': notes
         }
         return cls(account_data)
@@ -124,21 +141,93 @@ class Client(object):
             await self.client.disconnect()
             self.logger.info(f"Client for {self.phone_number} disconnected.")
 
+    async def _fetch_verification_code(self):
+        """Fetch the verification code from an external source or user input."""
+        # Placeholder for actual implementation
+        # For now, we will just ask the user to input the code manually
+        code = input(f'Enter the verification code for {self.phone_number}: ').strip()
+        return code
+
+    async def _get_session(self):
+        if self.session_encrypted:
+            self.logger.info(f"Using existing session for {self.phone_number}.")
+            return StringSession(decrypt_secret(self.session_encrypted))
+        else:
+            self.logger.info(f"Creating new session for {self.phone_number}.")
+
+            self.client = TelegramClient(
+                f"{config.get('filepaths', {}).get('sessions_folder', 'sessions/')}{self.session_name}",
+                api_id=api_id,
+                api_hash=api_hash
+            )
+
+            if await self.client.is_user_authorized():
+                self.logger.info(f"Client for {self.phone_number} is already authorized.")
+            else:
+                self.logger.info(f"Client for {self.phone_number} is not authorized. Sending code...")
+                
+                sent = await self.client.send_code_request(self.phone_number)  # Sending the verification code
+                self.logger.debug(f"Verification code sent to {self.phone_number}.")
+
+
+                code = await self._fetch_verification_code()
+                if not code:
+                    self.logger.warning("No verification code provided.")
+                    raise ValueError("Verification code cannot be empty.")
+                
+                if self.twofa and self.password_encrypted:
+                    password = decrypt_secret(self.password_encrypted, b'Password')
+                    me = await self.client.sign_in(self.phone_number, code, password=password)
+                else:
+                    me = await self.client.sign_in(self.phone_number, code)
+
+            self.session_encrypted = encrypt_secret(StringSession.save(self.client.session))
+            await self.client.disconnect()  # Ensure the session file is closed before deleting
+            
+            from database import get_db  # Avoid circular import if any
+            db = get_db()
+            await db.update_account(self.phone_number, {'session_encrypted': self.session_encrypted})
+            
+            self.logger.info(f"Session for {self.phone_number} saved.")
+            
+            try:                
+                os.remove(f"{config.get('filepaths', {}).get('sessions_folder', 'sessions/')}{self.session_name}.session")
+                self.logger.info(f"Temporary session file deleted for {self.phone_number}.")
+            except Exception as e:
+                self.logger.error(f"Failed to delete temporary session file for {self.phone_number}: {e}")
+            
+            return StringSession(decrypt_secret(self.session_encrypted))
+
 
     async def connect(self):
         retries = config.get('delays', {}).get('connection_retries', 5)
         delay = config.get('delays', {}).get('reconnect_delay', 3)
         attempt = 0
         while attempt < retries:  # Actually this could be implemented via inbuilt TelegramClient properties, but I'm not sure how to log it
-            try:
+            try:                
+                try:
+                    session = await self._get_session()
+                except Exception as e: # If session_encrypted is invalid, delete it and retry session creation                    
+                    self.logger.warning(f"Session creation failed: {e}. Attempting to delete invalid session and retry.")
+                    self.session_encrypted = None
+                    session = await self._get_session()
+                
                 self.client = TelegramClient(
-                    f"{config.get('filepaths', {}).get('sessions_folder', 'sessions/')}{self.session_name}",
-                    api_id, api_hash  # Add proxy logic here
-                )
-                await self.client.start()
+                    session=session,
+                    api_id=api_id,
+                    api_hash=api_hash 
+                    # Add proxy logic here
+                )                
+                if not self.client:
+                    raise ValueError("TelegramClient is not initialized.")
+
+                self.logger.debug(f"Starting client for {self.phone_number}...")
+                await self.client.connect()
+
                 self.logger.debug(f"Client for {self.phone_number} started successfully.")
                 if not self.account_id:
                     await self.update_account_id_from_telegram()
+            
                 return self
             except Exception as e:
                 attempt += 1
