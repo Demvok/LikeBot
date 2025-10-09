@@ -15,9 +15,16 @@ Currently, no authentication is required for API endpoints.
 ### Account
 ```json
 {
-  "phone_number": "string",
-  "account_id": "string (optional)",
-  "session_name": "string (optional)"
+  "phone_number": "+1234567890",
+  "account_id": 123456789,
+  "session_name": "string (optional)",
+  "session_encrypted": "string (optional)",
+  "twofa": false,
+  "password_encrypted": "string (optional)",
+  "notes": "string (optional)",
+  "status": "NEW|ACTIVE|LOGGED_IN|BANNED|ERROR (optional)",
+  "created_at": "string (ISO timestamp, optional)",
+  "updated_at": "string (ISO timestamp, optional)"
 }
 ```
 
@@ -125,8 +132,13 @@ Update an existing account.
 **Request Body:**
 ```json
 {
-  "account_id": "123456789",
-  "session_name": "new_session_name"
+  "account_id": 123456789,
+  "session_name": "new_session_name",
+  "session_encrypted": "encrypted_session_string",
+  "twofa": true,
+  "password_encrypted": "encrypted_password",
+  "notes": "Updated notes",
+  "status": "ACTIVE"
 }
 ```
 
@@ -146,6 +158,22 @@ Delete an account.
   "message": "Account +1234567890 deleted successfully"
 }
 ```
+
+### PUT /accounts/{phone_number}/validate
+Validate an account by testing its connection to Telegram.
+
+**Response:**
+```json
+{
+  "message": "Account +1234567890 validated successfully",
+  "account_id": 123456789,
+  "connection_status": "success"
+}
+```
+
+**Error Responses:**
+- `404`: Account not found
+- `500`: Connection failed or other validation errors
 
 ---
 

@@ -1,17 +1,22 @@
 import atexit
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
-from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field
+from typing import Optional, List, Dict
 from agent import *
-from logger import setup_logger, crash_handler, cleanup_logging
+from logger import crash_handler, cleanup_logging
 from taskhandler import *
 from database import get_db
 from fastapi.middleware.cors import CORSMiddleware
+from schemas import (
+    AccountCreate, AccountUpdate, AccountResponse,
+    PostCreate, PostUpdate, PostResponse,
+    TaskCreate, TaskUpdate, TaskResponse,
+    SuccessResponse, ErrorResponse, BulkOperationResult,
+    DatabaseStats, ValidationResult, serialize_for_json
+)
 
 atexit.register(cleanup_logging)  # Register cleanup function
 
-app = FastAPI(title="LikeBot API", description="Full CRUD API for LikeBot automation", version="1.0.0")
+app = FastAPI(title="LikeBot API", description="Full CRUD API for LikeBot automation", version="1.0.1")
 
 # Add CORS middleware
 app.add_middleware(
@@ -22,73 +27,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def convert_to_serializable(obj):
-    """Convert non-JSON-serializable objects to serializable format."""
-    if obj is None:
-        return None
-    
-    # Handle ObjectId specifically
-    if hasattr(obj, 'binary') and hasattr(obj, '__str__'):  # ObjectId check
-        return str(obj)
-    
-    # Handle numpy types
-    if hasattr(obj, 'item'):
-        return obj.item()
-    
-    # Handle datetime objects
-    if hasattr(obj, 'isoformat'):
-        return obj.isoformat()
-    
-    # Handle dictionaries
-    if isinstance(obj, dict):
-        return {key: convert_to_serializable(value) for key, value in obj.items()}
-    
-    # Handle lists and tuples
-    if isinstance(obj, (list, tuple)):
-        return [convert_to_serializable(item) for item in obj]
-    
-    # Return as-is for basic types
-    return obj
-
-# Pydantic models for request/response validation
-class AccountCreate(BaseModel):
-    phone_number: str = Field(..., description="Phone number for the account")
-    account_id: Optional[str] = Field(None, description="Account ID from Telegram")
-    session_name: Optional[str] = Field(None, description="Session name for Telegram client")
-
-class AccountUpdate(BaseModel):
-    account_id: Optional[str] = Field(None, description="Account ID from Telegram")
-    session_name: Optional[str] = Field(None, description="Session name for Telegram client")
-
-class PostCreate(BaseModel):
-    message_link: str = Field(..., description="Telegram message link")
-    post_id: Optional[int] = Field(None, description="Post ID (auto-generated if not provided)")
-    chat_id: Optional[int] = Field(None, description="Chat ID from Telegram")
-    message_id: Optional[int] = Field(None, description="Message ID from Telegram")
-
-class PostUpdate(BaseModel):
-    message_link: Optional[str] = Field(None, description="Telegram message link")
-    chat_id: Optional[int] = Field(None, description="Chat ID from Telegram")
-    message_id: Optional[int] = Field(None, description="Message ID from Telegram")
-
-class TaskCreate(BaseModel):
-    name: str = Field(..., description="Task name")
-    post_ids: List[int] = Field(..., description="List of post IDs")
-    accounts: List[str] = Field(..., description="List of phone numbers")
-    action: Dict[str, Any] = Field(..., description="Action configuration")
-    description: Optional[str] = Field(None, description="Task description")
-
-class TaskUpdate(BaseModel):
-    name: Optional[str] = Field(None, description="Task name")
-    post_ids: Optional[List[int]] = Field(None, description="List of post IDs")
-    accounts: Optional[List[str]] = Field(None, description="List of phone numbers")
-    action: Optional[Dict[str, Any]] = Field(None, description="Action configuration")
-    description: Optional[str] = Field(None, description="Task description")
-    status: Optional[str] = Field(None, description="Task status")
+convert_to_serializable = serialize_for_json  # Use centralized serialization function from schemas
 
 @app.get("/", summary="Health check")
 async def root():
-    return {"message": "LikeBot API Server is running", "version": "1.0.0"}
+    return {"message": "LikeBot API Server is running", "version": app.version}
 
 # ============= ACCOUNTS CRUD =============
 
@@ -204,6 +147,39 @@ async def delete_account(phone_number: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete account: {str(e)}")
+
+@app.put('/accounts/{phone_number}/validate', summary="Validate account connection")
+@crash_handler
+async def validate_account(phone_number: str):
+    """Validate an account by testing its connection to Telegram."""
+    try:
+        db = get_db()
+        
+        # Check if account exists
+        existing_account = await db.get_account(phone_number)
+        if not existing_account:
+            raise HTTPException(status_code=404, detail=f"Account with phone number {phone_number} not found")
+        
+        # Create connection and test it
+        client = await existing_account.create_connection()
+        
+        try:
+            # Test connection by trying to get user info
+            if client.is_connected:
+                return {
+                    "message": f"Account {phone_number} validated successfully",
+                    "account_id": existing_account.account_id or client.account.account_id,
+                    "account_status": existing_account.status,
+                }
+            else:
+                raise HTTPException(status_code=500, detail="Failed to establish connection")
+        finally:
+            await client.disconnect()
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to validate account: {str(e)}")
 
 # ============= POSTS CRUD =============
 
