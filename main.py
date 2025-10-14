@@ -1,4 +1,5 @@
 import atexit
+import uuid
 from fastapi import FastAPI, HTTPException, Query
 from typing import Optional, List, Dict
 from agent import *
@@ -11,7 +12,8 @@ from schemas import (
     PostCreate, PostUpdate, PostResponse,
     TaskCreate, TaskUpdate, TaskResponse,
     SuccessResponse, ErrorResponse, BulkOperationResult,
-    DatabaseStats, ValidationResult, serialize_for_json
+    DatabaseStats, ValidationResult, serialize_for_json,
+    LoginStatus
 )
 
 atexit.register(cleanup_logging)  # Register cleanup function
@@ -71,15 +73,13 @@ async def get_account(phone_number: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get account: {str(e)}")
 
-@app.post('/accounts', summary="Create new account", status_code=201)
+@app.post('/accounts', summary="Create new account in database without login", status_code=201)
 @crash_handler
-async def create_account(account_data: AccountCreate):
-    """Create a new account."""
+async def create_account_without_login(account_data: AccountCreate):
+    """Create a new account without logging in. Useful for pre-registering accounts. Legacy endpoint."""
     try:
         db = get_db()
-        
-        # Check if account already exists
-        existing_account = await db.get_account(account_data.phone_number)
+        existing_account = await db.get_account(account_data.phone_number)  # Check if account already exists
         if existing_account:
             raise HTTPException(status_code=409, detail=f"Account with phone number {account_data.phone_number} already exists")
         
@@ -95,6 +95,7 @@ async def create_account(account_data: AccountCreate):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create account: {str(e)}")
+
 
 @app.put('/accounts/{phone_number}', summary="Update account")
 @crash_handler
@@ -148,7 +149,7 @@ async def delete_account(phone_number: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete account: {str(e)}")
 
-@app.put('/accounts/{phone_number}/validate', summary="Validate account connection")
+@app.put('/accounts/{phone_number}/validate', summary="Validate account connection to Telegram")
 @crash_handler
 async def validate_account(phone_number: str):
     """Validate an account by testing its connection to Telegram."""
@@ -160,6 +161,13 @@ async def validate_account(phone_number: str):
         if not existing_account:
             raise HTTPException(status_code=404, detail=f"Account with phone number {phone_number} not found")
         
+        # Check if account has a session
+        if not existing_account.session_encrypted:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Account {phone_number} has no session. Please login first using /accounts/create/start"
+            )
+        
         # Create connection and test it
         client = await existing_account.create_connection()
         
@@ -170,6 +178,7 @@ async def validate_account(phone_number: str):
                     "message": f"Account {phone_number} validated successfully",
                     "account_id": existing_account.account_id or client.account.account_id,
                     "account_status": existing_account.status,
+                    "has_session": True
                 }
             else:
                 raise HTTPException(status_code=500, detail="Failed to establish connection")
@@ -180,6 +189,166 @@ async def validate_account(phone_number: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to validate account: {str(e)}")
+
+# ============= LOGIN PROCESS ENDPOINTS =============
+
+@app.post('/accounts/create/start', summary="Start login process", status_code=200)
+@crash_handler
+async def login_start(
+    phone_number: str = Query(..., description="Phone number with country code"),
+    password_encrypted: Optional[str] = Query(None, description="Encrypted password for 2FA (optional)"),
+    session_name: Optional[str] = Query(None, description="Custom session name (optional)"),
+    notes: Optional[str] = Query(None, description="Account notes (optional)")
+):
+    """
+    Start the login process for a Telegram account.
+    Returns login_session_id and status.
+    Frontend should poll /accounts/create/status or proceed to /accounts/create/verify.
+    """
+    from agent import start_login, pending_logins
+    import asyncio
+    
+    try:
+        # Generate unique session ID
+        login_session_id = str(uuid.uuid4())
+        
+        # Start login process in background
+        asyncio.create_task(start_login(
+            phone_number=phone_number, 
+            password=password_encrypted, 
+            login_session_id=login_session_id,
+            session_name=session_name,
+            notes=notes
+        ))
+        
+        # Wait a moment for the process to initialize and send code
+        await asyncio.sleep(1)
+        
+        # Get the login process from pending_logins
+        login_process = pending_logins.get(login_session_id)
+        if not login_process:
+            raise HTTPException(status_code=500, detail="Failed to initialize login process")
+        
+        return {
+            "status": login_process.status.value,
+            "login_session_id": login_session_id,
+            "message": f"Verification code sent to {phone_number}"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start login: {str(e)}")
+
+
+@app.post('/accounts/create/verify', summary="Verify login code or password", status_code=200)
+@crash_handler
+async def login_verify(
+    login_session_id: str = Query(..., description="Login session ID from /accounts/create/start"),
+    code: Optional[str] = Query(None, description="Verification code from Telegram"),
+    password_2fa: Optional[str] = Query(None, description="2FA password if required (will be encrypted)")
+):
+    """
+    Submit verification code or 2FA password to continue login process.
+    Note: It's recommended to provide encrypted password at /accounts/create/start for better security.
+    """
+    from agent import pending_logins
+    from encryption import encrypt_secret
+    
+    try:
+        # Get login process
+        login_process = pending_logins.get(login_session_id)
+        if not login_process:
+            raise HTTPException(status_code=404, detail="Login session not found or expired")
+        
+        # Check what we're waiting for
+        if login_process.status == LoginStatus.WAIT_CODE:
+            if not code:
+                raise HTTPException(status_code=400, detail="Verification code is required")
+            
+            # Set the code in the future to continue login
+            if not login_process.code_future.done():
+                login_process.code_future.set_result(code)
+            
+            return {
+                "status": "processing",
+                "message": "Verification code submitted, processing login..."
+            }
+            
+        elif login_process.status == LoginStatus.WAIT_2FA:
+            if not password_2fa:
+                raise HTTPException(status_code=400, detail="2FA password is required")
+            
+            # Set the password in the future to continue login
+            if login_process.password_future and not login_process.password_future.done():
+                login_process.password_future.set_result(password_2fa)
+            
+            return {
+                "status": "processing",
+                "message": "2FA password submitted, processing login..."
+            }
+            
+        else:
+            return {
+                "status": login_process.status.value,
+                "message": f"Login is in {login_process.status.value} state"
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to verify login: {str(e)}")
+
+
+@app.get('/accounts/create/status', summary="Check login process status", status_code=200)
+@crash_handler
+async def login_status(
+    login_session_id: str = Query(..., description="Login session ID from /accounts/create/start")
+):
+    """
+    Check the status of an ongoing login process.
+    Used for polling by the frontend.
+    """
+    from agent import pending_logins, cleanup_expired_logins
+    
+    try:
+        # Cleanup expired sessions
+        cleanup_expired_logins()
+        
+        # Get login process
+        login_process = pending_logins.get(login_session_id)
+        if not login_process:
+            raise HTTPException(status_code=404, detail="Login session not found or expired")
+        
+        response = {
+            "status": login_process.status.value,
+            "phone_number": login_process.phone_number,
+            "created_at": login_process.created_at.isoformat(),
+        }
+        
+        # Add additional info based on status
+        if login_process.status == LoginStatus.DONE:
+            response["message"] = "Login completed successfully"
+            response["account_created"] = True
+            
+        elif login_process.status == LoginStatus.FAILED:
+            response["message"] = "Login failed"
+            response["error"] = login_process.error_message
+            
+        elif login_process.status == LoginStatus.WAIT_CODE:
+            response["message"] = "Waiting for verification code"
+            
+        elif login_process.status == LoginStatus.WAIT_2FA:
+            response["message"] = "Waiting for 2FA password"
+            
+        elif login_process.status == LoginStatus.PROCESSING:
+            response["message"] = "Processing login..."
+        
+        return response
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get login status: {str(e)}")
+
 
 # ============= POSTS CRUD =============
 

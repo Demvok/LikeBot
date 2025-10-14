@@ -162,23 +162,17 @@ Delete an account.
 ### PUT /accounts/{phone_number}/validate
 Validate an account by testing its connection to Telegram.
 
-**Prerequisites:**
-- Account must have been logged in via `/accounts/create/start` and have a valid session
-- Account must have `session_encrypted` field populated
-
 **Response:**
 ```json
 {
   "message": "Account +1234567890 validated successfully",
   "account_id": 123456789,
-  "account_status": "LOGGED_IN",
-  "has_session": true
+  "connection_status": "success"
 }
 ```
 
 **Error Responses:**
 - `404`: Account not found
-- `400`: Account has no session (not logged in)
 - `500`: Connection failed or other validation errors
 
 ---

@@ -19,8 +19,10 @@ Use global find/replace to ensure consistency across the codebase.
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Union, Literal
 from enum import Enum, auto
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pandas import Timestamp
+from asyncio import Future
+from telethon import TelegramClient
 
 
 # ============= ENUMS =============
@@ -76,6 +78,21 @@ class EventLevel(Enum):
     CRITICAL = "critical"
 
 
+class LoginStatus(Enum):
+    """Login process status enumeration."""
+    WAIT_CODE = "wait_code"
+    WAIT_2FA = "wait_2fa"
+    PROCESSING = "processing"
+    DONE = "done"
+    FAILED = "failed"
+    
+    def __str__(self):
+        return self.value
+    
+    def __repr__(self):
+        return self.value
+
+
 # ============= BASE SCHEMAS =============
 
 class TimestampMixin(BaseModel):
@@ -110,10 +127,51 @@ class AccountBase(BaseModel):
             raise ValueError('Phone number must be at least 10 characters long')
         return v
 
+    @model_validator(mode='after')
+    def validate_twofa_password(self):
+        if self.twofa and not self.password_encrypted:
+            raise ValueError('password_encrypted is required when twofa is enabled')
+        return self
 
-class AccountCreate(AccountBase):
+
+class AccountCreate(BaseModel):
     """Schema for creating new accounts."""
-    pass
+    phone_number: str = Field(..., description="Phone number with country code (e.g., +1234567890)")
+    session_name: Optional[str] = Field(None, description="Telegram session name")
+    twofa: bool = Field(False, description="Is 2FA enabled for this account?")
+    password_encrypted: Optional[str] = Field(None, description="Encrypted password for 2FA")
+    notes: Optional[str] = Field("", description="Account notes")
+
+    @field_validator('phone_number')
+    def validate_phone_number(cls, v):
+        if not v.startswith('+'):
+            raise ValueError('Phone number must start with + and include country code')
+        if len(v) < 10:
+            raise ValueError('Phone number must be at least 10 characters long')
+        return v
+
+    @model_validator(mode='after')
+    def validate_twofa_password(self):
+        if self.twofa and not self.password_encrypted:
+            raise ValueError('password_encrypted is required when twofa is enabled')
+        return self
+
+class LoginProcess(BaseModel):
+    """Schema for tracking login process state."""
+    login_session_id: str = Field(..., description="Unique login session identifier (UUID)")
+    phone_number: str = Field(..., description="Phone number with country code (e.g., +1234567890)")
+    status: LoginStatus = Field(default=LoginStatus.PROCESSING, description="Current status of the login process")
+    telethon_client: Optional[TelegramClient] = Field(None, description="Telethon client instance (not serializable)")
+    code_future: Optional[Future] = Field(None, description="Future to await verification code from user")
+    password_future: Optional[Future] = Field(None, description="Future to await 2FA password from user")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Timestamp when the login process was created")
+    expires_at: Optional[datetime] = Field(None, description="Timestamp when the login process expires")
+    error_message: Optional[str] = Field(None, description="Error message if login failed")
+    session_string: Optional[str] = Field(None, description="Encrypted session string after successful login")
+    
+    class Config:
+        arbitrary_types_allowed = True
+        # Don't use use_enum_values here - we need the enum object for comparisons
 
 
 class AccountUpdate(BaseModel):
