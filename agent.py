@@ -170,94 +170,118 @@ class Client(object):
         code = input(f'Enter the verification code for {self.phone_number}: ').strip()
         return code
 
-    async def _get_session(self):
-        if self.session_encrypted:
+    async def _get_session(self, force_new=False):
+        if self.session_encrypted and not force_new:
             self.logger.info(f"Using existing session for {self.phone_number}.")
             return StringSession(decrypt_secret(self.session_encrypted))
         else:
             self.logger.info(f"Creating new session for {self.phone_number}.")
 
-            try:
-                session_folder = config.get('filepaths', {}).get('sessions_folder', 'sessions/')
+            # Get retry configuration for session creation (limited attempts)
+            session_creation_retries = config.get('delays', {}).get('session_creation_retries', 2)
+            
+            for attempt in range(1, session_creation_retries + 1):
+                try:
+                    session_folder = config.get('filepaths', {}).get('sessions_folder', 'sessions/')
 
-                if not os.path.exists(session_folder):
-                    os.makedirs(session_folder)
+                    if not os.path.exists(session_folder):
+                        os.makedirs(session_folder)
 
-                self.client = TelegramClient(
-                    f"{session_folder}{self.session_name}",
-                    api_id=api_id,
-                    api_hash=api_hash
-                )
+                    self.client = TelegramClient(
+                        f"{session_folder}{self.session_name}",
+                        api_id=api_id,
+                        api_hash=api_hash
+                    )
 
-                await self.client.connect()  # Connect before checking authorization
-                
-                if await self.client.is_user_authorized():
-                    self.logger.info(f"Client for {self.phone_number} is already authorized.")
-                else:
-                    self.logger.info(f"Client for {self.phone_number} is not authorized. Sending code...")
+                    await self.client.connect()  # Connect before checking authorization
                     
-                    await self.client.send_code_request(self.phone_number)  # Sending the verification code
-                    self.logger.debug(f"Verification code sent to {self.phone_number}.")
-
-                    code = await self._fetch_verification_code()
-                    if not code:
-                        self.logger.warning("No verification code provided.")
-                        raise ValueError("Verification code cannot be empty.")
+                    if await self.client.is_user_authorized():
+                        self.logger.info(f"Client for {self.phone_number} is already authorized.")
                     else:
-                        self.logger.debug(f"Received verification code: {code}")
+                        self.logger.info(f"Client for {self.phone_number} is not authorized. Sending code...")
+                        
+                        await self.client.send_code_request(self.phone_number)  # Sending the verification code
+                        self.logger.debug(f"Verification code sent to {self.phone_number}.")
 
-                    try:
-                        self.logger.debug("Attempting to sign in with verification code.")
-                        await self.client.sign_in(phone=self.phone_number, code=code)
-                    except errors.SessionPasswordNeededError:
-                        self.logger.info(f"2FA is enabled for {self.phone_number}, password required.")
-                        if not self.password_encrypted:
-                            self.logger.error("2FA is required but no password is configured.")
-                            raise ValueError("2FA password is required but not provided.")
-                        
-                        password = decrypt_secret(self.password_encrypted, b'Password')
-                        if not password:
-                            self.logger.error("Failed to decrypt 2FA password.")
-                            raise ValueError("Failed to decrypt 2FA password.")
-                        
-                        self.logger.debug("Signing in with 2FA password.")
-                        await self.client.sign_in(password=password)
-                    except Exception as e:
-                        self.logger.error(f"Error during sign-in for {self.phone_number}: {e}")
+                        code = await self._fetch_verification_code()
+                        if not code:
+                            self.logger.warning("No verification code provided.")
+                            raise ValueError("Verification code cannot be empty.")
+                        else:
+                            self.logger.debug(f"Received verification code: {code}")
+
+                        try:
+                            self.logger.debug("Attempting to sign in with verification code.")
+                            await self.client.sign_in(phone=self.phone_number, code=code)
+                        except errors.SessionPasswordNeededError:
+                            self.logger.info(f"2FA is enabled for {self.phone_number}, password required.")
+                            if not self.password_encrypted:
+                                self.logger.error("2FA is required but no password is configured.")
+                                raise ValueError("2FA password is required but not provided.")
+                            
+                            password = decrypt_secret(self.password_encrypted, b'Password')
+                            if not password:
+                                self.logger.error("Failed to decrypt 2FA password.")
+                                raise ValueError("Failed to decrypt 2FA password.")
+                            
+                            self.logger.debug("Signing in with 2FA password.")
+                            await self.client.sign_in(password=password)
+                        except Exception as e:
+                            self.logger.error(f"Error during sign-in for {self.phone_number}: {e}")
+                            raise
+
+                    self.session_encrypted = encrypt_secret(StringSession.save(self.client.session))
+                    await self.client.disconnect()  # Ensure the session file is closed before deleting
+                    
+                    from database import get_db  # Avoid circular import if any
+                    db = get_db()
+                    await db.update_account(self.phone_number, {'session_encrypted': self.session_encrypted, 'status': AccountStatus.LOGGED_IN.name})
+                    
+                    self.logger.info(f"Session for {self.phone_number} saved.")
+
+                    return StringSession(decrypt_secret(self.session_encrypted))
+                    
+                except (errors.PhoneCodeInvalidError, errors.PhoneCodeExpiredError) as e:
+                    self.logger.warning(f"Code error on attempt {attempt}/{session_creation_retries}: {e}")
+                    if attempt < session_creation_retries:
+                        self.logger.info(f"Retrying session creation for {self.phone_number}...")
+                        continue
+                    else:
+                        self.logger.error(f"Failed to create session after {session_creation_retries} attempts.")
                         raise
-
-                self.session_encrypted = encrypt_secret(StringSession.save(self.client.session))
-                await self.client.disconnect()  # Ensure the session file is closed before deleting
-                
-                from database import get_db  # Avoid circular import if any
-                db = get_db()
-                await db.update_account(self.phone_number, {'session_encrypted': self.session_encrypted, 'status': AccountStatus.LOGGED_IN.name})
-                
-                self.logger.info(f"Session for {self.phone_number} saved.")
-
-                return StringSession(decrypt_secret(self.session_encrypted))
-            except Exception as e:
-                raise e
-            finally:
-                try:                
-                    await self.client.disconnect()
-                    os.remove(f"{config.get('filepaths', {}).get('sessions_folder', 'sessions/')}{self.session_name}.session")
-                    self.logger.info(f"Temporary session file deleted for {self.phone_number}.")
                 except Exception as e:
-                    self.logger.error(f"Failed to delete temporary session file for {self.phone_number}: {e}")
+                    self.logger.error(f"Session creation failed on attempt {attempt}/{session_creation_retries}: {e}")
+                    raise
+                finally:
+                    try:                
+                        if self.client and self.client.is_connected():
+                            await self.client.disconnect()
+                        session_file = f"{config.get('filepaths', {}).get('sessions_folder', 'sessions/')}{self.session_name}.session"
+                        if os.path.exists(session_file):
+                            os.remove(session_file)
+                            self.logger.info(f"Temporary session file deleted for {self.phone_number}.")
+                    except Exception as e:
+                        self.logger.error(f"Failed to delete temporary session file for {self.phone_number}: {e}")
 
     async def connect(self):
         retries = config.get('delays', {}).get('connection_retries', 5)
         delay = config.get('delays', {}).get('reconnect_delay', 3)
-        attempt = 0
-        while attempt < retries:  # Actually this could be implemented via inbuilt TelegramClient properties, but I'm not sure how to log it
+        
+        session_created = False
+        force_new_session = False
+        
+        for attempt in range(1, retries + 1):
             try:    
-                try:
-                    session = await self._get_session()
-                except Exception as e:
-                    self.logger.error(f"Session creation attempt failed: {e}")
-                    self.session_encrypted = None
-                    raise
+                # Try to get session only once per connect() call, unless we need to force a new one
+                if not session_created or force_new_session:
+                    try:
+                        session = await self._get_session(force_new=force_new_session)
+                        session_created = True
+                        force_new_session = False  # Reset the flag
+                    except Exception as e:
+                        self.logger.error(f"Session creation failed: {e}")
+                        # Don't retry session creation here - it has its own retry logic
+                        raise
                 
                 self.client = TelegramClient(
                     session=session,
@@ -270,16 +294,47 @@ class Client(object):
 
                 self.logger.debug(f"Starting client for {self.phone_number}...")
                 await self.client.connect()
-
-                self.logger.debug(f"Client for {self.phone_number} started successfully.")
+                
+                # Verify the session is still valid
+                try:
+                    await self.client.get_me()
+                    self.logger.debug(f"Client for {self.phone_number} started successfully.")
+                except errors.AuthKeyUnregisteredError:
+                    self.logger.warning(f"Session for {self.phone_number} is invalid/expired. Creating new session...")
+                    self.session_encrypted = None
+                    force_new_session = True
+                    session_created = False
+                    
+                    # Update database to clear invalid session
+                    from database import get_db
+                    db = get_db()
+                    await db.update_account(self.phone_number, {
+                        'session_encrypted': None, 
+                        'status': AccountStatus.NEW.name
+                    })
+                    
+                    await self.client.disconnect()
+                    continue  # Retry with new session
+                except errors.UserDeactivatedError:
+                    self.logger.error(f"Account {self.phone_number} has been deactivated.")
+                    raise
+                except errors.UserDeactivatedBanError:
+                    self.logger.error(f"Account {self.phone_number} has been banned.")
+                    raise
+                
                 if not self.account_id:
                     await self.update_account_id_from_telegram()
             
                 return self
+                
+            except (errors.AuthKeyUnregisteredError, errors.UserDeactivatedError, errors.UserDeactivatedBanError):
+                # Don't retry on these errors
+                raise
             except ValueError as e:
+                # Session creation errors - don't retry connection
                 self.logger.error(f"Failed to create session for {self.phone_number}: {e}")
+                raise
             except Exception as e:
-                attempt += 1
                 self.logger.error(f"Failed to connect client for {self.phone_number} (attempt {attempt}/{retries}): {e}")
                 if attempt < retries:
                     await asyncio.sleep(delay)
