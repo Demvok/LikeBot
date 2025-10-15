@@ -2,7 +2,7 @@
 
 ### TO DO:
 
-- automate an provide manual way of session verification
+- add secure API endpoint for account password retrieval to view it
 
 - add object refresh on client for first account_id retrieval or fix logging to use phone number
 
@@ -23,6 +23,7 @@
 - ensured data type consistency via pydantic
 - routed account to session creation for first use
 - added account status as meta (login status)
+- added manual way and automated session verification
 
 ### v1.0.0 - RELEASE
 - full API for basic tasks
