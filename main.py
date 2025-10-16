@@ -8,7 +8,7 @@ from taskhandler import *
 from database import get_db
 from fastapi.middleware.cors import CORSMiddleware
 from schemas import (
-    AccountCreate, AccountUpdate, AccountResponse,
+    AccountCreate, AccountUpdate, AccountResponse, AccountPasswordResponse,
     PostCreate, PostUpdate, PostResponse,
     TaskCreate, TaskUpdate, TaskResponse,
     SuccessResponse, ErrorResponse, BulkOperationResult,
@@ -47,8 +47,8 @@ async def get_accounts(
         db = get_db()
         accounts = await db.load_all_accounts()
         
-        # Convert to dict format for JSON response
-        accounts_data = [account.to_dict() for account in accounts]
+        # Convert to secure dict format for JSON response (excludes passwords)
+        accounts_data = [account.to_dict(secure=True) for account in accounts]
         
         # Apply filtering if phone_number is provided
         if phone_number:
@@ -67,7 +67,7 @@ async def get_account(phone_number: str):
         account = await db.get_account(phone_number)
         if not account:
             raise HTTPException(status_code=404, detail=f"Account with phone number {phone_number} not found")
-        return account.to_dict()
+        return account.to_dict(secure=True)
     except HTTPException:
         raise
     except Exception as e:
@@ -78,13 +78,24 @@ async def get_account(phone_number: str):
 async def create_account_without_login(account_data: AccountCreate):
     """Create a new account without logging in. Useful for pre-registering accounts. Legacy endpoint."""
     try:
+        from encryption import encrypt_secret
+        
         db = get_db()
         existing_account = await db.get_account(account_data.phone_number)  # Check if account already exists
         if existing_account:
             raise HTTPException(status_code=409, detail=f"Account with phone number {account_data.phone_number} already exists")
         
-        # Create account
+        # Create account dictionary and encrypt password if provided
         account_dict = account_data.model_dump()
+        
+        # Handle password encryption
+        if account_dict.get('password'):
+            account_dict['password_encrypted'] = encrypt_secret(account_dict['password'], b'Password')
+            # Remove plain text password from dict
+            del account_dict['password']
+        else:
+            account_dict['password_encrypted'] = None
+        
         success = await db.add_account(account_dict)
         
         if success:
@@ -102,6 +113,8 @@ async def create_account_without_login(account_data: AccountCreate):
 async def update_account(phone_number: str, account_data: AccountUpdate):
     """Update an existing account."""
     try:
+        from encryption import encrypt_secret
+        
         db = get_db()
         
         # Check if account exists
@@ -114,6 +127,19 @@ async def update_account(phone_number: str, account_data: AccountUpdate):
         
         if not update_dict:
             raise HTTPException(status_code=400, detail="No update data provided")
+        
+        # Handle password encryption if password is being updated
+        if 'password' in update_dict:
+            if update_dict['password']:
+                update_dict['password_encrypted'] = encrypt_secret(update_dict['password'], b'Password')
+                # Automatically set twofa to True if password is provided
+                update_dict['twofa'] = True
+            else:
+                # If password is empty/None, clear password and disable 2FA
+                update_dict['password_encrypted'] = None
+                update_dict['twofa'] = False
+            # Remove plain text password from dict
+            del update_dict['password']
         
         success = await db.update_account(phone_number, update_dict)
         
@@ -190,13 +216,48 @@ async def validate_account(phone_number: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to validate account: {str(e)}")
 
+@app.get('/accounts/{phone_number}/password', summary="Get account password (secure endpoint)", response_model=AccountPasswordResponse)
+@crash_handler
+async def get_account_password(phone_number: str):
+    """
+    Get account password securely. This is a mockup endpoint for secure password retrieval.
+    In production, this should require additional authentication/authorization.
+    """
+    try:
+        from encryption import decrypt_secret
+        
+        db = get_db()
+        account = await db.get_account(phone_number)
+        if not account:
+            raise HTTPException(status_code=404, detail=f"Account with phone number {phone_number} not found")
+        
+        # Check if account has a password
+        has_password = bool(account.password_encrypted)
+        decrypted_password = None
+        
+        if has_password:
+            try:
+                decrypted_password = decrypt_secret(account.password_encrypted, b'Password')
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to decrypt password: {str(e)}")
+        
+        return AccountPasswordResponse(
+            phone_number=phone_number,
+            has_password=has_password,
+            password=decrypted_password
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get account password: {str(e)}")
+
 # ============= LOGIN PROCESS ENDPOINTS =============
 
 @app.post('/accounts/create/start', summary="Start login process", status_code=200)
 @crash_handler
 async def login_start(
     phone_number: str = Query(..., description="Phone number with country code"),
-    password_encrypted: Optional[str] = Query(None, description="Encrypted password for 2FA (optional)"),
+    password: Optional[str] = Query(None, description="Password for 2FA (will be encrypted)"),
     session_name: Optional[str] = Query(None, description="Custom session name (optional)"),
     notes: Optional[str] = Query(None, description="Account notes (optional)")
 ):
@@ -206,9 +267,16 @@ async def login_start(
     Frontend should poll /accounts/create/status or proceed to /accounts/create/verify.
     """
     from agent import start_login, pending_logins
+    from encryption import encrypt_secret
     import asyncio
+    import uuid
     
     try:
+        # Encrypt password if provided
+        password_encrypted = None
+        if password:
+            password_encrypted = encrypt_secret(password, b'Password')
+        
         # Generate unique session ID
         login_session_id = str(uuid.uuid4())
         
@@ -239,19 +307,17 @@ async def login_start(
         raise HTTPException(status_code=500, detail=f"Failed to start login: {str(e)}")
 
 
-@app.post('/accounts/create/verify', summary="Verify login code or password", status_code=200)
+@app.post('/accounts/create/verify', summary="Verify login code", status_code=200)
 @crash_handler
 async def login_verify(
     login_session_id: str = Query(..., description="Login session ID from /accounts/create/start"),
-    code: Optional[str] = Query(None, description="Verification code from Telegram"),
-    password_2fa: Optional[str] = Query(None, description="2FA password if required (will be encrypted)")
+    code: str = Query(..., description="Verification code from Telegram")
 ):
     """
-    Submit verification code or 2FA password to continue login process.
-    Note: It's recommended to provide encrypted password at /accounts/create/start for better security.
+    Submit verification code to continue login process.
+    2FA passwords must be provided during /accounts/create/start, not here.
     """
     from agent import pending_logins
-    from encryption import encrypt_secret
     
     try:
         # Get login process
@@ -261,9 +327,6 @@ async def login_verify(
         
         # Check what we're waiting for
         if login_process.status == LoginStatus.WAIT_CODE:
-            if not code:
-                raise HTTPException(status_code=400, detail="Verification code is required")
-            
             # Set the code in the future to continue login
             if not login_process.code_future.done():
                 login_process.code_future.set_result(code)
@@ -274,17 +337,11 @@ async def login_verify(
             }
             
         elif login_process.status == LoginStatus.WAIT_2FA:
-            if not password_2fa:
-                raise HTTPException(status_code=400, detail="2FA password is required")
-            
-            # Set the password in the future to continue login
-            if login_process.password_future and not login_process.password_future.done():
-                login_process.password_future.set_result(password_2fa)
-            
-            return {
-                "status": "processing",
-                "message": "2FA password submitted, processing login..."
-            }
+            # 2FA is required but no password was provided during start
+            raise HTTPException(
+                status_code=400, 
+                detail="2FA password is required but was not provided during /accounts/create/start. Please restart the login process with the password parameter."
+            )
             
         else:
             return {
@@ -941,6 +998,8 @@ async def delete_all_task_runs(task_id: int):
 async def create_accounts_bulk(accounts_data: List[AccountCreate]):
     """Create multiple accounts in bulk."""
     try:
+        from encryption import encrypt_secret
+        
         db = get_db()
         results = []
         
@@ -956,8 +1015,17 @@ async def create_accounts_bulk(accounts_data: List[AccountCreate]):
                     })
                     continue
                 
-                # Create account
+                # Create account dictionary and encrypt password if provided
                 account_dict = account_data.model_dump()
+                
+                # Handle password encryption
+                if account_dict.get('password'):
+                    account_dict['password_encrypted'] = encrypt_secret(account_dict['password'], b'Password')
+                    # Remove plain text password from dict
+                    del account_dict['password']
+                else:
+                    account_dict['password_encrypted'] = None
+                
                 success = await db.add_account(account_dict)
                 
                 if success:

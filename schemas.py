@@ -139,7 +139,7 @@ class AccountCreate(BaseModel):
     phone_number: str = Field(..., description="Phone number with country code (e.g., +1234567890)")
     session_name: Optional[str] = Field(None, description="Telegram session name")
     twofa: bool = Field(False, description="Is 2FA enabled for this account?")
-    password_encrypted: Optional[str] = Field(None, description="Encrypted password for 2FA")
+    password: Optional[str] = Field(None, description="Plain text password for 2FA (will be encrypted server-side)")
     notes: Optional[str] = Field("", description="Account notes")
 
     @field_validator('phone_number')
@@ -152,8 +152,8 @@ class AccountCreate(BaseModel):
 
     @model_validator(mode='after')
     def validate_twofa_password(self):
-        if self.twofa and not self.password_encrypted:
-            raise ValueError('password_encrypted is required when twofa is enabled')
+        if self.twofa and not self.password:
+            raise ValueError('password is required when twofa is enabled')
         return self
 
 class LoginProcess(BaseModel):
@@ -180,7 +180,7 @@ class AccountUpdate(BaseModel):
     session_name: Optional[str] = Field(None, description="Telegram session name")
     session_encrypted: Optional[str] = Field(None, description="Encrypted Telegram session string")
     twofa: Optional[bool] = Field(None, description="Is 2FA enabled for this account?")
-    password_encrypted: Optional[str] = Field(None, description="Encrypted password for 2FA")
+    password: Optional[str] = Field(None, description="Plain text password for 2FA (will be encrypted server-side)")
     notes: Optional[str] = Field(None, description="Account notes")
     status: Optional[AccountStatus] = Field(None, description="Account status")
 
@@ -189,12 +189,22 @@ class AccountUpdate(BaseModel):
 
 
 class AccountResponse(AccountBase, TimestampMixin):
-    """Schema for account responses (includes all fields)."""
+    """Schema for account responses (includes all fields except password)."""
     status: Optional[AccountStatus] = Field(default=AccountStatus.NEW, description="Account status")
 
     class Config:
         use_enum_values = True
         validate_by_name = True
+
+
+class AccountPasswordResponse(BaseModel):
+    """Schema for secure password retrieval (mockup)."""
+    phone_number: str = Field(..., description="Phone number with country code")
+    has_password: bool = Field(..., description="Whether account has a password set")
+    password: Optional[str] = Field(None, description="Decrypted password (only returned in secure context)")
+
+    class Config:
+        use_enum_values = True
 
 
 class AccountDict(BaseModel):
@@ -205,6 +215,23 @@ class AccountDict(BaseModel):
     session_encrypted: Optional[str]
     twofa: bool = Field(False)
     password_encrypted: Optional[str]
+    notes: Optional[str]
+    status: Optional[AccountStatus]
+    created_at: Optional[Union[str, datetime]]
+    updated_at: Optional[Union[str, datetime]]
+
+    class Config:
+        use_enum_values = True
+        validate_by_name = True
+
+
+class AccountDictSecure(BaseModel):
+    """Schema for Account.to_dict() output without password information."""
+    account_id: Optional[int]
+    session_name: Optional[str]
+    phone_number: str
+    session_encrypted: Optional[str]
+    twofa: bool = Field(False)
     notes: Optional[str]
     status: Optional[AccountStatus]
     created_at: Optional[Union[str, datetime]]
