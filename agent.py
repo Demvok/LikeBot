@@ -52,20 +52,28 @@ class Account(object):
     def __str__(self):
         return f"Account ID: {self.account_id}, phone: {self.phone_number}, session: {self.session_name}"
     
-    def to_dict(self):
-        """Convert Account object to dictionary matching AccountDict schema."""
-        return {
+    def to_dict(self, secure=False):
+        """Convert Account object to dictionary matching AccountDict schema.
+        
+        Args:
+            secure (bool): If True, excludes password_encrypted field for security
+        """
+        base_dict = {
             'account_id': self.account_id,
             'session_name': self.session_name,
             'phone_number': self.phone_number,
             'session_encrypted': self.session_encrypted,
             'twofa': self.twofa,
-            'password_encrypted': self.password_encrypted,
             'notes': self.notes,
             'status': self.status.name if isinstance(self.status, AccountStatus) else self.status,
             'created_at': self.created_at,
             'updated_at': self.updated_at
         }
+        
+        if not secure:
+            base_dict['password_encrypted'] = self.password_encrypted
+            
+        return base_dict
 
     async def create_connection(self):
         """Create a TelegramClient connection from account, useful for debugging."""

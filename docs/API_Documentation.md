@@ -20,13 +20,14 @@ Currently, no authentication is required for API endpoints.
   "session_name": "string (optional)",
   "session_encrypted": "string (optional)",
   "twofa": false,
-  "password_encrypted": "string (optional)",
   "notes": "string (optional)",
   "status": "NEW|ACTIVE|LOGGED_IN|BANNED|ERROR (optional)",
   "created_at": "string (ISO timestamp, optional)",
   "updated_at": "string (ISO timestamp, optional)"
 }
 ```
+
+**Note**: For security reasons, password information is not included in account responses. Use the secure password endpoint `/accounts/{phone_number}/password` to retrieve password information when needed.
 
 ### Post
 ```json
@@ -114,10 +115,14 @@ Create a new account.
 ```json
 {
   "phone_number": "+1234567890",
-  "account_id": "123456789",
-  "session_name": "user_session"
+  "session_name": "user_session",
+  "twofa": true,
+  "password": "mypassword123",
+  "notes": "Test account"
 }
 ```
+
+**Note**: The `password` field is sent as plain text but is immediately encrypted server-side for security. It's never stored in plain text.
 
 **Response:**
 ```json
@@ -136,11 +141,13 @@ Update an existing account.
   "session_name": "new_session_name",
   "session_encrypted": "encrypted_session_string",
   "twofa": true,
-  "password_encrypted": "encrypted_password",
+  "password": "newpassword123",
   "notes": "Updated notes",
   "status": "ACTIVE"
 }
 ```
+
+**Note**: The `password` field is sent as plain text but is immediately encrypted server-side for security. Setting `password` to an empty string or null will disable 2FA and clear the password.
 
 **Response:**
 ```json
@@ -175,6 +182,33 @@ Validate an account by testing its connection to Telegram.
 - `404`: Account not found
 - `500`: Connection failed or other validation errors
 
+### GET /accounts/{phone_number}/password
+Get account password securely (mockup endpoint).
+
+**Response:**
+```json
+{
+  "phone_number": "+1234567890",
+  "has_password": true,
+  "password": "decrypted_password_here"
+}
+```
+
+**Response (No Password):**
+```json
+{
+  "phone_number": "+1234567890",
+  "has_password": false,
+  "password": null
+}
+```
+
+**Note**: This is a mockup endpoint for secure password retrieval. In production, this should require additional authentication/authorization mechanisms such as admin tokens, IP restrictions, or multi-factor authentication.
+
+**Error Responses:**
+- `404`: Account not found
+- `500`: Failed to decrypt password or other errors
+
 ---
 
 ## Login Process
@@ -184,7 +218,7 @@ Start the login process for a Telegram account. Sends verification code to the p
 
 **Query Parameters:**
 - `phone_number` (required): Phone number with country code (e.g., +1234567890)
-- `password_encrypted` (optional): Encrypted password for 2FA
+- `password` (optional): Password for 2FA (will be encrypted server-side)
 - `session_name` (optional): Custom session name
 - `notes` (optional): Account notes
 
@@ -205,14 +239,13 @@ Start the login process for a Telegram account. Sends verification code to the p
 - `failed`: Login failed with error
 
 ### POST /accounts/create/verify
-Submit verification code or 2FA password to continue the login process.
+Submit verification code to continue the login process.
 
 **Query Parameters:**
 - `login_session_id` (required): Login session ID from /accounts/create/start
-- `code` (optional): Verification code from Telegram
-- `password_2fa` (optional): 2FA password if required (will be encrypted)
+- `code` (required): Verification code from Telegram
 
-**Note**: It's recommended to provide encrypted password at `/accounts/create/start` for better security.
+**Note**: 2FA passwords must be provided during `/accounts/create/start`, not here. If 2FA is required but no password was provided during start, this endpoint will return an error instructing to restart the login process.
 
 **Response:**
 ```json
@@ -224,7 +257,7 @@ Submit verification code or 2FA password to continue the login process.
 
 **Error Responses:**
 - `404`: Login session not found or expired
-- `400`: Missing required parameter (code or password)
+- `400`: Missing verification code or 2FA password required but not provided during start
 
 ### GET /accounts/create/status
 Check the status of an ongoing login process. Used for polling by the frontend.
@@ -641,11 +674,16 @@ Create multiple accounts in bulk.
 [
   {
     "phone_number": "+1234567890",
-    "account_id": "123456789"
+    "session_name": "user1_session",
+    "twofa": true,
+    "password": "password123",
+    "notes": "User 1 account"
   },
   {
     "phone_number": "+0987654321",
-    "account_id": "987654321"
+    "session_name": "user2_session",
+    "twofa": false,
+    "notes": "User 2 account"
   }
 ]
 ```

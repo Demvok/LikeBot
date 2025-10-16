@@ -40,12 +40,12 @@ This document describes the new asynchronous login process for LikeBot that allo
 
 **Request**:
 ```http
-POST /accounts/create/start?phone_number=+1234567890&password_encrypted=optional&session_name=my_session&notes=My%20Account
+POST /accounts/create/start?phone_number=+1234567890&password=optional&session_name=my_session&notes=My%20Account
 ```
 
 **Parameters**:
 - `phone_number` (required): Phone number with country code
-- `password_encrypted` (optional): Encrypted password for 2FA
+- `password` (optional): Password for 2FA (will be encrypted server-side)
 - `session_name` (optional): Custom session name (defaults to "session_{phone_number}")
 - `notes` (optional): Account notes
 
@@ -71,16 +71,13 @@ POST /accounts/create/start?phone_number=+1234567890&password_encrypted=optional
 **Request**:
 ```http
 POST /accounts/create/verify?login_session_id=uuid&code=12345
-# OR (if 2FA is required)
-POST /accounts/create/verify?login_session_id=uuid&password_2fa=my2fapassword
 ```
 
 **Parameters**:
 - `login_session_id` (required): Login session ID from /accounts/create/start
-- `code` (optional): Verification code from Telegram
-- `password_2fa` (optional): 2FA password if required
+- `code` (required): Verification code from Telegram
 
-**Note**: It's recommended to provide encrypted password at `/accounts/create/start` for better security.
+**Note**: 2FA passwords must be provided during `/accounts/create/start`. If 2FA is required but no password was provided during start, this endpoint will return an error instructing to restart the login process with the password parameter.
 
 **Response**:
 ```json
@@ -152,10 +149,10 @@ const pollStatus = async () => {
   const { status, error } = await statusResponse.json();
   
   if (status === 'wait_2fa') {
-    // Show 2FA password input
-    const password = await show2FAInputModal();
-    await fetch(`/accounts/create/verify?login_session_id=${login_session_id}&password_2fa=${password}`);
-    setTimeout(pollStatus, 1000); // Continue polling
+    // 2FA required but password not provided during start
+    // User needs to restart login process with password
+    showError('2FA password is required. Please restart login and provide password.');
+    // Optionally redirect to restart login with password input
   } else if (status === 'done') {
     showSuccess('Login completed!');
   } else if (status === 'failed') {
