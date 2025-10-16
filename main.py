@@ -78,7 +78,7 @@ async def get_account(phone_number: str):
 async def create_account_without_login(account_data: AccountCreate):
     """Create a new account without logging in. Useful for pre-registering accounts. Legacy endpoint."""
     try:
-        from encryption import encrypt_secret
+        from encryption import encrypt_secret, PURPOSE_PASSWORD
         
         db = get_db()
         existing_account = await db.get_account(account_data.phone_number)  # Check if account already exists
@@ -90,7 +90,7 @@ async def create_account_without_login(account_data: AccountCreate):
         
         # Handle password encryption
         if account_dict.get('password'):
-            account_dict['password_encrypted'] = encrypt_secret(account_dict['password'], b'Password')
+            account_dict['password_encrypted'] = encrypt_secret(account_dict['password'], PURPOSE_PASSWORD)
             # Remove plain text password from dict
             del account_dict['password']
         else:
@@ -113,7 +113,7 @@ async def create_account_without_login(account_data: AccountCreate):
 async def update_account(phone_number: str, account_data: AccountUpdate):
     """Update an existing account."""
     try:
-        from encryption import encrypt_secret
+        from encryption import encrypt_secret, PURPOSE_PASSWORD
         
         db = get_db()
         
@@ -131,7 +131,7 @@ async def update_account(phone_number: str, account_data: AccountUpdate):
         # Handle password encryption if password is being updated
         if 'password' in update_dict:
             if update_dict['password']:
-                update_dict['password_encrypted'] = encrypt_secret(update_dict['password'], b'Password')
+                update_dict['password_encrypted'] = encrypt_secret(update_dict['password'], PURPOSE_PASSWORD)
                 # Automatically set twofa to True if password is provided
                 update_dict['twofa'] = True
             else:
@@ -224,7 +224,7 @@ async def get_account_password(phone_number: str):
     In production, this should require additional authentication/authorization.
     """
     try:
-        from encryption import decrypt_secret
+        from encryption import decrypt_secret, PURPOSE_PASSWORD
         
         db = get_db()
         account = await db.get_account(phone_number)
@@ -237,7 +237,7 @@ async def get_account_password(phone_number: str):
         
         if has_password:
             try:
-                decrypted_password = decrypt_secret(account.password_encrypted, b'Password')
+                decrypted_password = decrypt_secret(account.password_encrypted, PURPOSE_PASSWORD)
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Failed to decrypt password: {str(e)}")
         
@@ -267,7 +267,7 @@ async def login_start(
     Frontend should poll /accounts/create/status or proceed to /accounts/create/verify.
     """
     from agent import start_login, pending_logins
-    from encryption import encrypt_secret
+    from encryption import encrypt_secret, PURPOSE_PASSWORD
     import asyncio
     import uuid
     
@@ -275,7 +275,7 @@ async def login_start(
         # Encrypt password if provided
         password_encrypted = None
         if password:
-            password_encrypted = encrypt_secret(password, b'Password')
+            password_encrypted = encrypt_secret(password, PURPOSE_PASSWORD)
         
         # Generate unique session ID
         login_session_id = str(uuid.uuid4())
@@ -998,7 +998,7 @@ async def delete_all_task_runs(task_id: int):
 async def create_accounts_bulk(accounts_data: List[AccountCreate]):
     """Create multiple accounts in bulk."""
     try:
-        from encryption import encrypt_secret
+        from encryption import encrypt_secret, PURPOSE_PASSWORD
         
         db = get_db()
         results = []
@@ -1020,7 +1020,7 @@ async def create_accounts_bulk(accounts_data: List[AccountCreate]):
                 
                 # Handle password encryption
                 if account_dict.get('password'):
-                    account_dict['password_encrypted'] = encrypt_secret(account_dict['password'], b'Password')
+                    account_dict['password_encrypted'] = encrypt_secret(account_dict['password'], PURPOSE_PASSWORD)
                     # Remove plain text password from dict
                     del account_dict['password']
                 else:

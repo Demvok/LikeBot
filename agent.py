@@ -7,7 +7,12 @@ from telethon.sessions import StringSession
 from logger import setup_logger, load_config
 from dotenv import load_dotenv
 from schemas import AccountStatus, LoginStatus, LoginProcess
-from encryption import decrypt_secret, encrypt_secret
+from encryption import (
+    decrypt_secret,
+    encrypt_secret,
+    PURPOSE_PASSWORD,
+    PURPOSE_STRING_SESSION,
+)
 
 load_dotenv()
 api_id = os.getenv('api_id')
@@ -86,7 +91,7 @@ class Account(object):
         """Add or update the encrypted password for 2FA."""
         if not password:
             raise ValueError("Password cannot be empty.")
-        self.password_encrypted = encrypt_secret(password, b'Password')
+        self.password_encrypted = encrypt_secret(password, PURPOSE_PASSWORD)
         self.twofa = True
 
         from database import get_db  # Avoid circular import if any
@@ -115,7 +120,7 @@ class Account(object):
             'session_name': session_name,
             'session_encrypted': session_encrypted,
             'twofa': twofa,
-            'password_encrypted': password_encrypted if password_encrypted else encrypt_secret(password, b'Password') if password else None,
+            'password_encrypted': password_encrypted if password_encrypted else encrypt_secret(password, PURPOSE_PASSWORD) if password else None,
             'notes': notes if notes is not None else "",
             'status': status if status is not None else cls.AccountStatus.NEW,
             'created_at': created_at or Timestamp.now(),
@@ -181,7 +186,7 @@ class Client(object):
     async def _get_session(self, force_new=False):
         if self.session_encrypted and not force_new:
             self.logger.info(f"Using existing session for {self.phone_number}.")
-            return StringSession(decrypt_secret(self.session_encrypted))
+            return StringSession(decrypt_secret(self.session_encrypted, PURPOSE_STRING_SESSION))
         else:
             self.logger.info(f"Creating new session for {self.phone_number}.")
 
@@ -227,7 +232,7 @@ class Client(object):
                                 self.logger.error("2FA is required but no password is configured.")
                                 raise ValueError("2FA password is required but not provided.")
                             
-                            password = decrypt_secret(self.password_encrypted, b'Password')
+                            password = decrypt_secret(self.password_encrypted, PURPOSE_PASSWORD)
                             if not password:
                                 self.logger.error("Failed to decrypt 2FA password.")
                                 raise ValueError("Failed to decrypt 2FA password.")
@@ -238,7 +243,7 @@ class Client(object):
                             self.logger.error(f"Error during sign-in for {self.phone_number}: {e}")
                             raise
 
-                    self.session_encrypted = encrypt_secret(StringSession.save(self.client.session))
+                    self.session_encrypted = encrypt_secret(StringSession.save(self.client.session), PURPOSE_STRING_SESSION)
                     await self.client.disconnect()  # Ensure the session file is closed before deleting
                     
                     from database import get_db  # Avoid circular import if any
@@ -247,7 +252,7 @@ class Client(object):
                     
                     self.logger.info(f"Session for {self.phone_number} saved.")
 
-                    return StringSession(decrypt_secret(self.session_encrypted))
+                    return StringSession(decrypt_secret(self.session_encrypted, PURPOSE_STRING_SESSION))
                     
                 except (errors.PhoneCodeInvalidError, errors.PhoneCodeExpiredError) as e:
                     self.logger.warning(f"Code error on attempt {attempt}/{session_creation_retries}: {e}")
@@ -749,7 +754,7 @@ async def start_login(
             
             # Success - save session
             session_string = client.session.save()
-            encrypted_session = encrypt_secret(session_string, b'Session')
+            encrypted_session = encrypt_secret(session_string, PURPOSE_STRING_SESSION)
             
             login_process.status = LoginStatus.DONE
             login_process.session_string = encrypted_session
@@ -784,7 +789,7 @@ async def start_login(
             # Wait for password from user
             if password:
                 # Password already provided - decrypt and use it
-                decrypted_password = decrypt_secret(password, b'Password')
+                decrypted_password = decrypt_secret(password, PURPOSE_PASSWORD)
                 password_to_use = decrypted_password
             else:
                 # Wait for password via Future
@@ -799,14 +804,14 @@ async def start_login(
             
             # Success - save session
             session_string = client.session.save()
-            encrypted_session = encrypt_secret(session_string, b'Session')
+            encrypted_session = encrypt_secret(session_string, PURPOSE_STRING_SESSION)
             
             login_process.status = LoginStatus.DONE
             login_process.session_string = encrypted_session
             
             # Update or create account in database
             db = get_db()
-            encrypted_password = encrypt_secret(password_to_use, b'Password') if not password else password
+            encrypted_password = encrypt_secret(password_to_use, PURPOSE_PASSWORD) if not password else password
             account_data = {
                 'phone_number': phone_number,
                 'account_id': me.id,

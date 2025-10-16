@@ -47,8 +47,8 @@ class CustomFormatter(logging.Formatter):
         # Set default value for execution_time if not provided
         if not hasattr(record, 'execution_time'):
             record.execution_time = 'N/A'
-        # Fixate levelname length to 7 symbols
-        record.levelname = str(record.levelname).ljust(7)[:7]
+        # Fixate levelname length to 8 symbols
+        record.levelname = str(record.levelname).ljust(8)[:8]
         
         try:
             return super().format(record)
