@@ -1,9 +1,12 @@
+import asyncio
 import atexit
+import os
 import uuid
-from fastapi import FastAPI, HTTPException, Query
+from collections import deque
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from typing import Optional, List, Dict
 from agent import *
-from logger import crash_handler, cleanup_logging
+from logger import crash_handler, cleanup_logging, get_log_directory
 from taskhandler import *
 from database import get_db
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,9 +34,75 @@ app.add_middleware(
 
 convert_to_serializable = serialize_for_json  # Use centralized serialization function from schemas
 
+
+def _resolve_log_path(log_file: str) -> Optional[str]:
+    """Resolve a log file name against the configured log directory."""
+    log_dir = os.path.abspath(get_log_directory())
+    candidate = os.path.abspath(os.path.join(log_dir, os.path.basename(log_file)))
+    if not candidate.startswith(log_dir):
+        return None
+    return candidate
+
+
 @app.get("/", summary="Health check")
 async def root():
     return {"message": "LikeBot API Server is running", "version": app.version}
+
+# ============= LOG STREAMING =============
+
+@app.websocket('/ws/logs')
+async def stream_logs(websocket: WebSocket):
+    """Stream log file updates over a websocket connection."""
+    log_file = websocket.query_params.get('log_file', 'main.log')
+    tail_param = websocket.query_params.get('tail', '200')
+
+    try:
+        tail = int(tail_param)
+    except ValueError:
+        tail = 200
+
+    tail = max(0, min(tail, 1000))
+    log_path = _resolve_log_path(log_file)
+
+    await websocket.accept()
+
+    if not log_path or not os.path.exists(log_path):
+        await websocket.send_json({
+            "type": "error",
+            "message": f"Log file {os.path.basename(log_file)} not found"
+        })
+        await websocket.close(code=1003)
+        return
+
+    try:
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as stream:
+            if tail > 0:
+                history = deque()
+                for raw_line in stream:
+                    history.append(raw_line.rstrip('\n'))
+                    if len(history) > tail:
+                        history.popleft()
+                for entry in history:
+                    await websocket.send_text(entry)
+            else:
+                stream.seek(0, os.SEEK_END)
+
+            while True:
+                line = stream.readline()
+                if line:
+                    await websocket.send_text(line.rstrip('\n'))
+                else:
+                    await asyncio.sleep(0.5)
+    except WebSocketDisconnect:
+        return
+    except Exception as exc:
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": f"Log streaming interrupted: {exc}"
+            })
+        finally:
+            await websocket.close(code=1011)
 
 # ============= ACCOUNTS CRUD =============
 
@@ -1269,7 +1338,7 @@ async def validate_post(post_id: int):
         raise HTTPException(status_code=500, detail=f"Failed to validate post: {str(e)}")
 
 if __name__ == "__main__":
-    import uvicorn, os
+    import uvicorn
     from dotenv import load_dotenv
     load_dotenv()
     
