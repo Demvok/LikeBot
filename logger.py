@@ -150,6 +150,11 @@ def cleanup_logging():
             except:
                 pass
 
+
+def get_log_directory() -> str:
+    """Expose the configured log directory for external consumers."""
+    return SAVE_TO
+
 def setup_logger(name: str, log_file: str) -> logging.Logger:
     """
     Sets up a logger that puts records into a multiprocessing queue.

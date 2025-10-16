@@ -71,8 +71,28 @@ Get server status.
 ```json
 {
   "message": "LikeBot API Server is running",
-  "version": "1.0.0"
+  "version": "1.0.1"
 }
+```
+
+### Websocket /ws/logs
+Stream log output in real time. Connect with a websocket client (e.g., browser `WebSocket`, `wscat`).
+
+**URL:** `ws://localhost:8000/ws/logs`
+
+**Query Parameters:**
+- `log_file` (optional): Name of the log file inside the configured logs directory. Defaults to `main.log`.
+- `tail` (optional): Number of trailing lines to send immediately after connection (0-1000, default 200).
+
+**Message Format:**
+- Server sends plain-text log lines as they are written.
+- Error messages are sent as JSON objects with fields `type` and `message` before the socket closes.
+
+**Example Usage (JavaScript):**
+```javascript
+const socket = new WebSocket('ws://localhost:8000/ws/logs?tail=100');
+socket.onmessage = (event) => console.log(event.data);
+socket.onerror = (event) => console.error('Log stream error', event);
 ```
 
 ---
