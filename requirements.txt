@@ -6,6 +6,7 @@ pymongo
 motor
 fastapi
 uvicorn
+'uvicorn[standard]'
 pydantic
 requests
 scipy
