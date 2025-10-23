@@ -1,7 +1,5 @@
-import asyncio
-import atexit
-import os
-import uuid
+import asyncio, atexit, os, uuid
+from dotenv import load_dotenv
 from collections import deque
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from typing import Optional, List, Dict
@@ -19,6 +17,9 @@ from schemas import (
     LoginStatus
 )
 
+load_dotenv()
+frontend_http = os.getenv("frontend_http", None)
+
 atexit.register(cleanup_logging)  # Register cleanup function
 
 app = FastAPI(title="LikeBot API", description="Full CRUD API for LikeBot automation", version="1.0.1")
@@ -26,7 +27,7 @@ app = FastAPI(title="LikeBot API", description="Full CRUD API for LikeBot automa
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:4200"],  # Or ["*"] for all origins (development only)
+    allow_origins=["http://localhost:4200", frontend_http],  # Or ["*"] for all origins (development only)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
