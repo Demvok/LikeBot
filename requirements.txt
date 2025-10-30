@@ -6,8 +6,11 @@ pymongo
 motor
 fastapi
 uvicorn
-'uvicorn[standard]'
+uvicorn[standard]
 pydantic
 requests
 scipy
 cryptography
+python-jose[cryptography]
+bcrypt
+python-multipart

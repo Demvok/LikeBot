@@ -1,8 +1,10 @@
-import asyncio, atexit, os, uuid
+import asyncio, atexit, os, uuid, logging
 from dotenv import load_dotenv
 from collections import deque
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from typing import Optional, List, Dict
+from datetime import timedelta, datetime, timezone
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Depends, status
+from fastapi.security import OAuth2PasswordRequestForm
+from typing import Optional, List, Dict, Annotated
 from agent import *
 from logger import crash_handler, cleanup_logging, get_log_directory
 from taskhandler import *
@@ -14,15 +16,27 @@ from schemas import (
     TaskCreate, TaskUpdate, TaskResponse,
     SuccessResponse, ErrorResponse, BulkOperationResult,
     DatabaseStats, ValidationResult, serialize_for_json,
-    LoginStatus
+    LoginStatus, UserCreate, UserLogin, UserResponse, Token, UserRole
 )
+from auth import (
+    authenticate_user, get_current_user, get_current_verified_user,
+    get_current_admin_user, create_user_account, create_user_token, decode_access_token
+)
+from jose import JWTError
+from jose.exceptions import ExpiredSignatureError
 
 load_dotenv()
 frontend_http = os.getenv("frontend_http", None)
 
 atexit.register(cleanup_logging)  # Register cleanup function
 
-app = FastAPI(title="LikeBot API", description="Full CRUD API for LikeBot automation", version="1.0.1")
+app = FastAPI(
+    title="LikeBot API",
+    description="Full API for LikeBot automation",
+    version="1.0.2"
+)
+
+logger = logging.getLogger("likebot.main")
 
 # Add CORS middleware
 app.add_middleware(
@@ -45,17 +59,158 @@ def _resolve_log_path(log_file: str) -> Optional[str]:
     return candidate
 
 
+@app.on_event("startup")
+async def validate_environment() -> None:
+    """Ensure critical environment configuration and database connectivity are available."""
+    required_vars = ("KEK", "JWT_SECRET_KEY", "db_url")
+    missing = [env for env in required_vars if not os.getenv(env)]
+
+    if missing:
+        message = ", ".join(missing)
+        logger.critical("Missing required environment variables: %s", message)
+        raise RuntimeError(f"Missing required environment variables: {message}")
+
+    db = get_db()
+    try:
+        await db._ensure_ready()
+    except RuntimeError as exc:
+        logger.critical("Database initialization failed: %s", exc)
+        raise
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Unexpected error during database readiness check")
+        raise
+
+
 @app.get("/", summary="Health check")
 async def root():
     return {"message": "LikeBot API Server is running", "version": app.version}
+
+
+# ============= AUTHENTICATION ENDPOINTS =============
+
+@app.post("/auth/register", summary="Register new user", status_code=201, response_model=UserResponse, tags=["Authentication"])
+@crash_handler
+async def register_user(user_data: UserCreate):
+    """
+    Register a new user account.
+    
+    - **username**: Unique username (3-50 characters, alphanumeric with underscores/hyphens)
+    - **password**: Password (minimum 6 characters)
+    - **role**: User role (default: user)
+    
+    New users start as unverified and require admin approval.
+    """
+    user_dict = await create_user_account(user_data)
+    
+    # Remove password hash from response
+    response_dict = {k: v for k, v in user_dict.items() if k != 'password_hash'}
+    return response_dict
+
+
+@app.post("/auth/login", summary="Login and get access token", response_model=Token, tags=["Authentication"])
+@crash_handler
+async def login(form_data: Annotated[OAuth2PasswordRequestForm, Depends()]):
+    """
+    Login with username and password to get a JWT access token.
+    
+    The token should be included in subsequent requests as:
+    `Authorization: Bearer <token>`
+    
+    Returns different error messages based on the failure reason:
+    - User not found
+    - Incorrect password
+    - User not verified (needs admin approval)
+    """
+    # Reject passwords that exceed bcrypt's 72-byte limit to avoid silent truncation
+    if len(form_data.password.encode('utf-8')) > 72:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password exceeds bcrypt's 72-byte limit. Please use a shorter password."
+        )
+
+    # Authenticate user
+    user = await authenticate_user(form_data.username, form_data.password)
+    
+    if not user:
+        # Check if user exists
+        db = get_db()
+        existing_user = await db.get_user(form_data.username)
+        
+        if not existing_user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="User not found. Please register first.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    
+    # Check if user is verified
+    if not user.get("is_verified", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User account is not verified. Please contact an administrator.",
+        )
+    
+    # Create access token
+    access_token = create_user_token(user)
+    
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@app.get("/auth/me", summary="Get current user info", response_model=UserResponse, tags=["Authentication"])
+@crash_handler
+async def get_me(current_user: Annotated[dict, Depends(get_current_user)]):
+    """
+    Get information about the currently authenticated user.
+    
+    Requires valid JWT token in Authorization header.
+    """
+    # Remove password hash from response
+    response_dict = {k: v for k, v in current_user.items() if k != 'password_hash'}
+    return response_dict
 
 # ============= LOG STREAMING =============
 
 @app.websocket('/ws/logs')
 async def stream_logs(websocket: WebSocket):
-    """Stream log file updates over a websocket connection."""
+    """Stream log file updates over a websocket connection. Requires authentication via query param."""
     log_file = websocket.query_params.get('log_file', 'main.log')
     tail_param = websocket.query_params.get('tail', '200')
+    token = websocket.query_params.get('token', None)
+
+    # Basic token validation for websocket
+    if not token:
+        await websocket.close(code=4401, reason="Authentication required: supply token query parameter.")
+        return
+
+    try:
+        payload = decode_access_token(token)
+    except ExpiredSignatureError:
+        await websocket.close(code=4403, reason="Token expired. Please refresh your session.")
+        return
+    except JWTError:
+        await websocket.close(code=4401, reason="Invalid token")
+        return
+
+    username = payload.get("sub")
+    if not username:
+        await websocket.close(code=4401, reason="Invalid token payload")
+        return
+
+    db = get_db()
+    user = await db.get_user(username)
+    if not user:
+        await websocket.close(code=4401, reason="User no longer exists.")
+        return
+
+    if not user.get("is_verified", False):
+        await websocket.close(code=4403, reason="User is not verified.")
+        return
 
     try:
         tail = int(tail_param)
@@ -66,6 +221,17 @@ async def stream_logs(websocket: WebSocket):
     log_path = _resolve_log_path(log_file)
 
     await websocket.accept()
+
+    exp_ts = payload.get("exp")
+    if exp_ts:
+        expires_at = datetime.fromtimestamp(exp_ts, tz=timezone.utc)
+        remaining = expires_at - datetime.now(timezone.utc)
+        if remaining <= timedelta(minutes=5):
+            await websocket.send_json({
+                "type": "warning",
+                "message": "Access token expires soon. Please refresh to avoid disconnection.",
+                "expires_at": expires_at.isoformat()
+            })
 
     if not log_path or not os.path.exists(log_path):
         await websocket.send_json({
@@ -96,6 +262,8 @@ async def stream_logs(websocket: WebSocket):
                     await asyncio.sleep(0.5)
     except WebSocketDisconnect:
         return
+    except ExpiredSignatureError:
+        await websocket.close(code=4403, reason="Token expired. Please refresh your session.")
     except Exception as exc:
         try:
             await websocket.send_json({
@@ -107,12 +275,13 @@ async def stream_logs(websocket: WebSocket):
 
 # ============= ACCOUNTS CRUD =============
 
-@app.get('/accounts', summary="Get all accounts", response_model=List[Dict])
+@app.get('/accounts', summary="Get all accounts", response_model=List[Dict], tags=["Accounts"])
 @crash_handler
 async def get_accounts(
-    phone_number: Optional[str] = Query(None, description="Filter by phone number")
+    phone_number: Optional[str] = Query(None, description="Filter by phone number"),
+    current_user: dict = Depends(get_current_user)
 ):
-    """Get all accounts with optional filtering by phone number."""
+    """Get all accounts with optional filtering by phone number. Requires authentication."""
     try:
         db = get_db()
         accounts = await db.load_all_accounts()
@@ -128,10 +297,13 @@ async def get_accounts(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to load accounts: {str(e)}")
 
-@app.get('/accounts/{phone_number}', summary="Get account by phone number")
+@app.get('/accounts/{phone_number}', summary="Get account by phone number", tags=["Accounts"])
 @crash_handler
-async def get_account(phone_number: str):
-    """Get a specific account by phone number."""
+async def get_account(
+    phone_number: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get a specific account by phone number. Requires authentication."""
     try:
         db = get_db()
         account = await db.get_account(phone_number)
@@ -143,10 +315,13 @@ async def get_account(phone_number: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get account: {str(e)}")
 
-@app.post('/accounts', summary="Create new account in database without login", status_code=201)
+@app.post('/accounts', summary="Create new account in database without login", status_code=201, tags=["Accounts"])
 @crash_handler
-async def create_account_without_login(account_data: AccountCreate):
-    """Create a new account without logging in. Useful for pre-registering accounts. Legacy endpoint."""
+async def create_account_without_login(
+    account_data: AccountCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Create a new account without logging in. Useful for pre-registering accounts. Legacy endpoint. Requires authentication."""
     try:
         from encryption import encrypt_secret, PURPOSE_PASSWORD
         
@@ -178,10 +353,14 @@ async def create_account_without_login(account_data: AccountCreate):
         raise HTTPException(status_code=500, detail=f"Failed to create account: {str(e)}")
 
 
-@app.put('/accounts/{phone_number}', summary="Update account")
+@app.put('/accounts/{phone_number}', summary="Update account", tags=["Accounts"])
 @crash_handler
-async def update_account(phone_number: str, account_data: AccountUpdate):
-    """Update an existing account."""
+async def update_account(
+    phone_number: str, 
+    account_data: AccountUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Update an existing account. Requires authentication."""
     try:
         from encryption import encrypt_secret, PURPOSE_PASSWORD
         
@@ -222,10 +401,13 @@ async def update_account(phone_number: str, account_data: AccountUpdate):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update account: {str(e)}")
 
-@app.delete('/accounts/{phone_number}', summary="Delete account")
+@app.delete('/accounts/{phone_number}', summary="Delete account", tags=["Accounts"])
 @crash_handler
-async def delete_account(phone_number: str):
-    """Delete an account by phone number."""
+async def delete_account(
+    phone_number: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete an account by phone number. Requires authentication."""
     try:
         db = get_db()
         
@@ -245,10 +427,13 @@ async def delete_account(phone_number: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete account: {str(e)}")
 
-@app.put('/accounts/{phone_number}/validate', summary="Validate account connection to Telegram")
+@app.put('/accounts/{phone_number}/validate', summary="Validate account connection to Telegram", tags=["Accounts"])
 @crash_handler
-async def validate_account(phone_number: str):
-    """Validate an account by testing its connection to Telegram."""
+async def validate_account(
+    phone_number: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Validate an account by testing its connection to Telegram. Requires authentication."""
     try:
         db = get_db()
         
@@ -286,11 +471,14 @@ async def validate_account(phone_number: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to validate account: {str(e)}")
 
-@app.get('/accounts/{phone_number}/password', summary="Get account password (secure endpoint)", response_model=AccountPasswordResponse)
+@app.get('/accounts/{phone_number}/password', summary="Get account password (secure endpoint)", response_model=AccountPasswordResponse, tags=["Accounts"])
 @crash_handler
-async def get_account_password(phone_number: str):
+async def get_account_password(
+    phone_number: str,
+    current_user: dict = Depends(get_current_admin_user)
+):
     """
-    Get account password securely. This is a mockup endpoint for secure password retrieval.
+    Get account password securely. Requires admin privileges.
     In production, this should require additional authentication/authorization.
     """
     try:
@@ -323,16 +511,17 @@ async def get_account_password(phone_number: str):
 
 # ============= LOGIN PROCESS ENDPOINTS =============
 
-@app.post('/accounts/create/start', summary="Start login process", status_code=200)
+@app.post('/accounts/create/start', summary="Start login process", status_code=200, tags=["Account Creation"])
 @crash_handler
 async def login_start(
     phone_number: str = Query(..., description="Phone number with country code"),
     password: Optional[str] = Query(None, description="Password for 2FA (will be encrypted)"),
     session_name: Optional[str] = Query(None, description="Custom session name (optional)"),
-    notes: Optional[str] = Query(None, description="Account notes (optional)")
+    notes: Optional[str] = Query(None, description="Account notes (optional)"),
+    current_user: dict = Depends(get_current_user)
 ):
     """
-    Start the login process for a Telegram account.
+    Start the login process for a Telegram account. Requires authentication.
     Returns login_session_id and status.
     Frontend should poll /accounts/create/status or proceed to /accounts/create/verify.
     """
@@ -377,14 +566,15 @@ async def login_start(
         raise HTTPException(status_code=500, detail=f"Failed to start login: {str(e)}")
 
 
-@app.post('/accounts/create/verify', summary="Verify login code", status_code=200)
+@app.post('/accounts/create/verify', summary="Verify login code", status_code=200, tags=["Account Creation"])
 @crash_handler
 async def login_verify(
     login_session_id: str = Query(..., description="Login session ID from /accounts/create/start"),
-    code: str = Query(..., description="Verification code from Telegram")
+    code: str = Query(..., description="Verification code from Telegram"),
+    current_user: dict = Depends(get_current_user)
 ):
     """
-    Submit verification code to continue login process.
+    Submit verification code to continue login process. Requires authentication.
     2FA passwords must be provided during /accounts/create/start, not here.
     """
     from agent import pending_logins
@@ -425,13 +615,14 @@ async def login_verify(
         raise HTTPException(status_code=500, detail=f"Failed to verify login: {str(e)}")
 
 
-@app.get('/accounts/create/status', summary="Check login process status", status_code=200)
+@app.get('/accounts/create/status', summary="Check login process status", status_code=200, tags=["Account Creation"])
 @crash_handler
 async def login_status(
-    login_session_id: str = Query(..., description="Login session ID from /accounts/create/start")
+    login_session_id: str = Query(..., description="Login session ID from /accounts/create/start"),
+    current_user: dict = Depends(get_current_user)
 ):
     """
-    Check the status of an ongoing login process.
+    Check the status of an ongoing login process. Requires authentication.
     Used for polling by the frontend.
     """
     from agent import pending_logins, cleanup_expired_logins
@@ -479,14 +670,15 @@ async def login_status(
 
 # ============= POSTS CRUD =============
 
-@app.get('/posts', summary="Get all posts", response_model=List[Dict])
+@app.get('/posts', summary="Get all posts", response_model=List[Dict], tags=["Posts"])
 @crash_handler
 async def get_posts(
     post_id: Optional[int] = Query(None, description="Filter by post ID"),
     chat_id: Optional[int] = Query(None, description="Filter by chat ID"),
-    validated_only: Optional[bool] = Query(None, description="Filter by validation status")
+    validated_only: Optional[bool] = Query(None, description="Filter by validation status"),
+    current_user: dict = Depends(get_current_user)
 ):
-    """Get all posts with optional filtering."""
+    """Get all posts with optional filtering. Requires authentication."""
     try:
         db = get_db()
         posts = await db.load_all_posts()
@@ -511,10 +703,13 @@ async def get_posts(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to load posts: {str(e)}")
 
-@app.get('/posts/{post_id}', summary="Get post by ID")
+@app.get('/posts/{post_id}', summary="Get post by ID", tags=["Posts"])
 @crash_handler
-async def get_post(post_id: int):
-    """Get a specific post by ID."""
+async def get_post(
+    post_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get a specific post by ID. Requires authentication."""
     try:
         db = get_db()
         post = await db.get_post(post_id)
@@ -526,10 +721,13 @@ async def get_post(post_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get post: {str(e)}")
 
-@app.post('/posts', summary="Create new post", status_code=201)
+@app.post('/posts', summary="Create new post", status_code=201, tags=["Posts"])
 @crash_handler
-async def create_post(post_data: PostCreate):
-    """Create a new post."""
+async def create_post(
+    post_data: PostCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Create a new post. Requires authentication."""
     try:
         db = get_db()
         
@@ -552,10 +750,14 @@ async def create_post(post_data: PostCreate):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create post: {str(e)}")
 
-@app.put('/posts/{post_id}', summary="Update post")
+@app.put('/posts/{post_id}', summary="Update post", tags=["Posts"])
 @crash_handler
-async def update_post(post_id: int, post_data: PostUpdate):
-    """Update an existing post."""
+async def update_post(
+    post_id: int, 
+    post_data: PostUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Update an existing post. Requires authentication."""
     try:
         db = get_db()
         
@@ -581,10 +783,13 @@ async def update_post(post_id: int, post_data: PostUpdate):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update post: {str(e)}")
 
-@app.delete('/posts/{post_id}', summary="Delete post")
+@app.delete('/posts/{post_id}', summary="Delete post", tags=["Posts"])
 @crash_handler
-async def delete_post(post_id: int):
-    """Delete a post by ID."""
+async def delete_post(
+    post_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete a post by ID. Requires authentication."""
     try:
         db = get_db()
         
@@ -606,14 +811,15 @@ async def delete_post(post_id: int):
 
 # ============= TASKS CRUD =============
 
-@app.get('/tasks', summary="Get all tasks", response_model=List[Dict])
+@app.get('/tasks', summary="Get all tasks", response_model=List[Dict], tags=["Tasks"])
 @crash_handler
 async def get_tasks(
     task_id: Optional[int] = Query(None, description="Filter by task ID"),
     status: Optional[str] = Query(None, description="Filter by task status"),
-    name: Optional[str] = Query(None, description="Filter by task name (partial match)")
+    name: Optional[str] = Query(None, description="Filter by task name (partial match)"),
+    current_user: dict = Depends(get_current_user)
 ):
-    """Get all tasks with optional filtering."""
+    """Get all tasks with optional filtering. Requires authentication."""
     try:
         db = get_db()
         tasks = await db.load_all_tasks()
@@ -635,10 +841,13 @@ async def get_tasks(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to load tasks: {str(e)}")
 
-@app.get('/tasks/{task_id}', summary="Get task by ID")
+@app.get('/tasks/{task_id}', summary="Get task by ID", tags=["Tasks"])
 @crash_handler
-async def get_task(task_id: int):
-    """Get a specific task by ID."""
+async def get_task(
+    task_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get a specific task by ID. Requires authentication."""
     try:
         db = get_db()
         task = await db.get_task(task_id)
@@ -650,10 +859,13 @@ async def get_task(task_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get task: {str(e)}")
 
-@app.post('/tasks', summary="Create new task", status_code=201)
+@app.post('/tasks', summary="Create new task", status_code=201, tags=["Tasks"])
 @crash_handler
-async def create_task(task_data: TaskCreate):
-    """Create a new task."""
+async def create_task(
+    task_data: TaskCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Create a new task. Requires authentication."""
     try:
         db = get_db()
         
@@ -682,10 +894,14 @@ async def create_task(task_data: TaskCreate):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create task: {str(e)}")
 
-@app.put('/tasks/{task_id}', summary="Update task")
+@app.put('/tasks/{task_id}', summary="Update task", tags=["Tasks"])
 @crash_handler
-async def update_task(task_id: int, task_data: TaskUpdate):
-    """Update an existing task."""
+async def update_task(
+    task_id: int, 
+    task_data: TaskUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Update an existing task. Requires authentication."""
     try:
         db = get_db()
         
@@ -725,10 +941,13 @@ async def update_task(task_id: int, task_data: TaskUpdate):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update task: {str(e)}")
 
-@app.delete('/tasks/{task_id}', summary="Delete task")
+@app.delete('/tasks/{task_id}', summary="Delete task", tags=["Tasks"])
 @crash_handler
-async def delete_task(task_id: int):
-    """Delete a task by ID."""
+async def delete_task(
+    task_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete a task by ID. Requires authentication."""
     try:
         db = get_db()
         
@@ -750,10 +969,13 @@ async def delete_task(task_id: int):
 
 # ============= TASK ACTIONS =============
 
-@app.get('/tasks/{task_id}/status', summary="Get task status")
+@app.get('/tasks/{task_id}/status', summary="Get task status", tags=["Task Actions"])
 @crash_handler
-async def get_task_status(task_id: int):
-    """Get the current status of a task."""
+async def get_task_status(
+    task_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get the current status of a task. Requires authentication."""
     try:
         db = get_db()
         task = await db.get_task(task_id)
@@ -767,10 +989,13 @@ async def get_task_status(task_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get task status: {str(e)}")
 
-@app.post('/tasks/{task_id}/start', summary="Start task execution")
+@app.post('/tasks/{task_id}/start', summary="Start task execution", tags=["Task Actions"])
 @crash_handler
-async def start_task(task_id: int):
-    """Start task execution."""
+async def start_task(
+    task_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """Start task execution. Requires authentication."""
     try:
         db = get_db()
         task = await db.get_task(task_id)
@@ -784,10 +1009,13 @@ async def start_task(task_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to start task: {str(e)}")
 
-@app.post('/tasks/{task_id}/pause', summary="Pause task execution")
+@app.post('/tasks/{task_id}/pause', summary="Pause task execution", tags=["Task Actions"])
 @crash_handler
-async def pause_task(task_id: int):
-    """Pause task execution."""
+async def pause_task(
+    task_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """Pause task execution. Requires authentication."""
     try:
         db = get_db()
         task = await db.get_task(task_id)
@@ -801,10 +1029,13 @@ async def pause_task(task_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to pause task: {str(e)}")
 
-@app.post('/tasks/{task_id}/resume', summary="Resume task execution")
+@app.post('/tasks/{task_id}/resume', summary="Resume task execution", tags=["Task Actions"])
 @crash_handler
-async def resume_task(task_id: int):
-    """Resume task execution."""
+async def resume_task(
+    task_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """Resume task execution. Requires authentication."""
     try:
         db = get_db()
         task = await db.get_task(task_id)
@@ -818,14 +1049,15 @@ async def resume_task(task_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to resume task: {str(e)}")
 
-@app.get('/tasks/{task_id}/report', summary="Get task execution report")
+@app.get('/tasks/{task_id}/report', summary="Get task execution report", tags=["Task Actions"])
 @crash_handler
 async def get_task_report(
     task_id: int,
     report_type: str = Query("success", description="Type of report (success, all, errors)"),
-    run_id: Optional[str] = Query(None, description="Specific run ID to get report for. If not provided, returns latest run report.")
+    run_id: Optional[str] = Query(None, description="Specific run ID to get report for. If not provided, returns latest run report."),
+    current_user: dict = Depends(get_current_user)
 ):
-    """Get execution report for a task. By default returns the latest run report."""
+    """Get execution report for a task. By default returns the latest run report. Requires authentication."""
     try:
         db = get_db()
         task = await db.get_task(task_id)
@@ -833,35 +1065,59 @@ async def get_task_report(
             raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
         
         from reporter import RunEventManager, create_report
-        import json
-        eventManager = RunEventManager()        
+        event_manager = RunEventManager()
+
+        effective_run_id = run_id
 
         if run_id is not None:
-            events = await eventManager.get_events(run_id)
+            events = await event_manager.get_events(run_id)
         else:
-            runs = await eventManager.get_runs(task_id) if run_id is None else None
-            events = await eventManager.get_events(runs.iloc[0].loc['run_id']) if run_id is None and not runs.empty else None
-        
-        report = await create_report(events, report_type) if events is not None else None
-        
-        if report is None:
-            return {"message": f"No report available for task {task_id}", "task_id": task_id}
-        
-        if '_id' in report.columns:
-            report = report.drop('_id', axis=1)
+            runs_df = await event_manager.get_runs(task_id)
+            if runs_df is None or runs_df.empty:
+                return {
+                    "message": f"No runs found for task {task_id}",
+                    "task_id": task_id
+                }
+            effective_run_id = str(runs_df.iloc[0]["run_id"])
+            events = await event_manager.get_events(effective_run_id)
 
-        report = json.loads(report.to_json(orient='records'))
+        if events is None or events.empty:
+            return {
+                "message": f"No reportable events for task {task_id}",
+                "task_id": task_id,
+                "run_id": effective_run_id
+            }
 
-        return {"task_id": task_id, "report": report, "run_id": run_id}
+        report = await create_report(events, report_type)
+
+        if report is None or report.empty:
+            return {
+                "message": f"No report available for task {task_id}",
+                "task_id": task_id,
+                "run_id": effective_run_id
+            }
+
+        report = report.drop(columns=['_id'], errors='ignore')
+        report_records = report.to_dict(orient='records')
+        report_records = convert_to_serializable(report_records)
+
+        response = {"task_id": task_id, "report": report_records}
+        if effective_run_id is not None:
+            response["run_id"] = effective_run_id
+
+        return response
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get task report: {str(e)}")
 
-@app.get('/tasks/{task_id}/runs', summary="Get all runs for a task")
+@app.get('/tasks/{task_id}/runs', summary="Get all runs for a task", tags=["Task Actions"])
 @crash_handler
-async def get_task_runs(task_id: int):
-    """Get all execution runs for a specific task, ordered by most recent first."""
+async def get_task_runs(
+    task_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get all execution runs for a specific task, ordered by most recent first. Requires authentication."""
     try:
         db = get_db()
         task = await db.get_task(task_id)
@@ -886,14 +1142,15 @@ async def get_task_runs(task_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get task runs: {str(e)}")
 
-@app.get('/tasks/{task_id}/runs/{run_id}/report', summary="Get report for specific run")
+@app.get('/tasks/{task_id}/runs/{run_id}/report', summary="Get report for specific run", tags=["Task Actions"])
 @crash_handler
 async def get_run_report(
     task_id: int,
     run_id: str,
-    report_type: str = Query("success", description="Type of report (success, all, errors)")
+    report_type: str = Query("success", description="Type of report (success, all, errors)"),
+    current_user: dict = Depends(get_current_user)
 ):
-    """Get execution report for a specific run of a task."""
+    """Get execution report for a specific run of a task. Requires authentication."""
     try:
         db = get_db()  # May be deleted as so it is only an unnecessary check
         task = await db.get_task(task_id)
@@ -902,34 +1159,36 @@ async def get_run_report(
         
         from reporter import RunEventManager, create_report
         from pandas import DataFrame
-        import json
 
-        eventManager = RunEventManager()
-        events: DataFrame = await eventManager.get_events(run_id)
+        event_manager = RunEventManager()
+        events: DataFrame = await event_manager.get_events(run_id)
 
-        if events.empty:
+        if events is None or events.empty:
             raise HTTPException(status_code=404, detail=f"Run with ID {run_id} not found.")
 
-        report = await create_report(data=events, type=report_type) if events is not None else None
+        report = await create_report(data=events, type=report_type)
 
-        if report is None:
-            return {"message": f"No report available for run {run_id}", "task_id": task_id, "run_id": run_id}
+        if report is None or report.empty:
+            return {
+                "message": f"No report available for run {run_id}",
+                "task_id": task_id,
+                "run_id": run_id
+            }
 
-        if '_id' in report.columns:
-            report = report.drop('_id', axis=1)
+        report = report.drop(columns=['_id'], errors='ignore')
+        report_records = report.to_dict(orient='records')
+        report_records = convert_to_serializable(report_records)
 
-        report_json = json.loads(report.to_json(orient='records'))
-
-        return {"task_id": task_id, "run_id": run_id, "report": report_json}
+        return {"task_id": task_id, "run_id": run_id, "report": report_records}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get run report: {str(e)}")
 
-@app.get('/runs', summary="Get all runs across all tasks")
+@app.get('/runs', summary="Get all runs across all tasks", tags=["Task Actions"])
 @crash_handler
-async def get_all_runs():
-    """Get all execution runs across all tasks."""
+async def get_all_runs(current_user: dict = Depends(get_current_user)):
+    """Get all execution runs across all tasks. Requires authentication."""
     try:
         from reporter import RunEventManager
         eventManager = RunEventManager()
@@ -971,10 +1230,14 @@ async def get_all_runs():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get all runs: {str(e)}")
 
-@app.delete('/tasks/{task_id}/runs/{run_id}', summary="Delete a specific run")
+@app.delete('/tasks/{task_id}/runs/{run_id}', summary="Delete a specific run", tags=["Task Actions"])
 @crash_handler
-async def delete_run(task_id: int, run_id: str):
-    """Delete a specific run and all its events."""
+async def delete_run(
+    task_id: int, 
+    run_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete a specific run and all its events. Requires authentication."""
     try:
         db = get_db()
         task = await db.get_task(task_id)
@@ -999,10 +1262,13 @@ async def delete_run(task_id: int, run_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete run: {str(e)}")
 
-@app.delete('/tasks/{task_id}/runs', summary="Delete all runs for a task")
+@app.delete('/tasks/{task_id}/runs', summary="Delete all runs for a task", tags=["Task Actions"])
 @crash_handler
-async def delete_all_task_runs(task_id: int):
-    """Delete all runs and their events for a specific task."""
+async def delete_all_task_runs(
+    task_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete all runs and their events for a specific task. Requires authentication."""
     try:
         db = get_db()
         task = await db.get_task(task_id)
@@ -1063,10 +1329,13 @@ async def delete_all_task_runs(task_id: int):
 
 # ============= BULK OPERATIONS =============
 
-@app.post('/accounts/bulk', summary="Create multiple accounts", status_code=201)
+@app.post('/accounts/bulk', summary="Create multiple accounts", status_code=201, tags=["Bulk Operations"])
 @crash_handler
-async def create_accounts_bulk(accounts_data: List[AccountCreate]):
-    """Create multiple accounts in bulk."""
+async def create_accounts_bulk(
+    accounts_data: List[AccountCreate],
+    current_user: dict = Depends(get_current_user)
+):
+    """Create multiple accounts in bulk. Requires authentication."""
     try:
         from encryption import encrypt_secret, PURPOSE_PASSWORD
         
@@ -1121,10 +1390,13 @@ async def create_accounts_bulk(accounts_data: List[AccountCreate]):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create accounts in bulk: {str(e)}")
 
-@app.post('/posts/bulk', summary="Create multiple posts", status_code=201)
+@app.post('/posts/bulk', summary="Create multiple posts", status_code=201, tags=["Bulk Operations"])
 @crash_handler
-async def create_posts_bulk(posts_data: List[PostCreate]):
-    """Create multiple posts in bulk."""
+async def create_posts_bulk(
+    posts_data: List[PostCreate],
+    current_user: dict = Depends(get_current_user)
+):
+    """Create multiple posts in bulk. Requires authentication."""
     try:
         db = get_db()
         results = []
@@ -1169,10 +1441,13 @@ async def create_posts_bulk(posts_data: List[PostCreate]):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create posts in bulk: {str(e)}")
 
-@app.delete('/accounts/bulk', summary="Delete multiple accounts")
+@app.delete('/accounts/bulk', summary="Delete multiple accounts", tags=["Bulk Operations"])
 @crash_handler
-async def delete_accounts_bulk(phone_numbers: List[str]):
-    """Delete multiple accounts in bulk."""
+async def delete_accounts_bulk(
+    phone_numbers: List[str],
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete multiple accounts in bulk. Requires authentication."""
     try:
         db = get_db()
         results = []
@@ -1214,10 +1489,13 @@ async def delete_accounts_bulk(phone_numbers: List[str]):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete accounts in bulk: {str(e)}")
 
-@app.delete('/posts/bulk', summary="Delete multiple posts")
+@app.delete('/posts/bulk', summary="Delete multiple posts", tags=["Bulk Operations"])
 @crash_handler
-async def delete_posts_bulk(post_ids: List[int]):
-    """Delete multiple posts in bulk."""
+async def delete_posts_bulk(
+    post_ids: List[int],
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete multiple posts in bulk. Requires authentication."""
     try:
         db = get_db()
         results = []
@@ -1261,10 +1539,10 @@ async def delete_posts_bulk(post_ids: List[int]):
 
 # ============= UTILITY ENDPOINTS =============
 
-@app.get('/stats', summary="Get database statistics")
+@app.get('/stats', summary="Get database statistics", tags=["Utilities"])
 @crash_handler
-async def get_stats():
-    """Get statistics about accounts, posts, and tasks."""
+async def get_stats(current_user: dict = Depends(get_current_user)):
+    """Get statistics about accounts, posts, and tasks. Requires authentication."""
     try:
         db = get_db()
         
@@ -1299,10 +1577,13 @@ async def get_stats():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get statistics: {str(e)}")
 
-@app.post('/posts/{post_id}/validate', summary="Validate a specific post")
+@app.post('/posts/{post_id}/validate', summary="Validate a specific post", tags=["Utilities"])
 @crash_handler
-async def validate_post(post_id: int):
-    """Validate a specific post by extracting chat_id and message_id from its link."""
+async def validate_post(
+    post_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """Validate a specific post by extracting chat_id and message_id from its link. Requires authentication."""
     try:
         db = get_db()
         

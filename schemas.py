@@ -27,6 +27,19 @@ from telethon import TelegramClient
 
 # ============= ENUMS =============
 
+class UserRole(Enum):
+    """User role enumeration."""
+    ADMIN = "admin"
+    USER = "user"
+    GUEST = "guest"
+    
+    def __str__(self):
+        return self.value
+    
+    def __repr__(self):
+        return self.value
+
+
 class AccountStatus(Enum):
     """Account status enumeration."""
     ACTIVE = auto()
@@ -105,6 +118,73 @@ class TimestampMixin(BaseModel):
         json_encoders = {
             datetime: lambda v: v.isoformat(),
         }
+
+
+# ============= USER/AUTH SCHEMAS =============
+
+class UserBase(BaseModel):
+    """Base schema for User data."""
+    username: str = Field(..., description="Unique username", min_length=3, max_length=50)
+    is_verified: bool = Field(default=False, description="Is user verified?")
+    role: UserRole = Field(default=UserRole.USER, description="User role")
+    
+    @field_validator('username')
+    def validate_username(cls, v):
+        if not v.replace('_', '').replace('-', '').isalnum():
+            raise ValueError("Username must contain only alphanumeric characters, underscores, and hyphens")
+        return v.lower()
+
+
+class UserCreate(BaseModel):
+    """Schema for creating new users."""
+    username: str = Field(..., description="Unique username", min_length=3, max_length=50)
+    password: str = Field(..., description="Plain text password (will be hashed server-side)", min_length=6)
+    role: UserRole = Field(default=UserRole.USER, description="User role")
+    
+    @field_validator('username')
+    def validate_username(cls, v):
+        if not v.replace('_', '').replace('-', '').isalnum():
+            raise ValueError("Username must contain only alphanumeric characters, underscores, and hyphens")
+        return v.lower()
+
+
+class UserLogin(BaseModel):
+    """Schema for user login."""
+    username: str = Field(..., description="Username")
+    password: str = Field(..., description="Password")
+
+
+class UserResponse(UserBase, TimestampMixin):
+    """Schema for user responses (excludes password)."""
+    class Config:
+        use_enum_values = True
+
+
+class Token(BaseModel):
+    """Schema for JWT token response."""
+    access_token: str = Field(..., description="JWT access token")
+    token_type: str = Field(default="bearer", description="Token type")
+
+
+class TokenData(BaseModel):
+    """Schema for JWT token payload data."""
+    sub: str = Field(..., description="Subject (username)")
+    is_verified: bool = Field(default=False, description="Is user verified?")
+    role: str = Field(..., description="User role")
+    exp: Optional[datetime] = Field(None, description="Expiration timestamp")
+
+
+class UserDict(BaseModel):
+    """Schema for User.to_dict() output."""
+    username: str
+    password_hash: str
+    is_verified: bool
+    role: UserRole
+    created_at: Union[str, datetime]
+    updated_at: Union[str, datetime]
+
+    class Config:
+        use_enum_values = True
 
 
 # ============= ACCOUNT SCHEMAS =============
