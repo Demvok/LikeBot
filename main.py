@@ -1,7 +1,7 @@
 import asyncio, atexit, os, uuid, logging
 from dotenv import load_dotenv
 from collections import deque
-from datetime import timedelta, datetime, timezone
+from datetime import timedelta, datetime as dt, timezone
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Depends, status
 from fastapi.security import OAuth2PasswordRequestForm
 from typing import Optional, List, Dict, Annotated
@@ -224,8 +224,8 @@ async def stream_logs(websocket: WebSocket):
 
     exp_ts = payload.get("exp")
     if exp_ts:
-        expires_at = datetime.fromtimestamp(exp_ts, tz=timezone.utc)
-        remaining = expires_at - datetime.now(timezone.utc)
+        expires_at = dt.fromtimestamp(exp_ts, tz=timezone.utc)
+        remaining = expires_at - dt.now(tz=timezone.utc)
         if remaining <= timedelta(minutes=5):
             await websocket.send_json({
                 "type": "warning",

@@ -578,13 +578,27 @@ def serialize_for_json(obj: Any) -> Any:
     if obj is None:
         return None
     
+    # Handle NaN and infinity values (pandas/numpy)
+    if isinstance(obj, float):
+        import math
+        if math.isnan(obj):
+            return None
+        if math.isinf(obj):
+            return None
+    
     # Handle ObjectId specifically (MongoDB)
     if hasattr(obj, 'binary') and hasattr(obj, '__str__'):
         return str(obj)
     
     # Handle numpy types
     if hasattr(obj, 'item'):
-        return obj.item()
+        value = obj.item()
+        # Check if the extracted value is NaN or inf
+        if isinstance(value, float):
+            import math
+            if math.isnan(value) or math.isinf(value):
+                return None
+        return value
     
     # Handle Timestamp objects (pandas)
     if hasattr(obj, 'isoformat') and hasattr(obj, 'value'):  # pandas Timestamp
