@@ -2,8 +2,6 @@
 
 ### TO DO:
 
-- add secure API endpoint for account password retrieval to view it
-
 - add object refresh on client for first account_id retrieval or fix logging to use phone number
 
 - add reaction precondition (exists in chat) check
@@ -17,6 +15,10 @@
 
 
 ## Changelog
+
+### v.1.0.2
+- added auth in API endpoints
+- managed access to endpoints depending on role
 
 ### v.1.0.1
 - removed semi-funtional file data storage logic

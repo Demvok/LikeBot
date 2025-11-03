@@ -141,14 +141,30 @@ def _ensure_listener(log_file):
 
 def cleanup_logging():
     """Clean up logging resources"""
-    global _main_listener
+    global _main_listener, _listener_handlers, _log_queue
     with _main_listener_lock:
         if _main_listener is not None:
             try:
                 _main_listener.stop()
-                _main_listener = None
-            except:
+            except Exception:
                 pass
+            finally:
+                _main_listener = None
+        
+        # Close all handlers
+        for handler in _listener_handlers:
+            try:
+                handler.close()
+            except Exception:
+                pass
+        _listener_handlers.clear()
+        
+        # Close the queue (cancel join thread if any)
+        try:
+            _log_queue.close()
+            _log_queue.join_thread()
+        except Exception:
+            pass
 
 
 def get_log_directory() -> str:

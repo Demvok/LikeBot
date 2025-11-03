@@ -2,15 +2,149 @@
 
 This document describes the full CRUD API for the LikeBot automation system.
 
+## Table of Contents
+
+1. [Base URL](#base-url)
+2. [Authentication](#authentication)
+3. [Initial Setup](#initial-setup)
+4. [Data Models](#data-models)
+5. [API Endpoints](#api-endpoints)
+   - [Health Check](#health-check)
+   - [Authentication Endpoints](#authentication-endpoints)
+   - [Log Streaming](#log-streaming)
+   - [Accounts CRUD](#accounts-crud)
+   - [Login Process](#login-process)
+   - [Posts CRUD](#posts-crud)
+   - [Tasks CRUD](#tasks-crud)
+   - [Task Actions](#task-actions)
+   - [Bulk Operations](#bulk-operations)
+   - [Utility Endpoints](#utility-endpoints)
+6. [Error Responses](#error-responses)
+7. [Notes](#notes)
+
 ## Base URL
 ```
-http://localhost:8000
+http://localhost:8080
 ```
+(Default port is 8080, configurable via `backend_port` environment variable)
 
 ## Authentication
-Currently, no authentication is required for API endpoints.
+
+The API uses **JWT (JSON Web Token) based authentication**. Most endpoints require authentication.
+
+### Authentication Flow
+
+1. **Register** a new user account via `POST /auth/register`
+2. Wait for an **admin to verify** your account (new users start as unverified)
+3. **Login** via `POST /auth/login` to receive an access token
+4. Include the token in subsequent requests using the **Authorization header**:
+   ```
+   Authorization: Bearer <your_access_token>
+   ```
+
+### Token Expiration
+- Tokens expire after **7 days** by default
+- When a token expires, you'll receive a `401 Unauthorized` response
+- Simply login again to get a new token
+
+### Public Endpoints (No Authentication Required)
+- `GET /` - Health check
+- `POST /auth/register` - User registration
+- `POST /auth/login` - User login
+
+### Protected Endpoints (Authentication Required)
+All other endpoints require a valid JWT token in the Authorization header.
+
+---
+
+## Initial Setup
+
+Before using the API, you need to set up the environment and create an admin user.
+
+### 1. Environment Variables
+
+Create a `.env` file with the following required variables:
+
+```env
+# Encryption key for sensitive data (generate using setup_env.py)
+KEK=your_base64_encoded_key_here
+
+# JWT secret key for authentication (generate using setup_env.py)
+JWT_SECRET_KEY=your_jwt_secret_here
+
+# MongoDB connection
+db_url=mongodb://localhost:27017/
+db_name=LikeBot
+
+# Optional: Backend configuration
+backend_ip=127.0.0.1
+backend_port=8080
+
+# Optional: Frontend CORS
+frontend_http=http://localhost:4200
+```
+
+### 2. Run Setup Script
+
+Use the provided setup script to generate secrets and create your first admin user:
+
+```bash
+python setup_env.py
+```
+
+This script will:
+- Generate a JWT secret key
+- Create an admin user account
+- Verify that all required environment variables are set
+
+### 3. Start the API Server
+
+```bash
+python main.py
+```
+
+The server will start on `http://127.0.0.1:8080` (or your configured backend_ip and backend_port).
+
+### 4. Login and Get Token
+
+Once your admin user is created, you can login to get an access token:
+
+```bash
+curl -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "username=your_admin&password=your_password"
+```
+
+Response:
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "token_type": "bearer"
+}
+```
+
+Use this token in all subsequent requests:
+```bash
+curl -X GET http://localhost:8080/accounts \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+```
+
+---
 
 ## Data Models
+
+### User
+```json
+{
+  "username": "string (3-50 chars, alphanumeric with underscores/hyphens)",
+  "is_verified": "boolean (default: false)",
+  "role": "string (user, admin, guest - default: user)",
+  "created_at": "string (ISO timestamp)",
+  "updated_at": "string (ISO timestamp)"
+}
+```
+
+**Note**: User passwords are never included in API responses. Password hashes are stored securely using bcrypt with a 72-byte limit.
 
 ### Account
 ```json
@@ -67,31 +201,155 @@ Currently, no authentication is required for API endpoints.
 #### GET /
 Get server status.
 
+**Authentication**: Not required
+
 **Response:**
 ```json
 {
   "message": "LikeBot API Server is running",
-  "version": "1.0.1"
+  "version": "1.0.2"
 }
 ```
+
+---
+
+## Authentication Endpoints
+
+### POST /auth/register
+Register a new user account.
+
+**Authentication**: Not required
+
+**Request Body:**
+```json
+{
+  "username": "john_doe",
+  "password": "securepassword123",
+  "role": "user"
+}
+```
+
+**Response (201 Created):**
+```json
+{
+  "username": "john_doe",
+  "is_verified": false,
+  "role": "user",
+  "created_at": "2025-01-01T00:00:00Z",
+  "updated_at": "2025-01-01T00:00:00Z"
+}
+```
+
+**Notes:**
+- New users start as **unverified** and require admin approval
+- Username must be 3-50 characters, alphanumeric with underscores/hyphens
+- Password must be at least 6 characters
+- Passwords exceeding 72 bytes (bcrypt limit) will be rejected
+
+**Error Responses:**
+- `400`: Username already registered or password exceeds bcrypt limit
+- `500`: Failed to create user
+
+---
+
+### POST /auth/login
+Login with username and password to get a JWT access token.
+
+**Authentication**: Not required
+
+**Request Body (Form Data):**
+```
+username=john_doe&password=securepassword123
+```
+
+**Response:**
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "token_type": "bearer"
+}
+```
+
+**Notes:**
+- Use the `access_token` in subsequent requests as: `Authorization: Bearer <token>`
+- Tokens expire after 7 days by default
+
+**Error Responses:**
+- `400`: Password exceeds bcrypt's 72-byte limit
+- `401`: User not found or incorrect password
+- `403`: User is not verified (needs admin approval)
+
+---
+
+### GET /auth/me
+Get information about the currently authenticated user.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Response:**
+```json
+{
+  "username": "john_doe",
+  "is_verified": true,
+  "role": "user",
+  "created_at": "2025-01-01T00:00:00Z",
+  "updated_at": "2025-01-01T00:00:00Z"
+}
+```
+
+**Error Responses:**
+- `401`: Invalid or missing token
+- `403`: User is not verified
+
+---
+
+## Log Streaming
 
 ### Websocket /ws/logs
 Stream log output in real time. Connect with a websocket client (e.g., browser `WebSocket`, `wscat`).
 
-**URL:** `ws://localhost:8000/ws/logs`
+**Authentication**: Required (via query parameter)
+
+**URL:** `ws://localhost:8080/ws/logs?token=<your_access_token>&log_file=main.log&tail=100`
 
 **Query Parameters:**
+- `token` (required): JWT access token for authentication
 - `log_file` (optional): Name of the log file inside the configured logs directory. Defaults to `main.log`.
 - `tail` (optional): Number of trailing lines to send immediately after connection (0-1000, default 200).
 
 **Message Format:**
 - Server sends plain-text log lines as they are written.
+- Warning messages sent as JSON when token is about to expire (within 5 minutes)
 - Error messages are sent as JSON objects with fields `type` and `message` before the socket closes.
+
+**WebSocket Close Codes:**
+- `4401`: Authentication required or invalid token
+- `4403`: Token expired or user not verified
+- `1003`: Log file not found
+- `1011`: Log streaming interrupted by error
 
 **Example Usage (JavaScript):**
 ```javascript
-const socket = new WebSocket('ws://localhost:8000/ws/logs?tail=100');
-socket.onmessage = (event) => console.log(event.data);
+const token = 'your_jwt_token_here';
+const socket = new WebSocket(`ws://localhost:8080/ws/logs?token=${token}&tail=100`);
+socket.onmessage = (event) => {
+  try {
+    const data = JSON.parse(event.data);
+    if (data.type === 'warning') {
+      console.warn(data.message);
+    } else if (data.type === 'error') {
+      console.error(data.message);
+    }
+  } catch {
+    // Plain text log line
+    console.log(event.data);
+  }
+};
 socket.onerror = (event) => console.error('Log stream error', event);
 ```
 
@@ -101,6 +359,13 @@ socket.onerror = (event) => console.error('Log stream error', event);
 
 ### GET /accounts
 Get all accounts with optional filtering.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
 
 **Query Parameters:**
 - `phone_number` (optional): Filter by phone number
@@ -119,6 +384,13 @@ Get all accounts with optional filtering.
 ### GET /accounts/{phone_number}
 Get a specific account by phone number.
 
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
 **Response:**
 ```json
 {
@@ -129,7 +401,14 @@ Get a specific account by phone number.
 ```
 
 ### POST /accounts
-Create a new account.
+Create a new account in database without login. Legacy endpoint.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
 
 **Request Body:**
 ```json
@@ -144,6 +423,10 @@ Create a new account.
 
 **Note**: The `password` field is sent as plain text but is immediately encrypted server-side for security. It's never stored in plain text.
 
+**Error Responses:**
+- `409`: Account already exists
+- `500`: Failed to create account
+
 **Response:**
 ```json
 {
@@ -153,6 +436,13 @@ Create a new account.
 
 ### PUT /accounts/{phone_number}
 Update an existing account.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
 
 **Request Body:**
 ```json
@@ -169,6 +459,11 @@ Update an existing account.
 
 **Note**: The `password` field is sent as plain text but is immediately encrypted server-side for security. Setting `password` to an empty string or null will disable 2FA and clear the password.
 
+**Error Responses:**
+- `404`: Account not found
+- `400`: No update data provided
+- `500`: Failed to update account
+
 **Response:**
 ```json
 {
@@ -178,6 +473,13 @@ Update an existing account.
 
 ### DELETE /accounts/{phone_number}
 Delete an account.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
 
 **Response:**
 ```json
@@ -189,21 +491,37 @@ Delete an account.
 ### PUT /accounts/{phone_number}/validate
 Validate an account by testing its connection to Telegram.
 
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
 **Response:**
 ```json
 {
   "message": "Account +1234567890 validated successfully",
   "account_id": 123456789,
-  "connection_status": "success"
+  "account_status": "ACTIVE",
+  "has_session": true
 }
 ```
 
 **Error Responses:**
 - `404`: Account not found
+- `400`: Account has no session (needs login first)
 - `500`: Connection failed or other validation errors
 
 ### GET /accounts/{phone_number}/password
-Get account password securely (mockup endpoint).
+Get account password securely. **Requires admin privileges.**
+
+**Authentication**: Required (Admin only)
+
+**Headers:**
+```
+Authorization: Bearer <your_admin_access_token>
+```
 
 **Response:**
 ```json
@@ -223,11 +541,13 @@ Get account password securely (mockup endpoint).
 }
 ```
 
-**Note**: This is a mockup endpoint for secure password retrieval. In production, this should require additional authentication/authorization mechanisms such as admin tokens, IP restrictions, or multi-factor authentication.
+**Note**: This endpoint requires admin privileges. In production, implement additional security measures such as IP restrictions or multi-factor authentication.
 
 **Error Responses:**
+- `401`: Invalid or missing token
+- `403`: User is not admin
 - `404`: Account not found
-- `500`: Failed to decrypt password or other errors
+- `500`: Failed to decrypt password
 
 ---
 
@@ -235,6 +555,13 @@ Get account password securely (mockup endpoint).
 
 ### POST /accounts/create/start
 Start the login process for a Telegram account. Sends verification code to the phone number.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
 
 **Query Parameters:**
 - `phone_number` (required): Phone number with country code (e.g., +1234567890)
@@ -258,8 +585,19 @@ Start the login process for a Telegram account. Sends verification code to the p
 - `done`: Login completed successfully
 - `failed`: Login failed with error
 
+**Error Responses:**
+- `401`: Invalid or missing token
+- `500`: Failed to start login
+
 ### POST /accounts/create/verify
 Submit verification code to continue the login process.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
 
 **Query Parameters:**
 - `login_session_id` (required): Login session ID from /accounts/create/start
@@ -276,11 +614,20 @@ Submit verification code to continue the login process.
 ```
 
 **Error Responses:**
+- `401`: Invalid or missing token
 - `404`: Login session not found or expired
 - `400`: Missing verification code or 2FA password required but not provided during start
+- `500`: Failed to verify login
 
 ### GET /accounts/create/status
 Check the status of an ongoing login process. Used for polling by the frontend.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
 
 **Query Parameters:**
 - `login_session_id` (required): Login session ID from /accounts/create/start
@@ -328,7 +675,9 @@ Check the status of an ongoing login process. Used for polling by the frontend.
 ```
 
 **Error Responses:**
+- `401`: Invalid or missing token
 - `404`: Login session not found or expired
+- `500`: Failed to get login status
 
 ---
 
@@ -336,6 +685,13 @@ Check the status of an ongoing login process. Used for polling by the frontend.
 
 ### GET /posts
 Get all posts with optional filtering.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
 
 **Query Parameters:**
 - `post_id` (optional): Filter by post ID
@@ -359,6 +715,13 @@ Get all posts with optional filtering.
 ### GET /posts/{post_id}
 Get a specific post by ID.
 
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
 **Response:**
 ```json
 {
@@ -373,6 +736,13 @@ Get a specific post by ID.
 
 ### POST /posts
 Create a new post.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
 
 **Request Body:**
 ```json
@@ -395,6 +765,13 @@ Create a new post.
 ### PUT /posts/{post_id}
 Update an existing post.
 
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
 **Request Body:**
 ```json
 {
@@ -414,6 +791,13 @@ Update an existing post.
 ### DELETE /posts/{post_id}
 Delete a post.
 
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
 **Response:**
 ```json
 {
@@ -427,6 +811,13 @@ Delete a post.
 
 ### GET /tasks
 Get all tasks with optional filtering.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
 
 **Query Parameters:**
 - `task_id` (optional): Filter by task ID
@@ -456,6 +847,13 @@ Get all tasks with optional filtering.
 ### GET /tasks/{task_id}
 Get a specific task by ID.
 
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
 **Response:**
 ```json
 {
@@ -476,6 +874,13 @@ Get a specific task by ID.
 
 ### POST /tasks
 Create a new task.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
 
 **Request Body:**
 ```json
@@ -502,6 +907,13 @@ Create a new task.
 ### PUT /tasks/{task_id}
 Update an existing task.
 
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
 **Request Body:**
 ```json
 {
@@ -521,6 +933,13 @@ Update an existing task.
 ### DELETE /tasks/{task_id}
 Delete a task.
 
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
 **Response:**
 ```json
 {
@@ -535,6 +954,13 @@ Delete a task.
 ### GET /tasks/{task_id}/status
 Get the current status of a task.
 
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
 **Response:**
 ```json
 {
@@ -546,6 +972,13 @@ Get the current status of a task.
 ### POST /tasks/{task_id}/start
 Start task execution.
 
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
 **Response:**
 ```json
 {
@@ -555,6 +988,13 @@ Start task execution.
 
 ### POST /tasks/{task_id}/pause
 Pause task execution.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
 
 **Response:**
 ```json
@@ -566,6 +1006,13 @@ Pause task execution.
 ### POST /tasks/{task_id}/resume
 Resume task execution.
 
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
 **Response:**
 ```json
 {
@@ -574,7 +1021,14 @@ Resume task execution.
 ```
 
 ### GET /tasks/{task_id}/report
-Get execution report for a task.
+Get execution report for a task. By default returns the latest run report.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
 
 **Query Parameters:**
 - `report_type` (optional): Type of report (success, all, errors). Default: "success"
@@ -593,7 +1047,14 @@ Get execution report for a task.
 ```
 
 ### GET /tasks/{task_id}/runs
-Get all execution runs for a specific task.
+Get all execution runs for a specific task, ordered by most recent first.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
 
 **Response:**
 ```json
@@ -620,6 +1081,13 @@ Get all execution runs for a specific task.
 ### GET /tasks/{task_id}/runs/{run_id}/report
 Get execution report for a specific run of a task.
 
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
 **Query Parameters:**
 - `report_type` (optional): Type of report (success, all, errors). Default: "success"
 
@@ -637,6 +1105,13 @@ Get execution report for a specific run of a task.
 
 ### GET /runs
 Get all execution runs across all tasks.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
 
 **Response:**
 ```json
@@ -661,6 +1136,13 @@ Get all execution runs across all tasks.
 ### DELETE /tasks/{task_id}/runs/{run_id}
 Delete a specific run and all its events.
 
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
 **Response:**
 ```json
 {
@@ -672,6 +1154,13 @@ Delete a specific run and all its events.
 
 ### DELETE /tasks/{task_id}/runs
 Delete all runs and their events for a specific task.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
 
 **Response:**
 ```json
@@ -688,6 +1177,13 @@ Delete all runs and their events for a specific task.
 
 ### POST /accounts/bulk
 Create multiple accounts in bulk.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
 
 **Request Body:**
 ```json
@@ -729,6 +1225,13 @@ Create multiple accounts in bulk.
 ### POST /posts/bulk
 Create multiple posts in bulk.
 
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
 **Request Body:**
 ```json
 [
@@ -744,6 +1247,13 @@ Create multiple posts in bulk.
 ### DELETE /accounts/bulk
 Delete multiple accounts in bulk.
 
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
 **Request Body:**
 ```json
 ["+1234567890", "+0987654321"]
@@ -751,6 +1261,13 @@ Delete multiple accounts in bulk.
 
 ### DELETE /posts/bulk
 Delete multiple posts in bulk.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
 
 **Request Body:**
 ```json
@@ -762,7 +1279,14 @@ Delete multiple posts in bulk.
 ## Utility Endpoints
 
 ### GET /stats
-Get database statistics.
+Get statistics about accounts, posts, and tasks.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
 
 **Response:**
 ```json
@@ -789,6 +1313,13 @@ Get database statistics.
 ### POST /posts/{post_id}/validate
 Validate a specific post by extracting chat_id and message_id from its link.
 
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
 **Response:**
 ```json
 {
@@ -800,39 +1331,69 @@ Validate a specific post by extracting chat_id and message_id from its link.
 
 ---
 
-## Legacy Endpoints
-
-### POST /actions/run_task
-Legacy endpoint to run a task (for backward compatibility).
-
-**Request Body:**
-```json
-{
-  "task_id": 1
-}
-```
-
-**Response:**
-```json
-{
-  "status": "Task 1 completed successfully"
-}
-```
-
----
-
 ## Error Responses
 
 All endpoints return appropriate HTTP status codes:
 
 - `200`: Success
 - `201`: Created
-- `400`: Bad Request (validation errors)
+- `400`: Bad Request (validation errors, missing parameters)
+- `401`: Unauthorized (invalid or missing authentication token)
+- `403`: Forbidden (user not verified or insufficient permissions)
 - `404`: Not Found
 - `409`: Conflict (resource already exists)
 - `500`: Internal Server Error
 
 Error response format:
+```json
+{
+  "detail": "Error message describing what went wrong"
+}
+```
+
+### Common Authentication Errors
+
+**401 Unauthorized:**
+```json
+{
+  "detail": "Could not validate credentials"
+}
+```
+
+**403 Forbidden (User Not Verified):**
+```json
+{
+  "detail": "User account is not verified. Please contact an administrator."
+}
+```
+
+**403 Forbidden (Admin Required):**
+```json
+{
+  "detail": "Admin privileges required"
+}
+```
+
+---
+
+## Notes
+
+1. **Token Expiration**: JWT tokens expire after 7 days. When you receive a 401 error, try logging in again to get a fresh token.
+
+2. **Password Security**: 
+   - Passwords are hashed using bcrypt with a 72-byte limit
+   - Account passwords (for 2FA) are encrypted using AES-256-GCM
+   - Never log or store passwords in plain text
+
+3. **User Verification**: New users start as unverified and require admin approval before they can use protected endpoints.
+
+4. **WebSocket Authentication**: WebSocket connections require token authentication via query parameter since headers can't be easily set in browser WebSocket API.
+
+5. **CORS**: The API supports CORS for frontend integration. Configure allowed origins via the `frontend_http` environment variable.
+
+6. **Rate Limiting**: Consider implementing rate limiting for production deployments to prevent abuse.
+
+7. **HTTPS**: Always use HTTPS in production to protect authentication tokens and sensitive data in transit.
 ```json
 {
   "detail": "Error message describing what went wrong"

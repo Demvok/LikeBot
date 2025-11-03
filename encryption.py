@@ -1,10 +1,14 @@
 import os, base64
-from typing import Iterable
+from typing import Iterable, Optional
+from datetime import datetime, timedelta, timezone
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+import bcrypt
+from jose import JWTError, jwt
 
 # ============== Configurations ===============
 SALT_SIZE = 16                            # bytes for salt in HKDF
@@ -20,6 +24,12 @@ PURPOSE_PASSWORD = b"Password"
 _LEGACY_PURPOSES: dict[bytes, tuple[bytes, ...]] = {
     PURPOSE_STRING_SESSION: (b"Session",),
 }
+
+# JWT Configuration
+JWT_SECRET_KEY_ENV_VAR = "JWT_SECRET_KEY"  # Environment variable for JWT secret
+JWT_ALGORITHM = "HS256"
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days default
+
 # =============================================
 
 
@@ -119,6 +129,140 @@ def decrypt_secret(
     raise InvalidTag(
         "Decryption failed; verify that the master key and purpose match the encrypted secret."
     ) from last_error
+
+
+# ============== PASSWORD HASHING ==============
+
+def hash_password(password: str) -> str:
+    """
+    Hash a password using bcrypt.
+    Bcrypt has a maximum password length of 72 bytes, so we truncate if necessary.
+    
+    Args:
+        password: Plain text password
+        
+    Returns:
+        Hashed password string
+    """
+    # Bcrypt has a 72-byte limit, so we truncate the password if needed
+    password_bytes = password.encode('utf-8')
+    if len(password_bytes) > 72:
+        password_bytes = password_bytes[:72]
+    
+    # Generate salt and hash the password
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password_bytes, salt)
+    
+    # Return as a string
+    return hashed.decode('utf-8')
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """
+    Verify a password against its hash.
+    Bcrypt has a maximum password length of 72 bytes, so we truncate if necessary.
+    
+    Args:
+        plain_password: Plain text password to verify
+        hashed_password: Hashed password to compare against
+        
+    Returns:
+        True if password matches, False otherwise
+    """
+    # Bcrypt has a 72-byte limit, so we truncate the password if needed
+    password_bytes = plain_password.encode('utf-8')
+    if len(password_bytes) > 72:
+        password_bytes = password_bytes[:72]
+    
+    # Convert hash to bytes if it's a string
+    if isinstance(hashed_password, str):
+        hashed_password = hashed_password.encode('utf-8')
+    
+    # Verify the password
+    return bcrypt.checkpw(password_bytes, hashed_password)
+
+
+# ============== JWT TOKEN MANAGEMENT ==============
+
+def generate_jwt_secret_key() -> str:
+    """Generate a new JWT secret key and return it as base64."""
+    key = os.urandom(32)
+    return base64.urlsafe_b64encode(key).decode("ascii")
+
+
+def get_jwt_secret_key(env_var: str = JWT_SECRET_KEY_ENV_VAR) -> str:
+    """
+    Get JWT secret key from environment variable.
+    
+    Args:
+        env_var: Environment variable name
+        
+    Returns:
+        JWT secret key
+        
+    Raises:
+        RuntimeError: If JWT secret key not found in environment
+    """
+    secret = os.environ.get(env_var)
+    if not secret:
+        raise RuntimeError(f"JWT secret key not found in environment variable '{env_var}'")
+    return secret
+
+
+def create_access_token(
+    data: dict,
+    expires_delta: Optional[timedelta] = None,
+    secret_key: Optional[str] = None
+) -> str:
+    """
+    Create a JWT access token.
+    
+    Args:
+        data: Dictionary containing token payload (should include 'sub', 'role', 'is_verified')
+        expires_delta: Optional token expiration time delta
+        secret_key: Optional secret key (if not provided, will use environment variable)
+        
+    Returns:
+        Encoded JWT token string
+    """
+    to_encode = data.copy()
+    
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+    
+    to_encode.update({"exp": expire})
+    
+    if secret_key is None:
+        secret_key = get_jwt_secret_key()
+    
+    encoded_jwt = jwt.encode(to_encode, secret_key, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+
+def decode_access_token(token: str, secret_key: Optional[str] = None) -> dict:
+    """
+    Decode and verify a JWT access token.
+    
+    Args:
+        token: JWT token string
+        secret_key: Optional secret key (if not provided, will use environment variable)
+        
+    Returns:
+        Decoded token payload dictionary
+        
+    Raises:
+        JWTError: If token is invalid or expired
+    """
+    if secret_key is None:
+        secret_key = get_jwt_secret_key()
+    
+    try:
+        payload = jwt.decode(token, secret_key, algorithms=[JWT_ALGORITHM])
+        return payload
+    except JWTError as e:
+        raise JWTError(f"Could not validate credentials: {str(e)}") from e
 
 
 

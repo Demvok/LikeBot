@@ -1,8 +1,10 @@
-import os, inspect
+import os, inspect, asyncio
+from typing import Optional
 from pandas import Timestamp
 from functools import wraps
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import PyMongoError, ServerSelectionTimeoutError
 from logger import setup_logger, load_config
 from agent import Account
 from taskhandler import Post, Task
@@ -13,6 +15,7 @@ logger = setup_logger("DB", "main.log")
 load_dotenv()
 db_url = os.getenv('db_url')
 db_name = os.getenv('db_name', 'LikeBot')
+mongo_timeout_ms = int(os.getenv('db_timeout_ms', '5000'))
 
 def ensure_async(func):
     if inspect.iscoroutinefunction(func):
@@ -30,21 +33,72 @@ class MongoStorage():
     _posts = None
     _accounts = None
     _tasks = None
+    _users = None
+    _client: Optional[AsyncIOMotorClient] = None
+    _indexes_initialized = False
+    _index_lock: Optional[asyncio.Lock] = None
 
     @classmethod
     def _init(cls):
-        if cls._accounts is None:
-            logger.info("Initializing MongoDB client and collections.")
-            client = AsyncIOMotorClient(db_url)
-            cls._db = client[db_name]
-            cls._accounts = cls._db["accounts"]
-            cls._posts = cls._db["posts"]
-            cls._tasks = cls._db["tasks"]
+        if cls._accounts is not None:
+            return
+
+        if not db_url:
+            logger.critical("Environment variable 'db_url' is not set; cannot initialize MongoDB client.")
+            raise RuntimeError("MongoDB connection string is missing (env 'db_url')")
+
+        logger.info("Initializing MongoDB client and collections.")
+        try:
+            cls._client = AsyncIOMotorClient(db_url, serverSelectionTimeoutMS=mongo_timeout_ms)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("Failed to create MongoDB client: %s", exc)
+            raise
+
+        cls._db = cls._client[db_name]
+        cls._accounts = cls._db["accounts"]
+        cls._posts = cls._db["posts"]
+        cls._tasks = cls._db["tasks"]
+        cls._users = cls._db["users"]
+
+    @classmethod
+    async def _ensure_ready(cls):
+        cls._init()
+        await cls._ensure_indexes()
+
+    @classmethod
+    async def _ensure_indexes(cls):
+        if cls._indexes_initialized:
+            return
+
+        if cls._index_lock is None:
+            cls._index_lock = asyncio.Lock()
+
+        async with cls._index_lock:
+            if cls._indexes_initialized:
+                return
+
+            try:
+                await cls._client.admin.command("ping")
+            except ServerSelectionTimeoutError as exc:
+                logger.critical("Unable to reach MongoDB server: %s", exc)
+                raise RuntimeError("MongoDB server unavailable. Check 'db_url' and database connectivity.") from exc
+
+            try:
+                await cls._accounts.create_index("phone_number", unique=True, name="ux_accounts_phone")
+                await cls._accounts.create_index("account_id", unique=True, sparse=True, name="ux_accounts_account_id")
+                await cls._posts.create_index("post_id", unique=True, name="ux_posts_post_id")
+                await cls._tasks.create_index("task_id", unique=True, name="ux_tasks_task_id")
+                await cls._users.create_index("username", unique=True, name="ux_users_username")
+            except PyMongoError as exc:
+                logger.error("Failed to ensure MongoDB indexes: %s", exc)
+                raise RuntimeError("Failed to create required MongoDB indexes") from exc
+
+            cls._indexes_initialized = True
 
     @classmethod
     @ensure_async
     async def load_all_accounts(cls):
-        cls._init()
+        await cls._ensure_ready()
         logger.info("Loading all accounts from MongoDB.")
         cursor = cls._accounts.find()
         accounts = []
@@ -57,7 +111,7 @@ class MongoStorage():
     @classmethod
     @ensure_async
     async def add_account(cls, account_data):
-        cls._init()
+        await cls._ensure_ready()
         logger.info(f"Adding account to MongoDB: {account_data}")
         if hasattr(account_data, 'to_dict'):
             account_data = account_data.to_dict()
@@ -80,7 +134,7 @@ class MongoStorage():
     @classmethod
     @ensure_async
     async def get_account(cls, phone_number):
-        cls._init()
+        await cls._ensure_ready()
         logger.info(f"Getting account from MongoDB with phone number: {phone_number}")
         acc = await cls._accounts.find_one({"phone_number": phone_number})
         if acc and '_id' in acc:
@@ -98,7 +152,7 @@ class MongoStorage():
     @classmethod
     @ensure_async
     async def update_account(cls, phone_number, update_data):
-        cls._init()
+        await cls._ensure_ready()
         logger.info(f"Upserting account {phone_number} in MongoDB with data: {update_data}")
         if not isinstance(update_data, dict):
             raise ValueError(f"update_data must be a dict mapping field names to values, got {type(update_data)}: {update_data}")
@@ -111,7 +165,7 @@ class MongoStorage():
     @classmethod
     @ensure_async
     async def delete_account(cls, phone_number):
-        cls._init()
+        await cls._ensure_ready()
         logger.info(f"Deleting account from MongoDB with phone number: {phone_number}")
         if hasattr(phone_number, 'phone_number'):
             phone_number = phone_number.phone_number
@@ -123,7 +177,7 @@ class MongoStorage():
     @classmethod
     @ensure_async
     async def load_all_posts(cls):
-        cls._init()
+        await cls._ensure_ready()
         logger.info("Loading all posts from MongoDB.")
         cursor = cls._posts.find()
         posts = []
@@ -137,7 +191,7 @@ class MongoStorage():
     @classmethod
     @ensure_async
     async def add_post(cls, post):
-        cls._init()
+        await cls._ensure_ready()
         logger.info(f"Adding post to MongoDB: {post}")
         if hasattr(post, 'to_dict'):
             post = post.to_dict()
@@ -166,7 +220,7 @@ class MongoStorage():
     @classmethod
     @ensure_async
     async def get_post(cls, post_id):
-        cls._init()
+        await cls._ensure_ready()
         logger.info(f"Getting post from MongoDB with post_id: {post_id}")
         post = await cls._posts.find_one({"post_id": post_id})
         if post and '_id' in post:
@@ -178,7 +232,7 @@ class MongoStorage():
     @classmethod
     @ensure_async
     async def update_post(cls, post_id, update_data):
-        cls._init()
+        await cls._ensure_ready()
         logger.info(f"Upserting post {post_id} in MongoDB with data: {update_data}")
         if not isinstance(update_data, dict):
             raise ValueError(f"update_data must be a dict mapping field names to values, got {type(update_data)}: {update_data}")
@@ -192,7 +246,7 @@ class MongoStorage():
     @classmethod
     @ensure_async
     async def delete_post(cls, post_id):
-        cls._init()
+        await cls._ensure_ready()
         logger.info(f"Deleting post from MongoDB with post_id: {post_id}")
         if hasattr(post_id, 'post_id'):
             post_id = post_id.post_id
@@ -204,7 +258,7 @@ class MongoStorage():
     @classmethod
     @ensure_async
     async def load_all_tasks(cls):
-        cls._init()
+        await cls._ensure_ready()
         logger.info("Loading all tasks from MongoDB.")
         cursor = cls._tasks.find().sort('updated_at', -1)
         tasks = []
@@ -240,7 +294,7 @@ class MongoStorage():
     @classmethod
     @ensure_async
     async def add_task(cls, task):
-        cls._init()
+        await cls._ensure_ready()
         logger.info(f"Adding task to MongoDB: {task}")
         if hasattr(task, 'to_dict'):
             task = task.to_dict()
@@ -268,7 +322,7 @@ class MongoStorage():
     @classmethod
     @ensure_async
     async def get_task(cls, task_id):
-        cls._init()
+        await cls._ensure_ready()
         logger.info(f"Getting task from MongoDB with task_id: {task_id}")
         task = await cls._tasks.find_one({"task_id": task_id})
         if task and '_id' in task:
@@ -280,7 +334,7 @@ class MongoStorage():
     @classmethod
     @ensure_async
     async def update_task(cls, task_id, update_data):
-        cls._init()
+        await cls._ensure_ready()
         logger.info(f"Upserting task {task_id} in MongoDB with data: {update_data}")
         if not isinstance(update_data, dict):
             raise ValueError(f"update_data must be a dict mapping field names to values, got {type(update_data)}: {update_data}")
@@ -294,13 +348,123 @@ class MongoStorage():
     @classmethod
     @ensure_async
     async def delete_task(cls, task_id):
-        cls._init()
+        await cls._ensure_ready()
         logger.info(f"Deleting task from MongoDB with task_id: {task_id}")
         if hasattr(task_id, 'task_id'):
             task_id = task_id.task_id
         result = await cls._tasks.delete_one({"task_id": task_id})
         logger.debug(f"Task {task_id} delete result: {result.deleted_count}")
         return result.deleted_count > 0
+
+    # --- User methods ---
+    @classmethod
+    @ensure_async
+    async def create_user(cls, user_data: dict):
+        """
+        Create a new user in the database.
+        
+        Args:
+            user_data: Dictionary containing user fields (username, password_hash, role, is_verified)
+            
+        Returns:
+            True if user created successfully, False otherwise
+        """
+        await cls._ensure_ready()
+        logger.info(f"Creating user in MongoDB: {user_data.get('username')}")
+        
+        # Check if user already exists
+        existing_user = await cls.get_user(user_data.get('username'))
+        if existing_user:
+            logger.warning(f"User {user_data.get('username')} already exists")
+            return False
+        
+        user_data.pop('_id', None)
+        await cls._users.insert_one(user_data)
+        logger.debug(f"User {user_data.get('username')} created successfully")
+        return True
+
+    @classmethod
+    @ensure_async
+    async def get_user(cls, username: str):
+        """
+        Get a user by username.
+        
+        Args:
+            username: Username to search for
+            
+        Returns:
+            User dictionary if found, None otherwise
+        """
+        await cls._ensure_ready()
+        logger.info(f"Getting user from MongoDB: {username}")
+        user = await cls._users.find_one({"username": username.lower()})
+        if user and '_id' in user:
+            user.pop('_id')
+        if user:
+            logger.debug(f"User found: {username}")
+        return user
+
+    @classmethod
+    @ensure_async
+    async def verify_user_credentials(cls, username: str, password: str) -> tuple[bool, dict | None]:
+        """
+        Verify user credentials.
+        
+        Args:
+            username: Username to verify
+            password: Plain text password to verify
+            
+        Returns:
+            Tuple of (success: bool, user_data: dict | None)
+        """
+        from encryption import verify_password
+        
+        await cls._ensure_ready()
+        logger.info(f"Verifying credentials for user: {username}")
+        
+        user = await cls.get_user(username)
+        if not user:
+            logger.warning(f"User {username} not found")
+            return False, None
+        
+        # Verify password
+        password_hash = user.get('password_hash')
+        if not password_hash:
+            logger.warning(f"User {username} has no password hash")
+            return False, None
+        
+        if not verify_password(password, password_hash):
+            logger.warning(f"Invalid password for user {username}")
+            return False, None
+        
+        logger.info(f"Credentials verified for user: {username}")
+        return True, user
+
+    @classmethod
+    @ensure_async
+    async def update_user(cls, username: str, update_data: dict):
+        """
+        Update user data.
+        
+        Args:
+            username: Username to update
+            update_data: Dictionary of fields to update
+            
+        Returns:
+            True if updated successfully, False otherwise
+        """
+        await cls._ensure_ready()
+        logger.info(f"Updating user {username} with data: {update_data}")
+        
+        update_data.pop('_id', None)
+        update_data.pop('username', None)  # Don't allow username changes
+        
+        result = await cls._users.update_one(
+            {"username": username.lower()},
+            {"$set": update_data}
+        )
+        logger.debug(f"User {username} update result: modified={result.modified_count}")
+        return result.modified_count > 0
 
 
 def get_db() -> MongoStorage:
