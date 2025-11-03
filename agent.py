@@ -155,9 +155,9 @@ class Client(object):
         except KeyError as e:
             raise ValueError(f"Missing key in account configuration: {e}")
         
-        self.active_emoji_palette = config.get('reactions_palettes', []).get('positive', [])  # Default emoji palette, is replaced automatically
-        if not self.active_emoji_palette:
-            raise ValueError("Emoji palette is empty in the configuration.")
+        # Active emoji palette will be set during task execution from database
+        self.active_emoji_palette = []
+        self.palette_ordered = False  # Whether to use emojis sequentially or randomly
         
         # Initialize proxy_name as None - will be set during connection
         self.proxy_name = None
@@ -633,8 +633,20 @@ class Client(object):
     # Basic actions
 
     async def _react(self, message, target_chat):
+        """
+        React to a message with an emoji from the active palette.
+        
+        Args:
+            message: Telethon message object
+            target_chat: Target chat entity
+        
+        Raises:
+            ValueError: If no valid emojis are available after filtering
+        """
         await self.ensure_connected()
-        if config.get('delays', {}).get('humanisation_level', 1) >= 1:  # If humanisation level is 1 it should consider reading time
+        
+        # Humanization delay
+        if config.get('delays', {}).get('humanisation_level', 1) >= 1:
             msg_content = await self.get_message_content(chat_id=target_chat.id if hasattr(target_chat, 'id') else target_chat, message_id=message.id)
             if not msg_content:
                 self.logger.warning("Message content is empty, skipping reaction.")
@@ -643,16 +655,127 @@ class Client(object):
             self.logger.debug(f"Estimated reading time: {reading_time} seconds")
             await asyncio.sleep(reading_time)
 
-        emoticon = random.choice(self.active_emoji_palette)
+        # Check for active emoji palette
+        if not self.active_emoji_palette:
+            error_msg = "No emoji palette configured for this client. Palette must be set before reacting."
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
 
-        await asyncio.sleep(random.uniform(0.5, 2))  # Simulate human-like delay and prevent spam
-
-        await self.client(SendReactionRequest(
-            peer=target_chat,
-            msg_id=message.id,
-            reaction=[types.ReactionEmoji(emoticon=emoticon)],
-            add_to_recent=True
-        ))
+        # Get allowed reactions from message (if explicitly restricted)
+        allowed_reactions = None
+        try:
+            # Fetch full message to get reactions attribute
+            full_message = await self.client.get_messages(target_chat, ids=message.id)
+            
+            if hasattr(full_message, 'reactions') and full_message.reactions:
+                # Check available_reactions if it exists (Telegram's list of allowed emojis)
+                if hasattr(full_message.reactions, 'available_reactions'):
+                    available_reactions_list = []
+                    for reaction in full_message.reactions.available_reactions:
+                        if hasattr(reaction, 'emoticon'):
+                            available_reactions_list.append(reaction.emoticon)
+                    
+                    if available_reactions_list:
+                        self.logger.debug(f"Message has restricted reactions: {available_reactions_list}")
+                        # If available_reactions exists, it means only these are allowed
+                        allowed_reactions = available_reactions_list
+            
+            if not allowed_reactions:
+                self.logger.debug("Message has no reaction restrictions - will try palette emojis")
+                
+        except Exception as e:
+            self.logger.warning(f"Could not fetch message reactions metadata: {e}. Will try palette emojis.")
+        
+        # Filter palette based on allowed reactions (only if explicitly restricted)
+        if allowed_reactions:
+            # Filter to only emojis that are in the allowed list
+            filtered_palette = [emoji for emoji in self.active_emoji_palette if emoji in allowed_reactions]
+            
+            if not filtered_palette:
+                # None of our palette emojis are in the allowed reactions
+                error_msg = f"None of the palette emojis {self.active_emoji_palette} are in allowed reactions {allowed_reactions}"
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
+            
+            self.logger.info(f"Filtered palette from {len(self.active_emoji_palette)} to {len(filtered_palette)} emojis based on allowed reactions")
+        else:
+            # No explicit restrictions - use full palette and rely on try-catch
+            filtered_palette = self.active_emoji_palette.copy()
+            self.logger.debug(f"Using full palette ({len(filtered_palette)} emojis) - will try until one works")
+        
+        if not filtered_palette:
+            error_msg = f"No valid emojis available after filtering. Palette: {self.active_emoji_palette}, Allowed: {allowed_reactions}"
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        # Simulate human-like delay before reacting
+        await asyncio.sleep(random.uniform(0.5, 2))
+        
+        # Try to send reaction
+        if self.palette_ordered:
+            # Ordered mode: try emojis in sequence until one succeeds
+            last_error = None
+            for idx, emoticon in enumerate(filtered_palette, 1):
+                try:
+                    self.logger.debug(f"Attempting emoji (ordered, rank {idx}/{len(filtered_palette)}): {emoticon}")
+                    await self.client(SendReactionRequest(
+                        peer=target_chat,
+                        msg_id=message.id,
+                        reaction=[types.ReactionEmoji(emoticon=emoticon)],
+                        add_to_recent=True
+                    ))
+                    self.logger.info(f"Successfully reacted with {emoticon} (rank {idx}/{len(filtered_palette)})")
+                    return  # Success - exit method
+                except errors.ReactionInvalidError as e:
+                    # This emoji is not allowed, try next one
+                    self.logger.warning(f"Emoji {emoticon} not allowed (rank {idx}/{len(filtered_palette)}): {e}")
+                    last_error = e
+                    if idx < len(filtered_palette):
+                        continue  # Try next emoji
+                    else:
+                        # No more emojis to try
+                        error_msg = f"All {len(filtered_palette)} emojis failed. Last error: {last_error}"
+                        self.logger.error(error_msg)
+                        raise ValueError(error_msg)
+                except Exception as e:
+                    # Other error - don't retry, raise immediately
+                    error_msg = f"Failed to send reaction {emoticon} to message {message.id}: {e}"
+                    self.logger.error(error_msg)
+                    raise RuntimeError(error_msg)
+        else:
+            # Random mode: try random emojis until one succeeds or all fail
+            # Shuffle palette to try in random order
+            shuffled_palette = filtered_palette.copy()
+            random.shuffle(shuffled_palette)
+            
+            last_error = None
+            for idx, emoticon in enumerate(shuffled_palette, 1):
+                try:
+                    self.logger.debug(f"Attempting emoji (random, attempt {idx}/{len(shuffled_palette)}): {emoticon}")
+                    await self.client(SendReactionRequest(
+                        peer=target_chat,
+                        msg_id=message.id,
+                        reaction=[types.ReactionEmoji(emoticon=emoticon)],
+                        add_to_recent=True
+                    ))
+                    self.logger.info(f"Successfully reacted with {emoticon} (attempt {idx}/{len(shuffled_palette)})")
+                    return  # Success - exit method
+                except errors.ReactionInvalidError as e:
+                    # This emoji is not allowed, try another random one
+                    self.logger.warning(f"Emoji {emoticon} not allowed (attempt {idx}/{len(shuffled_palette)}): {e}")
+                    last_error = e
+                    if idx < len(shuffled_palette):
+                        continue  # Try next random emoji
+                    else:
+                        # No more emojis to try
+                        error_msg = f"All {len(shuffled_palette)} emojis failed. Last error: {last_error}"
+                        self.logger.error(error_msg)
+                        raise ValueError(error_msg)
+                except Exception as e:
+                    # Other error - don't retry, raise immediately
+                    error_msg = f"Failed to send reaction {emoticon} to message {message.id}: {e}"
+                    self.logger.error(error_msg)
+                    raise RuntimeError(error_msg)
 
     async def _comment(self, message, target_chat, content):
         await self.ensure_connected()
@@ -788,8 +911,15 @@ class Client(object):
                     raise
 
     async def react(self, message_id:int=None, chat_id:str=None, message_link:str=None):
-        """React to a message by its ID in a specific chat."""
-        retries = config.get('delays', {}).get('action_retries', 3)
+        """
+        React to a message by its ID in a specific chat.
+        
+        Args:
+            message_id: Telegram message ID
+            chat_id: Telegram chat ID
+            message_link: Telegram message link (alternative to message_id + chat_id)
+        """
+        retries = config.get('delays', {}).get('action_retries', 1)
         delay = config.get('delays', {}).get('action_retry_delay', 3)
         attempt = 0
         while attempt < retries:

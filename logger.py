@@ -1,4 +1,4 @@
-import logging, time, sys, os, yaml, multiprocessing, threading, traceback, inspect
+import logging, time, sys, os, yaml, multiprocessing, threading, traceback, inspect, copy
 from asyncio import CancelledError
 from functools import wraps
 from logging.handlers import QueueHandler, QueueListener
@@ -72,6 +72,57 @@ class CustomFormatter(logging.Formatter):
                 # Ultimate fallback
                 return f"LOGGING_FORMAT_ERROR: {str(record.msg)} (original error: {str(e)})"
 
+class SafeConsoleFormatter(CustomFormatter):
+    """
+    Formatter that forcefully casts string data to safe UTF representation
+    before formatting for console output, without mutating the original record.
+    """
+    def format(self, record):
+        # Work on a shallow copy so original record stays unchanged
+        rec = copy.copy(record)
+        try:
+            # Ensure message is a str; decode bytes to utf-8 with replacement
+            if isinstance(rec.msg, (bytes, bytearray)):
+                rec.msg = rec.msg.decode('utf-8', errors='replace')
+            else:
+                rec.msg = str(rec.msg)
+        except Exception:
+            pass
+
+        try:
+            # Normalize args to strings, preserving mapping or sequence shape
+            if rec.args:
+                if isinstance(rec.args, dict):
+                    safe_args = {}
+                    for k, v in rec.args.items():
+                        if isinstance(v, (bytes, bytearray)):
+                            safe_args[k] = v.decode('utf-8', errors='replace')
+                        else:
+                            safe_args[k] = str(v)
+                    rec.args = safe_args
+                else:
+                    safe_args = []
+                    for v in rec.args:
+                        if isinstance(v, (bytes, bytearray)):
+                            safe_args.append(v.decode('utf-8', errors='replace'))
+                        else:
+                            safe_args.append(str(v))
+                    rec.args = tuple(safe_args)
+        except Exception:
+            pass
+
+        # Also ensure record.getMessage() won't fail due to non-str parts
+        try:
+            # Precompute message so custom format uses safe string
+            rec.message = rec.getMessage()
+        except Exception:
+            try:
+                rec.message = str(rec.msg)
+            except Exception:
+                rec.message = "<unrepresentable message>"
+
+        return super().format(rec)
+
 class BufferingHandler(logging.Handler):
     """
     Handler that stores log records in a per-process buffer for crash reporting.
@@ -116,12 +167,18 @@ def _make_handlers(log_file):
     formatter.converter = lambda *args: time.localtime(*args)
     formatter.default_time_format = '%Y-%m-%d %H:%M:%S'
     formatter.default_msec_format = ''
-    file_handler = logging.FileHandler(file_path)
+    # Ensure file handler writes in utf-8
+    file_handler = logging.FileHandler(file_path, encoding='utf-8')
     file_handler.setFormatter(formatter)
     handlers.append(file_handler)
     if CONSOLE_LOG:
+        # Use SafeConsoleFormatter for console output to avoid non-UTF problems
+        console_formatter = SafeConsoleFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        console_formatter.converter = formatter.converter
+        console_formatter.default_time_format = formatter.default_time_format
+        console_formatter.default_msec_format = formatter.default_msec_format
         console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(formatter)
+        console_handler.setFormatter(console_formatter)
         handlers.append(console_handler)
     buffer_handler = BufferingHandler()
     buffer_handler.setFormatter(formatter)

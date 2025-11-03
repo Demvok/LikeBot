@@ -215,17 +215,36 @@ class Task:
         """Get the palette for react action, if present, else None."""
         return self.get_action().get('palette', None)
 
-    def get_reaction_emojis(self):
-        """Get emojis for a specific action type and palette from config."""
+    async def get_reaction_emojis(self):
+        """
+        Get emojis for a specific action type and palette from database.
+        
+        Returns:
+            Tuple of (list of emoji strings, ordered flag)
+            
+        Raises:
+            ValueError: If palette not found in database
+        """
+        from database import get_db
+        
         palette = self.get_reaction_palette_name()
-        if palette == 'positive':
-            return config.get('reactions_palettes', {}).get('positive', [])
-        elif palette == 'negative':
-            return config.get('reactions_palettes', {}).get('negative', [])
-        elif palette is None:
-            return []
-        else:
-            raise ValueError(f"Unknown reaction palette: {palette}")
+        if palette is None:
+            return [], False
+        
+        db = get_db()
+        palette_data = await db.get_palette(palette)
+        
+        if not palette_data:
+            raise ValueError(f"Reaction palette '{palette}' not found in database. Please run migrate_palettes.py to create it.")
+        
+        emojis = palette_data.get('emojis', [])
+        if not emojis:
+            raise ValueError(f"Reaction palette '{palette}' exists but has no emojis configured.")
+        
+        ordered = palette_data.get('ordered', False)
+        
+        self.logger.debug(f"Loaded palette '{palette}' from database with {len(emojis)} emojis, ordered={ordered}")
+        return emojis, ordered
 
     async def _update_status(self):
         from database import get_db
@@ -369,7 +388,14 @@ class Task:
         await reporter.event(run_id, self.task_id, "INFO", "info.worker", f"Worker started for client {client.phone_number}")
         if self.get_action_type() == 'react':
             await reporter.event(run_id, self.task_id, "DEBUG", "info.worker.action", "Worker proceeds to reacting")
-            client.active_emoji_palette = self.get_reaction_emojis()
+            
+            # Get palette emojis and ordering flag, then set on client
+            emojis, palette_ordered = await self.get_reaction_emojis()
+            client.active_emoji_palette = emojis
+            client.palette_ordered = palette_ordered
+            
+            self.logger.debug(f"Client {client.phone_number} using palette with {len(emojis)} emojis, ordered={palette_ordered}")
+            
             retries = config.get('delays', {}).get('action_retries', 5)
             for post in posts:
                 client = await self._check_pause_single(client, reporter, run_id)  # Check pause before each post

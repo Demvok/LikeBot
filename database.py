@@ -58,6 +58,7 @@ class MongoStorage():
     _events = None
     _runs = None
     _proxies = None
+    _palettes = None
     _client: Optional[AsyncIOMotorClient] = None
     _indexes_initialized = False
     _index_lock: Optional[asyncio.Lock] = None
@@ -84,6 +85,7 @@ class MongoStorage():
         cls._tasks = cls._db["tasks"]
         cls._users = cls._db["users"]
         cls._proxies = cls._db["proxies"]
+        cls._palettes = cls._db["reaction_palettes"]
         
         # Reporter collections with write concerns
         from pymongo.write_concern import WriteConcern
@@ -1227,6 +1229,182 @@ class MongoStorage():
             }}
         )
         return result.modified_count > 0
+
+    # --- Reaction Palette methods ---
+    @classmethod
+    @ensure_async
+    async def add_palette(cls, palette_data: dict):
+        """
+        Add a new reaction palette to the database.
+        
+        Args:
+            palette_data: Dictionary containing palette fields (palette_name, emojis, ordered, description)
+            
+        Returns:
+            True if palette added successfully, False if already exists
+        """
+        await cls._ensure_ready()
+        logger.info(f"Adding palette to MongoDB: {palette_data.get('palette_name')}")
+        
+        palette_name = palette_data.get('palette_name')
+        if not palette_name:
+            logger.error("Palette name is required")
+            return False
+        
+        # Check if palette already exists
+        existing_palette = await cls.get_palette(palette_name)
+        if existing_palette:
+            logger.warning(f"Palette {palette_name} already exists")
+            return False
+        
+        palette_data.pop('_id', None)
+        
+        # Ensure timestamps
+        from datetime import datetime, timezone
+        if 'created_at' not in palette_data:
+            palette_data['created_at'] = datetime.now(timezone.utc)
+        if 'updated_at' not in palette_data:
+            palette_data['updated_at'] = datetime.now(timezone.utc)
+        
+        await cls._palettes.insert_one(palette_data)
+        logger.debug(f"Palette {palette_name} added to MongoDB")
+        return True
+
+    @classmethod
+    @ensure_async
+    async def get_palette(cls, palette_name: str):
+        """
+        Get a reaction palette by name.
+        
+        Args:
+            palette_name: Palette name to search for
+            
+        Returns:
+            Palette dictionary if found, None otherwise
+        """
+        await cls._ensure_ready()
+        logger.info(f"Getting palette from MongoDB: {palette_name}")
+        
+        palette = await cls._palettes.find_one({"palette_name": palette_name.lower()})
+        if palette and '_id' in palette:
+            del palette['_id']
+        
+        return palette
+
+    @classmethod
+    @ensure_async
+    async def get_all_palettes(cls):
+        """
+        Get all reaction palettes.
+        
+        Returns:
+            List of palette dictionaries
+        """
+        await cls._ensure_ready()
+        logger.info("Getting all palettes from MongoDB")
+        
+        cursor = cls._palettes.find()
+        palettes = []
+        async for palette in cursor:
+            if '_id' in palette:
+                del palette['_id']
+            palettes.append(palette)
+        
+        logger.debug(f"Found {len(palettes)} palettes")
+        return palettes
+
+    @classmethod
+    @ensure_async
+    async def update_palette(cls, palette_name: str, update_data: dict):
+        """
+        Update a reaction palette.
+        
+        Args:
+            palette_name: Palette name to update
+            update_data: Dictionary of fields to update
+            
+        Returns:
+            True if updated successfully, False otherwise
+        """
+        await cls._ensure_ready()
+        logger.info(f"Updating palette {palette_name} with data: {update_data}")
+        
+        update_data.pop('_id', None)
+        update_data.pop('palette_name', None)  # Don't allow name changes
+        
+        # Update timestamp
+        from datetime import datetime, timezone
+        update_data['updated_at'] = datetime.now(timezone.utc)
+        
+        result = await cls._palettes.update_one(
+            {"palette_name": palette_name.lower()},
+            {"$set": update_data}
+        )
+        
+        logger.debug(f"Palette {palette_name} update result: modified={result.modified_count}")
+        return result.modified_count > 0
+
+    @classmethod
+    @ensure_async
+    async def delete_palette(cls, palette_name: str):
+        """
+        Delete a reaction palette.
+        
+        Args:
+            palette_name: Palette name to delete
+            
+        Returns:
+            True if deleted successfully, False otherwise
+        """
+        await cls._ensure_ready()
+        logger.info(f"Deleting palette from MongoDB: {palette_name}")
+        
+        result = await cls._palettes.delete_one({"palette_name": palette_name.lower()})
+        logger.debug(f"Palette {palette_name} delete result: {result.deleted_count}")
+        return result.deleted_count > 0
+
+    @classmethod
+    @ensure_async
+    async def ensure_default_palettes(cls, palettes_data: dict = None):
+        """
+        Ensure default reaction palettes exist in the database.
+        Creates palettes from provided data if they don't exist.
+        
+        Args:
+            palettes_data: Optional dict mapping palette names to emoji lists
+                          Format: {'positive': ['👍', '❤️'], 'negative': ['👎', '💩']}
+                          If None, no palettes will be created.
+        
+        Returns:
+            Number of default palettes created
+        """
+        await cls._ensure_ready()
+        logger.info("Ensuring default reaction palettes exist")
+        
+        from datetime import datetime, timezone
+        created_count = 0
+        
+        if not palettes_data:
+            logger.warning("No palette data provided to ensure_default_palettes")
+            return 0
+        
+        for palette_name, emojis in palettes_data.items():
+            existing = await cls.get_palette(palette_name)
+            if not existing:
+                palette_data = {
+                    'palette_name': palette_name.lower(),
+                    'emojis': emojis,
+                    'ordered': False,  # Default to random selection
+                    'description': f"Default {palette_name} reactions palette",
+                    'created_at': datetime.now(timezone.utc),
+                    'updated_at': datetime.now(timezone.utc)
+                }
+                await cls.add_palette(palette_data)
+                logger.info(f"Created default palette: {palette_name}")
+                created_count += 1
+        
+        logger.debug(f"Ensured {created_count} default palettes")
+        return created_count
 
 
 def get_db() -> MongoStorage:

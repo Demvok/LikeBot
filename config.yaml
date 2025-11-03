@@ -12,19 +12,6 @@ database:
   batch_size: 100  # Number of events to batch before writing to DB
   batch_timeout: 0.5  # Timeout for batch flushing
 
-reactions_palettes:
-  positive:
-    - "👍"
-    - "❤️"
-    - "🔥"
-  negative:
-    - "👎"
-    - "😡"
-    - "🤬"
-    - "🤮"
-    - "💩"
-    - "🤡"
-
 proxy:
   mode: "soft"  # "strict" or "soft" - strict fails on proxy error, soft falls back to no proxy
 
@@ -37,5 +24,5 @@ delays:
   session_creation_retries: 2  # Number of retries for creating new session (code input attempts)
   connection_retries: 5  # Number of connection retries
   reconnect_delay: 3  # Delay between reconnection attempts
-  action_retries: 3  # Number of retries for actions
+  action_retries: 1  # Number of retries for actions
   action_retry_delay: 2  # Delay between action retries
