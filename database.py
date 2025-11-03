@@ -57,6 +57,7 @@ class MongoStorage():
     _users = None
     _events = None
     _runs = None
+    _proxies = None
     _client: Optional[AsyncIOMotorClient] = None
     _indexes_initialized = False
     _index_lock: Optional[asyncio.Lock] = None
@@ -82,6 +83,7 @@ class MongoStorage():
         cls._posts = cls._db["posts"]
         cls._tasks = cls._db["tasks"]
         cls._users = cls._db["users"]
+        cls._proxies = cls._db["proxies"]
         
         # Reporter collections with write concerns
         from pymongo.write_concern import WriteConcern
@@ -114,14 +116,18 @@ class MongoStorage():
                 raise RuntimeError("MongoDB server unavailable. Check 'db_url' and database connectivity.") from exc
 
             try:
+                # Import pymongo constants first
+                from pymongo import ASCENDING, IndexModel
+                
                 await cls._accounts.create_index("phone_number", unique=True, name="ux_accounts_phone")
                 await cls._accounts.create_index("account_id", unique=True, sparse=True, name="ux_accounts_account_id")
                 await cls._posts.create_index("post_id", unique=True, name="ux_posts_post_id")
                 await cls._tasks.create_index("task_id", unique=True, name="ux_tasks_task_id")
                 await cls._users.create_index("username", unique=True, name="ux_users_username")
+                await cls._proxies.create_index("proxy_name", unique=True, name="ux_proxies_proxy_name")
+                await cls._proxies.create_index([("active", ASCENDING), ("connected_accounts", ASCENDING)], name="ix_proxies_active_usage")
                 
                 # Reporter collection indexes
-                from pymongo import ASCENDING, IndexModel
                 await cls._runs.create_index([("run_id", ASCENDING)], unique=True, name="ux_runs_run_id")
                 await cls._events.create_indexes([
                     IndexModel([("run_id", ASCENDING), ("ts", ASCENDING)], name="ix_events_run_ts"),
@@ -890,6 +896,337 @@ class MongoStorage():
         count = await cls._users.count_documents({"role": "admin", "is_verified": True})
         logger.debug(f"Found {count} verified admin users")
         return count
+
+    # --- Proxy methods ---
+    @classmethod
+    @ensure_async
+    async def add_proxy(cls, proxy_data: dict):
+        """
+        Add a new proxy configuration to the database.
+
+        Args:
+            proxy_data: Dictionary describing the proxy to add.
+
+        Required fields:
+            - proxy_name (str): unique, non-empty identifier for the proxy (used as the primary key).
+            - host (str): proxy hostname or IP address (used as 'addr' in internal proxy dict). Practically required.
+            - port (int): proxy port. Practically required.
+
+        Optional fields (and defaults expected by _build_proxy_dict):
+            - type (str): one of "socks5", "socks4", "http" (case-insensitive). Defaults to "socks5".
+            - rdns (bool): whether to resolve DNS remotely. Defaults to True.
+            - username (str): authentication username.
+            - password (str): authentication password.
+            - connected_accounts (int): connection count (defaults to 0).
+            - active (bool): whether proxy is active (defaults to True).
+            - Any other metadata keys (tags, notes, ssl, timeout, retries, created_at, updated_at, etc.) may be present.
+
+        Returns:
+            True if the proxy was added successfully, False on missing required fields, duplicate proxy_name,
+            or insertion failure.
+        """
+        await cls._ensure_ready()
+        logger.info(f"Adding proxy to MongoDB: {proxy_data.get('proxy_name')}")
+        
+        proxy_name = proxy_data.get('proxy_name')
+        if not proxy_name:
+            logger.error("Proxy name is required")
+            return False
+        
+        # Check if proxy already exists
+        existing_proxy = await cls.get_proxy(proxy_name)
+        if existing_proxy:
+            logger.warning(f"Proxy {proxy_name} already exists")
+            return False
+        
+        # Encrypt password if provided
+        if proxy_data.get('password'):
+            from encryption import encrypt_secret, PURPOSE_PROXY_PASSWORD
+            logger.debug(f"Encrypting password for proxy {proxy_name}")
+            proxy_data['password_encrypted'] = encrypt_secret(proxy_data['password'], PURPOSE_PROXY_PASSWORD)
+            proxy_data.pop('password')  # Remove plain password
+        
+        # Set default values
+        proxy_data.setdefault('connected_accounts', 0)
+        proxy_data.setdefault('active', True)
+        proxy_data.setdefault('rdns', True)
+        
+        proxy_data.pop('_id', None)
+        await cls._proxies.insert_one(proxy_data)
+        logger.debug(f"Proxy {proxy_name} added to MongoDB")
+        return True
+
+    @classmethod
+    @ensure_async
+    async def get_proxy(cls, proxy_name: str):
+        """
+        Get a proxy by name and decrypt password if present.
+        
+        Args:
+            proxy_name: Proxy name to search for
+            
+        Returns:
+            Proxy dictionary if found (with decrypted password), None otherwise
+        """
+        from encryption import decrypt_secret, PURPOSE_PROXY_PASSWORD
+        
+        await cls._ensure_ready()
+        logger.info(f"Getting proxy from MongoDB: {proxy_name}")
+        proxy = await cls._proxies.find_one({"proxy_name": proxy_name})
+        if proxy and '_id' in proxy:
+            proxy.pop('_id')
+        
+        # Decrypt password if present
+        if proxy and proxy.get('password_encrypted'):
+            try:
+                proxy['password'] = decrypt_secret(proxy['password_encrypted'], PURPOSE_PROXY_PASSWORD)
+                logger.debug(f"Decrypted password for proxy {proxy_name}")
+            except Exception as e:
+                logger.error(f"Failed to decrypt password for proxy {proxy_name}: {e}")
+                proxy['password'] = None
+        
+        return proxy
+
+    @classmethod
+    @ensure_async
+    async def get_all_proxies(cls):
+        """
+        Get all proxies from the database with decrypted passwords.
+        
+        Returns:
+            List of proxy dictionaries (with decrypted passwords)
+        """
+        from encryption import decrypt_secret, PURPOSE_PROXY_PASSWORD
+        
+        await cls._ensure_ready()
+        logger.info("Loading all proxies from MongoDB")
+        cursor = cls._proxies.find()
+        proxies = []
+        async for proxy in cursor:
+            proxy.pop('_id', None)
+            
+            # Decrypt password if present
+            if proxy.get('password_encrypted'):
+                try:
+                    proxy['password'] = decrypt_secret(proxy['password_encrypted'], PURPOSE_PROXY_PASSWORD)
+                except Exception as e:
+                    logger.error(f"Failed to decrypt password for proxy {proxy.get('proxy_name')}: {e}")
+                    proxy['password'] = None
+            
+            proxies.append(proxy)
+        logger.debug(f"Loaded {len(proxies)} proxies from MongoDB")
+        return proxies
+
+    @classmethod
+    @ensure_async
+    async def get_active_proxies(cls):
+        """
+        Get all active proxies from the database with decrypted passwords.
+        
+        Returns:
+            List of active proxy dictionaries (with decrypted passwords)
+        """
+        from encryption import decrypt_secret, PURPOSE_PROXY_PASSWORD
+        
+        await cls._ensure_ready()
+        logger.info("Loading active proxies from MongoDB")
+        cursor = cls._proxies.find({"active": True})
+        proxies = []
+        async for proxy in cursor:
+            proxy.pop('_id', None)
+            
+            # Decrypt password if present
+            if proxy.get('password_encrypted'):
+                try:
+                    proxy['password'] = decrypt_secret(proxy['password_encrypted'], PURPOSE_PROXY_PASSWORD)
+                except Exception as e:
+                    logger.error(f"Failed to decrypt password for proxy {proxy.get('proxy_name')}: {e}")
+                    proxy['password'] = None
+            
+            proxies.append(proxy)
+        logger.debug(f"Loaded {len(proxies)} active proxies from MongoDB")
+        return proxies
+
+    @classmethod
+    @ensure_async
+    async def get_least_used_proxy(cls):
+        """
+        Get the active proxy with the least number of connected accounts (with decrypted password).
+        
+        Returns:
+            Proxy dictionary if found (with decrypted password), None otherwise
+        """
+        from encryption import decrypt_secret, PURPOSE_PROXY_PASSWORD
+        
+        await cls._ensure_ready()
+        logger.info("Getting least used active proxy from MongoDB")
+        
+        # Find active proxies sorted by connected_accounts ascending
+        cursor = cls._proxies.find({"active": True}).sort("connected_accounts", 1).limit(1)
+        proxy = await cursor.to_list(length=1)
+        
+        if proxy:
+            proxy = proxy[0]
+            proxy.pop('_id', None)
+            
+            # Decrypt password if present
+            if proxy.get('password_encrypted'):
+                try:
+                    proxy['password'] = decrypt_secret(proxy['password_encrypted'], PURPOSE_PROXY_PASSWORD)
+                except Exception as e:
+                    logger.error(f"Failed to decrypt password for proxy {proxy.get('proxy_name')}: {e}")
+                    proxy['password'] = None
+            
+            logger.debug(f"Found least used proxy: {proxy.get('proxy_name')} with {proxy.get('connected_accounts', 0)} connections")
+            return proxy
+        
+        logger.warning("No active proxies found")
+        return None
+
+    @classmethod
+    @ensure_async
+    async def update_proxy(cls, proxy_name: str, update_data: dict):
+        """
+        Update proxy configuration. Encrypts password if provided.
+        
+        Args:
+            proxy_name: Proxy name to update
+            update_data: Dictionary of fields to update (password will be encrypted)
+            
+        Returns:
+            True if updated successfully, False otherwise
+        """
+        await cls._ensure_ready()
+        logger.info(f"Updating proxy {proxy_name} with data: {update_data}")
+        
+        update_data.pop('_id', None)
+        update_data.pop('proxy_name', None)  # Don't allow proxy_name changes
+        
+        # Encrypt password if provided
+        if update_data.get('password'):
+            from encryption import encrypt_secret, PURPOSE_PROXY_PASSWORD
+            logger.debug(f"Encrypting new password for proxy {proxy_name}")
+            update_data['password_encrypted'] = encrypt_secret(update_data['password'], PURPOSE_PROXY_PASSWORD)
+            update_data.pop('password')  # Remove plain password
+        
+        result = await cls._proxies.update_one(
+            {"proxy_name": proxy_name},
+            {"$set": update_data}
+        )
+        logger.debug(f"Proxy {proxy_name} update result: modified={result.modified_count}")
+        return result.modified_count > 0
+
+    @classmethod
+    @ensure_async
+    async def increment_proxy_usage(cls, proxy_name: str):
+        """
+        Increment the connected_accounts counter for a proxy.
+        
+        Args:
+            proxy_name: Proxy name to increment
+            
+        Returns:
+            True if incremented successfully, False otherwise
+        """
+        await cls._ensure_ready()
+        logger.debug(f"Incrementing usage for proxy {proxy_name}")
+        
+        result = await cls._proxies.update_one(
+            {"proxy_name": proxy_name},
+            {"$inc": {"connected_accounts": 1}}
+        )
+        return result.modified_count > 0
+
+    @classmethod
+    @ensure_async
+    async def decrement_proxy_usage(cls, proxy_name: str):
+        """
+        Decrement the connected_accounts counter for a proxy.
+        
+        Args:
+            proxy_name: Proxy name to decrement
+            
+        Returns:
+            True if decremented successfully, False otherwise
+        """
+        await cls._ensure_ready()
+        logger.debug(f"Decrementing usage for proxy {proxy_name}")
+        
+        result = await cls._proxies.update_one(
+            {"proxy_name": proxy_name},
+            {"$inc": {"connected_accounts": -1}}
+        )
+        return result.modified_count > 0
+
+    @classmethod
+    @ensure_async
+    async def delete_proxy(cls, proxy_name: str):
+        """
+        Delete a proxy from the database.
+        
+        Args:
+            proxy_name: Proxy name to delete
+            
+        Returns:
+            True if deleted successfully, False otherwise
+        """
+        await cls._ensure_ready()
+        logger.info(f"Deleting proxy from MongoDB: {proxy_name}")
+        
+        result = await cls._proxies.delete_one({"proxy_name": proxy_name})
+        logger.debug(f"Proxy {proxy_name} delete result: {result.deleted_count}")
+        return result.deleted_count > 0
+
+    @classmethod
+    @ensure_async
+    async def set_proxy_error(cls, proxy_name: str, error_message: str):
+        """
+        Set error status on a proxy when connection fails.
+        
+        Args:
+            proxy_name: Proxy name to update
+            error_message: Error message to store
+            
+        Returns:
+            True if updated successfully, False otherwise
+        """
+        from datetime import datetime, timezone
+        
+        await cls._ensure_ready()
+        logger.warning(f"Setting error status for proxy {proxy_name}: {error_message}")
+        
+        result = await cls._proxies.update_one(
+            {"proxy_name": proxy_name},
+            {"$set": {
+                "last_error": error_message,
+                "last_error_time": datetime.now(timezone.utc)
+            }}
+        )
+        return result.modified_count > 0
+
+    @classmethod
+    @ensure_async
+    async def clear_proxy_error(cls, proxy_name: str):
+        """
+        Clear error status on a proxy after successful connection.
+        
+        Args:
+            proxy_name: Proxy name to update
+            
+        Returns:
+            True if updated successfully, False otherwise
+        """
+        await cls._ensure_ready()
+        logger.debug(f"Clearing error status for proxy {proxy_name}")
+        
+        result = await cls._proxies.update_one(
+            {"proxy_name": proxy_name},
+            {"$unset": {
+                "last_error": "",
+                "last_error_time": ""
+            }}
+        )
+        return result.modified_count > 0
 
 
 def get_db() -> MongoStorage:

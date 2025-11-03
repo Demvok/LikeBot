@@ -7,7 +7,6 @@
 
 - add reaction precondition (exists in chat) check
 - ensure views on posts correct counting
-- implement proxy logic (import, status, links to accounts)
 
 - add neccessary filtering on db loading, not loading all and filtering
 
@@ -19,8 +18,7 @@
 
 ### v.1.0.3
 - secondary database usage moved to `database.py`
-- 
-
+- implemented proxy logic with password encryption
 
 ### v.1.0.2
 - added auth in API endpoints

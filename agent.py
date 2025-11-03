@@ -159,6 +159,9 @@ class Client(object):
         if not self.active_emoji_palette:
             raise ValueError("Emoji palette is empty in the configuration.")
         
+        # Initialize proxy_name as None - will be set during connection
+        self.proxy_name = None
+        
         self.logger = setup_logger(f"{self.phone_number}", f"accounts/account_{self.phone_number}.log")
         self.logger.info(f"Initializing client for {self.phone_number}. Awaiting connection...")
         self.client = None
@@ -190,6 +193,83 @@ class Client(object):
         # For now, we will just ask the user to input the code manually
         code = input(f'Enter the verification code for {self.phone_number}: ').strip()
         return code
+
+    async def _get_proxy_config(self):
+        """
+        Get proxy configuration for this connection.
+        Selects the least-used active proxy for load balancing.
+        Returns a tuple (proxy_dict, proxy_config) where:
+        - proxy_dict is the telethon proxy configuration dict or None
+        - proxy_config is the raw proxy data from database
+        """
+        from database import get_db
+        db = get_db()
+        
+        # Get least used active proxy (balances on every connection)
+        proxy_data = await db.get_least_used_proxy()
+        if not proxy_data:
+            self.logger.info("No active proxies available, connecting without proxy")
+            return None, None
+        
+        # Store proxy name for usage tracking (not a permanent assignment)
+        self.proxy_name = proxy_data.get('proxy_name')
+        self.logger.info(f"Selected proxy {self.proxy_name} for {self.phone_number} (current usage: {proxy_data.get('connected_accounts', 0)})")
+        
+        return self._build_proxy_dict(proxy_data), proxy_data
+    
+    def _build_proxy_dict(self, proxy_data):
+        """
+        Build a telethon-compatible proxy configuration dictionary.
+        
+        Args:
+            proxy_data: Proxy data from database
+            
+        Returns:
+            Dictionary compatible with TelegramClient proxy parameter
+        """
+        if not proxy_data:
+            return None
+        
+        try:
+            import socks  # PySocks, installed as dependency of telethon
+        except ImportError:
+            self.logger.error("PySocks not installed. Install with: pip install PySocks")
+            return None
+        
+        # Map proxy type string to socks constant
+        proxy_type_map = {
+            'socks5': socks.SOCKS5,
+            'socks4': socks.SOCKS4,
+            'http': socks.HTTP
+        }
+        
+        proxy_type = proxy_data.get('type', 'socks5').lower()
+        if proxy_type not in proxy_type_map:
+            self.logger.error(f"Unsupported proxy type: {proxy_type}")
+            return None
+        
+        # Ensure port is an integer
+        try:
+            port = int(proxy_data.get('port'))
+        except (ValueError, TypeError) as e:
+            self.logger.error(f"Invalid port value: {proxy_data.get('port')} - {e}")
+            return None
+        
+        proxy_dict = {
+            'proxy_type': proxy_type_map[proxy_type],
+            'addr': proxy_data.get('host'),
+            'port': port,
+            'rdns': proxy_data.get('rdns', True)
+        }
+        
+        # Add credentials if provided
+        if proxy_data.get('username'):
+            proxy_dict['username'] = proxy_data.get('username')
+        if proxy_data.get('password'):
+            proxy_dict['password'] = proxy_data.get('password')
+        
+        self.logger.debug(f"Built proxy config: {proxy_type}://{proxy_dict['addr']}:{proxy_dict['port']}")
+        return proxy_dict
 
     async def _get_session(self, force_new=False):
         if self.session_encrypted and not force_new:
@@ -288,8 +368,13 @@ class Client(object):
         retries = config.get('delays', {}).get('connection_retries', 5)
         delay = config.get('delays', {}).get('reconnect_delay', 3)
         
+        # Proxy configuration
+        proxy_mode = config.get('proxy', {}).get('mode', 'soft')  # 'strict' or 'soft'
+        
         session_created = False
         force_new_session = False
+        proxy_assigned = False
+        proxy_failed = False
         
         for attempt in range(1, retries + 1):
             try:    
@@ -304,17 +389,70 @@ class Client(object):
                         # Don't retry session creation here - it has its own retry logic
                         raise
                 
-                self.client = TelegramClient(
-                    session=session,
-                    api_id=api_id,
-                    api_hash=api_hash 
-                    # Add proxy logic here
-                )                
-                if not self.client:
-                    raise ValueError("TelegramClient is not initialized.")
+                # Get proxy configuration (skip if proxy already failed in strict mode)
+                if proxy_mode == 'strict' and proxy_failed:
+                    raise ConnectionError("Strict proxy mode: Proxy connection failed, cannot proceed")
+                
+                # Get proxy (or None if soft mode and proxy previously failed)
+                if proxy_failed and proxy_mode == 'soft':
+                    proxy_dict, proxy_data = None, None
+                    self.logger.info(f"Connecting without proxy (fallback after proxy failure)")
+                else:
+                    proxy_dict, proxy_data = await self._get_proxy_config()
+                    if proxy_dict:
+                        self.logger.info(f"Connecting with proxy: {proxy_data.get('proxy_name')}")
+                    else:
+                        self.logger.info(f"Connecting without proxy")
+                
+                try:
+                    self.client = TelegramClient(
+                        session=session,
+                        api_id=api_id,
+                        api_hash=api_hash,
+                        proxy=proxy_dict
+                    )                
+                    if not self.client:
+                        raise ValueError("TelegramClient is not initialized.")
 
-                self.logger.debug(f"Starting client for {self.phone_number}...")
-                await self.client.connect()
+                    self.logger.debug(f"Starting client for {self.phone_number}...")
+                    await self.client.connect()
+                    
+                    # Connection successful - clear proxy error if using proxy
+                    if proxy_data:
+                        from database import get_db
+                        db = get_db()
+                        await db.clear_proxy_error(proxy_data.get('proxy_name'))
+                        
+                        # Increment proxy usage counter
+                        if not proxy_assigned:
+                            await db.increment_proxy_usage(proxy_data.get('proxy_name'))
+                            proxy_assigned = True
+                            self.logger.debug(f"Incremented usage counter for proxy {proxy_data.get('proxy_name')}")
+                    
+                except (OSError, TimeoutError, ConnectionError) as proxy_error:
+                    # Connection failed - could be proxy-related
+                    if proxy_data:
+                        error_msg = f"Proxy connection failed: {type(proxy_error).__name__}: {str(proxy_error)}"
+                        self.logger.warning(error_msg)
+                        
+                        # Update proxy error in database
+                        from database import get_db
+                        db = get_db()
+                        await db.set_proxy_error(proxy_data.get('proxy_name'), error_msg)
+                        
+                        # Mark proxy as failed
+                        proxy_failed = True
+                        
+                        if proxy_mode == 'strict':
+                            self.logger.error("Strict proxy mode: Proxy connection failed")
+                            raise ConnectionError(f"Strict mode - proxy failed: {error_msg}")
+                        else:  # soft mode
+                            self.logger.warning("Soft proxy mode: Will retry without proxy")
+                            # Will retry in next iteration without proxy
+                            continue
+                    else:
+                        # No proxy was used, propagate the error
+                        raise
                 
                 # Verify the session is still valid
                 try:
@@ -335,6 +473,13 @@ class Client(object):
                     })
                     
                     await self.client.disconnect()
+                    
+                    # Decrement proxy usage if it was incremented
+                    if proxy_assigned and proxy_data:
+                        await db.decrement_proxy_usage(proxy_data.get('proxy_name'))
+                        proxy_assigned = False
+                        self.logger.debug(f"Decremented usage counter for proxy {proxy_data.get('proxy_name')}")
+                    
                     continue  # Retry with new session
                 except errors.UserDeactivatedError:
                     self.logger.error(f"Account {self.phone_number} has been deactivated.")
@@ -372,6 +517,16 @@ class Client(object):
             try:
                 await self.client.disconnect()
                 self.logger.info(f"Client for {self.phone_number} disconnected.")
+                
+                # Decrement proxy usage counter if a proxy was used
+                if self.proxy_name:
+                    from database import get_db
+                    db = get_db()
+                    await db.decrement_proxy_usage(self.proxy_name)
+                    self.logger.debug(f"Decremented usage counter for proxy {self.proxy_name}")
+                    # Clear proxy name after disconnecting
+                    self.proxy_name = None
+                
                 break
             except Exception as e:
                 attempt += 1
