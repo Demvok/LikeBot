@@ -156,12 +156,7 @@ async def verify_setup():
     
     # Try to find any admin user
     try:
-        from motor.motor_asyncio import AsyncIOMotorClient
-        client = AsyncIOMotorClient(db_url)
-        db_name = os.getenv("db_name", "LikeBot")
-        users_coll = client[db_name]["users"]
-        
-        admin_users = await users_coll.count_documents({"role": "admin", "is_verified": True})
+        admin_users = await db.count_admin_users()
         if admin_users > 0:
             print(f"✓ Found {admin_users} verified admin user(s)")
         else:

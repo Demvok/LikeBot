@@ -1,4 +1,14 @@
-import asyncio, atexit, os, uuid, logging
+"""
+LikeBot FastAPI application.
+
+Defines the HTTP and WebSocket API for authentication, account/post/task CRUD,
+task actions, reporting, bulk operations and log streaming. Delegates data,
+auth and background work to modules: auth, database, agent, reporter,
+encryption and logger. Expects env vars (KEK, JWT_SECRET_KEY, db_url) and is
+typically run with uvicorn.
+"""
+
+import asyncio, atexit, os, logging
 from dotenv import load_dotenv
 from collections import deque
 from datetime import timedelta, datetime as dt, timezone

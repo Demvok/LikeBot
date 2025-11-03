@@ -1,3 +1,24 @@
+"""database.py
+Async MongoDB storage for LikeBot.
+
+Provides MongoStorage (get_db()) using motor.AsyncIOMotorClient:
+- Lazy client/collection init, idempotent index creation (asyncio.Lock)
+- CRUD for accounts, posts, tasks, users, runs, and events
+- Accepts domain objects or dicts, strips MongoDB _id on return
+- ensure_async decorator wraps sync helpers for async use
+- Centralized database logic for all collections including reporter events/runs
+
+Collections:
+- accounts: Telegram account information
+- posts: Post/message data
+- tasks: Task definitions and status
+- users: API user authentication
+- runs: Task execution runs (reporter)
+- events: Task execution events (reporter)
+
+Environment:
+- db_url (required), db_name (default "LikeBot"), db_timeout_ms (default 5000)
+"""
 import os, inspect, asyncio
 from typing import Optional
 from pandas import Timestamp
@@ -34,6 +55,8 @@ class MongoStorage():
     _accounts = None
     _tasks = None
     _users = None
+    _events = None
+    _runs = None
     _client: Optional[AsyncIOMotorClient] = None
     _indexes_initialized = False
     _index_lock: Optional[asyncio.Lock] = None
@@ -59,6 +82,13 @@ class MongoStorage():
         cls._posts = cls._db["posts"]
         cls._tasks = cls._db["tasks"]
         cls._users = cls._db["users"]
+        
+        # Reporter collections with write concerns
+        from pymongo.write_concern import WriteConcern
+        events_coll_name = config.get('database', {}).get('events_coll', 'events')
+        runs_coll_name = config.get('database', {}).get('runs_coll', 'runs')
+        cls._events = cls._db.get_collection(events_coll_name, write_concern=WriteConcern(w="majority", j=True))
+        cls._runs = cls._db.get_collection(runs_coll_name, write_concern=WriteConcern(w="majority", j=True))
 
     @classmethod
     async def _ensure_ready(cls):
@@ -89,6 +119,16 @@ class MongoStorage():
                 await cls._posts.create_index("post_id", unique=True, name="ux_posts_post_id")
                 await cls._tasks.create_index("task_id", unique=True, name="ux_tasks_task_id")
                 await cls._users.create_index("username", unique=True, name="ux_users_username")
+                
+                # Reporter collection indexes
+                from pymongo import ASCENDING, IndexModel
+                await cls._runs.create_index([("run_id", ASCENDING)], unique=True, name="ux_runs_run_id")
+                await cls._events.create_indexes([
+                    IndexModel([("run_id", ASCENDING), ("ts", ASCENDING)], name="ix_events_run_ts"),
+                    IndexModel([("task_id", ASCENDING)], name="ix_events_task_id"),
+                    IndexModel([("level", ASCENDING)], name="ix_events_level"),
+                    IndexModel([("code", ASCENDING)], name="ix_events_code")
+                ])
             except PyMongoError as exc:
                 logger.error("Failed to ensure MongoDB indexes: %s", exc)
                 raise RuntimeError("Failed to create required MongoDB indexes") from exc
@@ -465,6 +505,391 @@ class MongoStorage():
         )
         logger.debug(f"User {username} update result: modified={result.modified_count}")
         return result.modified_count > 0
+
+    # --- Reporter/Events/Runs methods ---
+    @classmethod
+    @ensure_async
+    async def create_run(cls, run_id: str, task_id: str, meta: dict = None):
+        """
+        Create a new run record.
+        
+        Args:
+            run_id: Unique identifier for the run
+            task_id: Task identifier this run belongs to
+            meta: Optional metadata dictionary
+            
+        Returns:
+            run_id if successful
+        """
+        from datetime import datetime, timezone
+        await cls._ensure_ready()
+        logger.info(f"Creating run {run_id} for task {task_id}")
+        
+        doc = {
+            "run_id": run_id,
+            "task_id": task_id,
+            "started_at": datetime.now(timezone.utc),
+            "finished_at": None,
+            "status": "running",
+            "meta": meta or {}
+        }
+        await cls._runs.insert_one(doc)
+        logger.debug(f"Run {run_id} created successfully")
+        return run_id
+
+    @classmethod
+    @ensure_async
+    async def end_run(cls, run_id: str, status: str = "success", meta_patch: dict = None):
+        """
+        Mark a run as completed.
+        
+        Args:
+            run_id: Run identifier to update
+            status: Final status (success, failed, etc.)
+            meta_patch: Optional metadata updates
+            
+        Returns:
+            True if updated successfully
+        """
+        from datetime import datetime, timezone
+        await cls._ensure_ready()
+        logger.info(f"Ending run {run_id} with status {status}")
+        
+        update = {"$set": {"finished_at": datetime.now(timezone.utc), "status": status}}
+        if meta_patch:
+            update["$set"]["meta"] = meta_patch
+        
+        result = await cls._runs.update_one({"run_id": run_id}, update)
+        logger.debug(f"Run {run_id} end result: modified={result.modified_count}")
+        return result.modified_count > 0
+
+    @classmethod
+    @ensure_async
+    async def create_event(cls, event_data: dict):
+        """
+        Create a single event record.
+        
+        Args:
+            event_data: Dictionary containing event fields (run_id, task_id, ts, level, code, message, payload)
+            
+        Returns:
+            True if created successfully
+        """
+        await cls._ensure_ready()
+        logger.debug(f"Creating event for run {event_data.get('run_id')}")
+        
+        event_data.pop('_id', None)
+        await cls._events.insert_one(event_data)
+        return True
+
+    @classmethod
+    @ensure_async
+    async def create_events_batch(cls, events: list):
+        """
+        Create multiple event records in batch (optimized for performance).
+        
+        Args:
+            events: List of event dictionaries
+            
+        Returns:
+            Number of events inserted
+        """
+        await cls._ensure_ready()
+        if not events:
+            return 0
+            
+        logger.debug(f"Creating batch of {len(events)} events")
+        
+        # Remove _id fields if present
+        for event in events:
+            event.pop('_id', None)
+        
+        try:
+            result = await cls._events.insert_many(events, ordered=False)
+            return len(result.inserted_ids)
+        except PyMongoError as exc:
+            logger.warning(f"Batch insert partially failed: {exc}")
+            # Fallback to individual inserts
+            inserted = 0
+            for event in events:
+                try:
+                    await cls._events.insert_one(event)
+                    inserted += 1
+                except PyMongoError as e:
+                    logger.error(f"Failed to insert individual event: {e}")
+            return inserted
+
+    @classmethod
+    @ensure_async
+    async def get_runs_by_task(cls, task_id: str):
+        """
+        Get all runs for a given task, ordered by started_at descending.
+        
+        Args:
+            task_id: Task identifier
+            
+        Returns:
+            List of run documents
+        """
+        await cls._ensure_ready()
+        logger.info(f"Getting runs for task {task_id}")
+        
+        cursor = cls._runs.find({'task_id': task_id}).sort('started_at', -1)
+        runs = await cursor.to_list(length=None)
+        
+        # Remove _id from results
+        for run in runs:
+            run.pop('_id', None)
+        
+        logger.debug(f"Found {len(runs)} runs for task {task_id}")
+        return runs
+
+    @classmethod
+    @ensure_async
+    async def get_run(cls, run_id: str):
+        """
+        Get a single run by run_id.
+        
+        Args:
+            run_id: Run identifier
+            
+        Returns:
+            Run document or None
+        """
+        await cls._ensure_ready()
+        logger.info(f"Getting run {run_id}")
+        
+        run = await cls._runs.find_one({"run_id": run_id})
+        if run and '_id' in run:
+            run.pop('_id')
+        
+        return run
+
+    @classmethod
+    @ensure_async
+    async def get_events_by_run(cls, run_id: str):
+        """
+        Get all events for a given run, ordered by timestamp.
+        
+        Args:
+            run_id: Run identifier
+            
+        Returns:
+            List of event documents
+        """
+        await cls._ensure_ready()
+        logger.info(f"Getting events for run {run_id}")
+        
+        cursor = cls._events.find({'run_id': run_id}).sort('ts', 1)
+        events = await cursor.to_list(length=None)
+        
+        logger.debug(f"Found {len(events)} events for run {run_id}")
+        return events
+
+    @classmethod
+    @ensure_async
+    async def delete_run(cls, run_id: str):
+        """
+        Delete a run and all its associated events.
+        
+        Args:
+            run_id: Run identifier
+            
+        Returns:
+            Dictionary with counts of deleted runs and events
+        """
+        await cls._ensure_ready()
+        logger.info(f"Deleting run {run_id} and associated events")
+        
+        run_result = await cls._runs.delete_one({'run_id': run_id})
+        event_result = await cls._events.delete_many({'run_id': run_id})
+        
+        result = {
+            'runs_deleted': run_result.deleted_count,
+            'events_deleted': event_result.deleted_count
+        }
+        logger.debug(f"Deleted run {run_id}: {result}")
+        return result
+
+    @classmethod
+    @ensure_async
+    async def clear_runs_by_task(cls, task_id: str):
+        """
+        Delete all runs for a task and all associated events.
+        
+        Args:
+            task_id: Task identifier
+            
+        Returns:
+            Dictionary with counts of deleted runs and events
+        """
+        await cls._ensure_ready()
+        logger.info(f"Clearing all runs for task {task_id}")
+        
+        # Get all run_ids first
+        runs_cursor = cls._runs.find({'task_id': task_id}, {'run_id': 1})
+        runs = await runs_cursor.to_list(length=None)
+        run_ids = [run['run_id'] for run in runs]
+        
+        # Delete runs
+        runs_result = await cls._runs.delete_many({'task_id': task_id})
+        
+        # Delete linked events
+        events_deleted = 0
+        if run_ids:
+            events_result = await cls._events.delete_many({'run_id': {'$in': run_ids}})
+            events_deleted = events_result.deleted_count
+        
+        result = {
+            'runs_deleted': runs_result.deleted_count,
+            'events_deleted': events_deleted
+        }
+        logger.debug(f"Cleared runs for task {task_id}: {result}")
+        return result
+
+    @classmethod
+    @ensure_async
+    async def get_all_task_summaries(cls):
+        """
+        Get summary of all tasks with run counts.
+        
+        Returns:
+            List of dicts with task_id and run_count
+        """
+        await cls._ensure_ready()
+        logger.info("Getting task summaries")
+        
+        pipeline = [
+            {"$group": {"_id": "$task_id", "run_count": {"$sum": 1}}},
+            {"$project": {"task_id": "$_id", "run_count": 1, "_id": 0}}
+        ]
+        cursor = cls._runs.aggregate(pipeline)
+        results = await cursor.to_list(length=None)
+        
+        logger.debug(f"Found {len(results)} tasks with runs")
+        return results
+
+    @classmethod
+    @ensure_async
+    async def get_event_counts_for_runs(cls, run_ids: list):
+        """
+        Get event counts for multiple runs.
+        
+        Args:
+            run_ids: List of run identifiers
+            
+        Returns:
+            Dictionary mapping run_id to event count
+        """
+        await cls._ensure_ready()
+        logger.debug(f"Getting event counts for {len(run_ids)} runs")
+        
+        pipeline = [
+            {"$match": {"run_id": {"$in": run_ids}}},
+            {"$group": {"_id": "$run_id", "event_count": {"$sum": 1}}}
+        ]
+        cursor = cls._events.aggregate(pipeline)
+        results = await cursor.to_list(length=None)
+        
+        return {r["_id"]: r["event_count"] for r in results}
+
+    @classmethod
+    @ensure_async
+    async def get_all_runs(cls):
+        """
+        Get all runs from the database.
+        
+        Returns:
+            List of all run documents
+        """
+        await cls._ensure_ready()
+        logger.info("Getting all runs")
+        
+        cursor = cls._runs.find()
+        runs = await cursor.to_list(length=None)
+        
+        # Remove _id from results
+        for run in runs:
+            run.pop('_id', None)
+        
+        logger.debug(f"Found {len(runs)} total runs")
+        return runs
+
+    @classmethod
+    @ensure_async
+    async def get_all_events(cls):
+        """
+        Get all events from the database.
+        
+        Returns:
+            List of all event documents
+        """
+        await cls._ensure_ready()
+        logger.info("Getting all events")
+        
+        cursor = cls._events.find()
+        events = await cursor.to_list(length=None)
+        
+        logger.debug(f"Found {len(events)} total events")
+        return events
+
+    @classmethod
+    @ensure_async
+    async def get_event_by_id(cls, event_id):
+        """
+        Get a single event by its MongoDB ObjectId.
+        
+        Args:
+            event_id: MongoDB ObjectId (as string or ObjectId)
+            
+        Returns:
+            Event document or None
+        """
+        from bson import ObjectId
+        await cls._ensure_ready()
+        logger.info(f"Getting event {event_id}")
+        
+        event = await cls._events.find_one({'_id': ObjectId(event_id)})
+        if event and '_id' in event:
+            event.pop('_id')
+        
+        return event
+
+    @classmethod
+    @ensure_async
+    async def delete_event_by_id(cls, event_id):
+        """
+        Delete a single event by its MongoDB ObjectId.
+        
+        Args:
+            event_id: MongoDB ObjectId (as string or ObjectId)
+            
+        Returns:
+            Number of deleted events (0 or 1)
+        """
+        from bson import ObjectId
+        await cls._ensure_ready()
+        logger.info(f"Deleting event {event_id}")
+        
+        result = await cls._events.delete_one({'_id': ObjectId(event_id)})
+        logger.debug(f"Event {event_id} delete result: {result.deleted_count}")
+        return result.deleted_count
+
+    @classmethod
+    @ensure_async
+    async def count_admin_users(cls):
+        """
+        Count verified admin users in the database.
+        
+        Returns:
+            Number of verified admin users
+        """
+        await cls._ensure_ready()
+        logger.info("Counting admin users")
+        
+        count = await cls._users.count_documents({"role": "admin", "is_verified": True})
+        logger.debug(f"Found {count} verified admin users")
+        return count
 
 
 def get_db() -> MongoStorage:

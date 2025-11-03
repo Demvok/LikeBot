@@ -4,7 +4,6 @@ from enum import Enum, auto
 
 from telethon import errors
 from pymongo import errors as mg_errors
-from motor.motor_asyncio import AsyncIOMotorClient
 from pandas import errors as pd_errors
 
 from agent import Account, Client

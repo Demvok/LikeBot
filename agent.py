@@ -1,3 +1,11 @@
+"""
+Telegram account and client management utilities using Telethon.
+Defines Account and Client classes to manage account data, session creation,
+connection lifecycle, and common actions (react/comment/undo). Implements
+an interactive login flow (start_login) with 2FA support, session encryption,
+database persistence integration, and a global pending_logins registry with cleanup.
+"""
+
 import re, os, random, asyncio, uuid
 from datetime import datetime, timezone, timedelta
 from pandas import Timestamp 

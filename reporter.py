@@ -1,11 +1,7 @@
 import pandas as pd
-import asyncio, uuid, signal, os
+import asyncio, uuid, os
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
-import motor.motor_asyncio
-from pymongo import IndexModel
-from pymongo import ASCENDING
-from pymongo.write_concern import WriteConcern
 from dotenv import load_dotenv
 from logger import setup_logger, load_config
 
@@ -15,11 +11,6 @@ logger = setup_logger("reporter", "main.log")
 config = load_config()
 
 # CONFIG
-MONGO_URI = os.getenv("db_url", "mongodb://localhost:27017")
-DB_NAME = os.getenv("db_name")
-EVENTS_COLL = config.get('database', {}).get('events_coll', 'events')
-RUNS_COLL = config.get('database', {}).get('runs_coll', 'runs')
-
 BATCH_SIZE = config.get('database', {}).get('batch_size', 100)
 BATCH_TIMEOUT = config.get('database', {}).get('batch_timeout', 0.5)
 
@@ -30,50 +21,31 @@ def utc_now():
 
 class Reporter:
     def __init__(self):
-        self.client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
-        self.db = self.client[DB_NAME]
-
-        # Use majority write concern + journaling for durability guarantees (requires replica set for true majority)
-        self.events_coll = self.db.get_collection(EVENTS_COLL, write_concern=WriteConcern(w="majority", j=True))
-        self.runs_coll = self.db.get_collection(RUNS_COLL, write_concern=WriteConcern(w="majority", j=True))
-
         self.queue: asyncio.Queue = asyncio.Queue()
         self._writer_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
 
     async def init(self):
-        """Create indexes (idempotent)"""
-        await self.runs_coll.create_index([("run_id", ASCENDING)], unique=True)
-        # Index events by run_id, ts for fast querying by run
-        await self.events_coll.create_indexes([
-            IndexModel([("run_id", ASCENDING), ("ts", ASCENDING)]),
-            IndexModel([("task_id", ASCENDING)]),
-            IndexModel([("level", ASCENDING)]),
-            IndexModel([("code", ASCENDING)])
-        ])
+        """Initialize database (ensure indexes are created)"""
+        from database import get_db
+        db = get_db()
+        await db._ensure_ready()
 
 
 
     # ---- Public reporter API used by workers ----
     async def new_run(self, task_id: str, meta: Optional[Dict[str, Any]] = None) -> str:
+        from database import get_db
+        db = get_db()
         run_id = str(uuid.uuid4())
-        doc = {
-            "run_id": run_id,
-            "task_id": task_id,
-            "started_at": utc_now(),
-            "finished_at": None,
-            "status": "running",
-            "meta": meta or {}
-        }
         # write run doc immediately for stronger traceability
-        await self.runs_coll.insert_one(doc)
+        await db.create_run(run_id, task_id, meta)
         return run_id
 
     async def end_run(self, run_id: str, status: str = "success", meta_patch: Optional[Dict[str, Any]] = None):
-        update = {"$set": {"finished_at": utc_now(), "status": status}}
-        if meta_patch:
-            update["$set"]["meta"] = meta_patch
-        await self.runs_coll.update_one({"run_id": run_id}, update)
+        from database import get_db
+        db = get_db()
+        await db.end_run(run_id, status, meta_patch)
 
     async def event(self, run_id: str, task_id: str, level: str, code: str = None, message: str = None, payload: Optional[Dict[str, Any]] = None):
         """
@@ -106,6 +78,9 @@ class Reporter:
 
     async def _writer_loop(self):
         """Background task for writing events to the database."""
+        from database import get_db
+        db = get_db()
+        
         buffer: List[Dict[str, Any]] = []
         last_flush = asyncio.get_running_loop().time()
 
@@ -138,20 +113,12 @@ class Reporter:
                             "message": it["message"],
                             "payload": it["payload"]
                         })
-                    # unordered insert for speed and resilience; write concern handled by collection's WriteConcern
+                    # Use centralized batch insert from database
                     try:
-                        await self.events_coll.insert_many(docs, ordered=False)
+                        await db.create_events_batch(docs)
                     except Exception as e:
-                        # handle partial failures — you might want to log this to stderr or another collection
-                        logger.warning("Warning: insert_many failed:", e)
-                        # fallback: try inserting one-by-one (so nothing is silently lost)
-                        for doc in docs:
-                            try:
-                                await self.events_coll.insert_one(doc)
-                            except Exception as ex:
-                                # If even single insert fails, store minimal failure record in runs collection
-                                await self.runs_coll.update_one({"run_id": doc["run_id"]}, {"$set": {"status": "persist_error"}})
-                                logger.error("Failed to persist doc:", ex)
+                        logger.warning("Batch insert failed:", e)
+                    
                     buffer = []
                     last_flush = now
 
@@ -170,7 +137,6 @@ class Reporter:
         self._stop_event.set()
         if self._writer_task:
             await self._writer_task
-        self.client.close()  # optionally close client
 
     # Convenient context manager for a run
     async def run_context(self, task_id: str, meta: Optional[Dict[str, Any]] = None):
@@ -205,19 +171,18 @@ class Reporter:
 # Async class to manage runs and events data from MongoDB
 class RunEventManager:
     def __init__(self):
-        self.client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
-        self.db = self.client[DB_NAME]
-        self.runs_coll = self.db[RUNS_COLL]
-        self.events_coll = self.db[EVENTS_COLL]
         self.runs_df = pd.DataFrame()
         self.events_df = pd.DataFrame()
 
     async def refresh(self):
         """Reload data from MongoDB asynchronously."""
-        runs_cursor = self.runs_coll.find()
-        events_cursor = self.events_coll.find()
-        runs = await runs_cursor.to_list(length=None)
-        events = await events_cursor.to_list(length=None)
+        from database import get_db
+        db = get_db()
+        
+        # Get all runs and events using centralized methods
+        runs = await db.get_all_runs()
+        events = await db.get_all_events()
+        
         self.runs_df = pd.DataFrame(runs)
         self.events_df = pd.DataFrame(events)
 
@@ -226,12 +191,10 @@ class RunEventManager:
         Returns a pandas DataFrame with all unique task_ids and the number of runs for each.
         Ensures columns are ordered: task_id, run_count.
         """
-        pipeline = [
-            {"$group": {"_id": "$task_id", "run_count": {"$sum": 1}}},
-            {"$project": {"task_id": "$_id", "run_count": 1, "_id": 0}}
-        ]
-        cursor = self.runs_coll.aggregate(pipeline)
-        results = await cursor.to_list(length=None)
+        from database import get_db
+        db = get_db()
+        
+        results = await db.get_all_task_summaries()
         df = pd.DataFrame(results)
         # Ensure columns order
         df = df.loc[:, ["task_id", "run_count"]] if not df.empty else pd.DataFrame(columns=["task_id", "run_count"])
@@ -242,21 +205,17 @@ class RunEventManager:
         Return all runs for a given task_id, with an additional column 'event_count'
         indicating the number of events for each run, ordered by started_at descending.
         """
-        # Get all runs for the task_id, ordered by started_at descending
-        cursor = self.runs_coll.find({'task_id': task_id}).sort('started_at', -1)
-        runs = await cursor.to_list(length=None)
+        from database import get_db
+        db = get_db()
+        
+        # Get all runs for the task_id
+        runs = await db.get_runs_by_task(task_id)
         if not runs:
             return pd.DataFrame(columns=["run_id", "task_id", "started_at", "finished_at", "status", "meta", "event_count"])
 
         # Get event counts for each run_id
         run_ids = [run["run_id"] for run in runs]
-        pipeline = [
-            {"$match": {"run_id": {"$in": run_ids}}},
-            {"$group": {"_id": "$run_id", "event_count": {"$sum": 1}}}
-        ]
-        event_counts_cursor = self.events_coll.aggregate(pipeline)
-        event_counts = await event_counts_cursor.to_list(length=None)
-        event_count_map = {ec["_id"]: ec["event_count"] for ec in event_counts}
+        event_count_map = await db.get_event_counts_for_runs(run_ids)
 
         # Add event_count to each run
         for run in runs:
@@ -266,8 +225,10 @@ class RunEventManager:
 
     async def get_task_details(self, task_id):
         """Return details for a single task."""
-        cursor = self.runs_coll.find({'task_id': task_id})
-        runs = await cursor.to_list(length=None)
+        from database import get_db
+        db = get_db()
+        
+        runs = await db.get_runs_by_task(task_id)
         return runs
 
     async def get_events(self, run_id):
@@ -276,8 +237,10 @@ class RunEventManager:
         Splits the 'code' field into 'event_type', 'action_type', and 'details' columns.
         Removes the original 'code' column.
         """
-        cursor = self.events_coll.find({'run_id': run_id}).sort('ts', 1)
-        events = await cursor.to_list(length=None)
+        from database import get_db
+        db = get_db()
+        
+        events = await db.get_events_by_run(run_id)
         df = pd.DataFrame(events)
         if not df.empty and "code" in df.columns:
             split_cols = df["code"].str.split(".", expand=True)
@@ -293,51 +256,47 @@ class RunEventManager:
         Splits the 'code' field into 'event_type', 'action_type', and 'details' columns.
         Removes the original 'code' field.
         """
-        from bson import ObjectId
-        cursor = self.events_coll.find({'_id': ObjectId(event_id)})
-        events = await cursor.to_list(length=None)
-        if events:
-            for event in events:
-                code = event.get("code", "")
-                parts = code.split(".") if code else []
-                event["event_type"] = parts[0] if len(parts) > 0 else None
-                event["action_type"] = parts[1] if len(parts) > 1 else None
-                event["details"] = parts[2] if len(parts) > 2 else None
-                event.pop("code", None)
-        return events
+        from database import get_db
+        
+        db = get_db()
+        event = await db.get_event_by_id(event_id)
+        
+        if event:
+            code = event.get("code", "")
+            parts = code.split(".") if code else []
+            event["event_type"] = parts[0] if len(parts) > 0 else None
+            event["action_type"] = parts[1] if len(parts) > 1 else None
+            event["details"] = parts[2] if len(parts) > 2 else None
+            event.pop("code", None)
+            return [event]
+        return []
 
     async def delete_run(self, run_id):
         """Delete a run by run_id and all linked events."""
-        run_result = await self.runs_coll.delete_one({'run_id': run_id})
-        event_result = await self.events_coll.delete_many({'run_id': run_id})
+        from database import get_db
+        db = get_db()
+        
+        result = await db.delete_run(run_id)
         await self.refresh()
-        return {'runs_deleted': run_result.deleted_count, 'events_deleted': event_result.deleted_count}
+        return result
 
     async def delete_event(self, event_id):
         """Delete an event by event_id."""
-        result = await self.events_coll.delete_one({'event_id': event_id})
+        from database import get_db
+        
+        db = get_db()
+        result = await db.delete_event_by_id(event_id)
         await self.refresh()
-        return result.deleted_count
+        return result
 
     async def clear_runs(self, task_id):
         """Delete all runs for a given task_id and all linked events, then refresh data."""
-        # Find all run_ids for the given task_id
-        runs_cursor = self.runs_coll.find({'task_id': task_id}, {'run_id': 1})
-        runs = await runs_cursor.to_list(length=None)
-        run_ids = [run['run_id'] for run in runs]
-
-        # Delete runs
-        runs_result = await self.runs_coll.delete_many({'task_id': task_id})
-
-        # Delete linked events
-        if run_ids:
-            events_result = await self.events_coll.delete_many({'run_id': {'$in': run_ids}})
-            events_deleted = events_result.deleted_count
-        else:
-            events_deleted = 0
-
+        from database import get_db
+        db = get_db()
+        
+        result = await db.clear_runs_by_task(task_id)
         await self.refresh()
-        return {'runs_deleted': runs_result.deleted_count, 'events_deleted': events_deleted}
+        return result
 
 async def create_report(data, type=None):
     """Create a report from the given data. As data standard uses data from get_events from RunEventManager. Report types are:

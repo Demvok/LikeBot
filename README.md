@@ -3,6 +3,7 @@
 ### TO DO:
 
 - add object refresh on client for first account_id retrieval or fix logging to use phone number
+- add task's runs and events clearup on delete
 
 - add reaction precondition (exists in chat) check
 - ensure views on posts correct counting
@@ -15,6 +16,11 @@
 
 
 ## Changelog
+
+### v.1.0.3
+- secondary database usage moved to `database.py`
+- 
+
 
 ### v.1.0.2
 - added auth in API endpoints
