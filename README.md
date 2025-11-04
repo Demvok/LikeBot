@@ -15,6 +15,10 @@
 
 ## Changelog
 
+### v.1.0.4
+- fixed logger file writing issue
+- added file size limit for logs
+
 ### v.1.0.3
 - secondary database usage moved to `database.py`
 - implemented proxy logic with password encryption

@@ -194,7 +194,7 @@ class MongoStorage():
                 'password_encrypted', 'notes', 'status', 'created_at', 'updated_at'
             ]:
                 acc.setdefault(field, None)
-            logger.debug(f"Account found in MongoDB: {acc}")
+            logger.debug(f"Account found in MongoDB: {acc.get('phone_number', '')}, {acc.get('status', '')}, {acc.get('updated_at', '')}")
         return Account(acc) if acc else None
 
     @classmethod
@@ -274,7 +274,7 @@ class MongoStorage():
         if post and '_id' in post:
             post.pop('_id')
         if post:
-            logger.debug(f"Post found in MongoDB: {post}")
+            logger.debug(f"Post found in MongoDB: {post.get('post_id', '')}, link: {post.get('message_link', '')}")
         return Post(**post) if post else None
 
     @classmethod
@@ -376,7 +376,7 @@ class MongoStorage():
         if task and '_id' in task:
             task.pop('_id')
         if task:
-            logger.debug(f"Task found in MongoDB: {task}")
+            logger.debug(f"Task found in MongoDB: {task.get('task_id', '')}, status: {task.get('status', '')}, updated_at: {task.get('updated_at', '')}, posts: {len(task.get('post_ids', []))}, accounts: {len(task.get('accounts', []))}")
         return Task(**task) if task else None
 
     @classmethod
