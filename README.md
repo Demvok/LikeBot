@@ -2,19 +2,31 @@
 
 ### TO DO:
 
-- add object refresh on client for first account_id retrieval or fix logging to use phone number
-
-- add reaction precondition (exists in chat) check
-- ensure views on posts correct counting
-- implement proxy logic (import, status, links to accounts)
-
+- add task's runs and events clearup on delete
 - add neccessary filtering on db loading, not loading all and filtering
+- add timestamp for task
+
+- ensure views on posts correct counting
+
+- fix multiple palette import, only once needed
 
 - add creation of neccessary files if they dont exist
 - add signal stops for reporter context?
 
 
 ## Changelog
+
+### v.1.0.4
+- fixed logger file writing issue
+- added file size limit for logs
+- fixed message url parser
+- added more specific error tracking
+
+### v.1.0.3
+- secondary database usage moved to `database.py`
+- implemented proxy logic with password encryption
+- moved reaction palette storage into DB
+- added reaction precondition check
 
 ### v.1.0.2
 - added auth in API endpoints

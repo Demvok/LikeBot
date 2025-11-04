@@ -1,5 +1,6 @@
 python-dotenv
 telethon
+PySocks
 PyYAML
 pandas
 pymongo

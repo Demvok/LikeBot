@@ -50,7 +50,7 @@ Currently, no authentication is required for API endpoints.
   "accounts": ["array of phone numbers"],
   "action": {
     "type": "string (react|comment)",
-    "palette": "string (positive|negative) - for react actions",
+    "palette": "string (palette name from database) - for react actions",
     "content": "string - for comment actions"
   },
   "status": "string (PENDING|RUNNING|PAUSED|FINISHED|CRASHED)",
@@ -58,6 +58,22 @@ Currently, no authentication is required for API endpoints.
   "updated_at": "string (ISO timestamp)"
 }
 ```
+
+### Reaction Palette
+```json
+{
+  "palette_name": "string (unique identifier)",
+  "emojis": ["array of emoji strings"],
+  "ordered": "boolean (false=random, true=sequential)",
+  "description": "string (optional)",
+  "created_at": "string (ISO timestamp)",
+  "updated_at": "string (ISO timestamp)"
+}
+```
+
+**Palette Behavior:**
+- `ordered: false` - Random emoji selection for each reaction
+- `ordered: true` - Sequential emoji selection (cycles through list)
 
 ## API Endpoints
 
@@ -707,6 +723,130 @@ Delete multiple posts in bulk.
 
 ---
 
+## Reaction Palettes CRUD
+
+Reaction palettes define sets of emojis used in reaction tasks. Each palette can be configured to use emojis randomly or sequentially.
+
+### GET /palettes
+Get all reaction palettes with optional filtering.
+
+**Query Parameters:**
+- `palette_name` (optional): Filter by palette name
+
+**Response:**
+```json
+[
+  {
+    "palette_name": "positive",
+    "emojis": ["👍", "❤️", "🔥"],
+    "ordered": false,
+    "description": "Positive reactions palette",
+    "created_at": "2025-01-01T00:00:00Z",
+    "updated_at": "2025-01-01T00:00:00Z"
+  },
+  {
+    "palette_name": "negative",
+    "emojis": ["👎", "😡", "🤬", "🤮", "💩", "🤡"],
+    "ordered": false,
+    "description": "Negative reactions palette",
+    "created_at": "2025-01-01T00:00:00Z",
+    "updated_at": "2025-01-01T00:00:00Z"
+  }
+]
+```
+
+### GET /palettes/{palette_name}
+Get a specific reaction palette by name.
+
+**Response:**
+```json
+{
+  "palette_name": "positive",
+  "emojis": ["👍", "❤️", "🔥"],
+  "ordered": false,
+  "description": "Positive reactions palette",
+  "created_at": "2025-01-01T00:00:00Z",
+  "updated_at": "2025-01-01T00:00:00Z"
+}
+```
+
+**Error Responses:**
+- `404`: Palette not found
+
+### POST /palettes
+Create a new reaction palette.
+
+**Query Parameters:**
+- `palette_name` (required): Unique palette name (alphanumeric, lowercase, underscores/hyphens)
+- `emojis` (required): Comma-separated list of emojis (e.g., "👍,❤️,🔥")
+- `ordered` (optional): If true, emojis are used sequentially; if false (default), chosen randomly
+- `description` (optional): Palette description
+
+**Example Request:**
+```
+POST /palettes?palette_name=custom&emojis=🎉,🎊,🎈&ordered=false&description=Celebration emojis
+```
+
+**Response:**
+```json
+{
+  "message": "Palette 'custom' created successfully",
+  "palette_name": "custom",
+  "emoji_count": 3
+}
+```
+
+**Error Responses:**
+- `400`: Invalid emoji list (empty or invalid format)
+- `409`: Palette already exists
+
+**Palette Ordering:**
+- **ordered=false** (default): Emojis are chosen randomly for each reaction
+- **ordered=true**: Emojis are used sequentially in the order defined (cycling through)
+
+### PUT /palettes/{palette_name}
+Update an existing reaction palette.
+
+**Query Parameters:**
+- `emojis` (optional): Comma-separated list of emojis
+- `ordered` (optional): Update ordering behavior
+- `description` (optional): Update description
+
+**Note:** Palette name cannot be changed. Only provided fields will be updated.
+
+**Example Request:**
+```
+PUT /palettes/custom?emojis=🎉,🎊,🎈,🎁&description=Updated celebration emojis
+```
+
+**Response:**
+```json
+{
+  "message": "Palette 'custom' updated successfully"
+}
+```
+
+**Error Responses:**
+- `400`: No fields to update or invalid emoji list
+- `404`: Palette not found
+
+### DELETE /palettes/{palette_name}
+Delete a reaction palette.
+
+**Warning:** Tasks using this palette will fail to execute until palette is recreated or task is updated.
+
+**Response:**
+```json
+{
+  "message": "Palette 'custom' deleted successfully"
+}
+```
+
+**Error Responses:**
+- `404`: Palette not found
+
+---
+
 ## Utility Endpoints
 
 ### GET /stats
@@ -795,13 +935,16 @@ Error response format:
 ```json
 {
   "type": "react",
-  "palette": "positive"  // or "negative"
+  "palette": "positive"  // Palette name - must exist in database
 }
 ```
 
-Available emoji palettes:
-- **positive**: 👍, ❤️, 🔥
-- **negative**: 👎, 😡, 🤬, 🤮, 💩, 🤡
+Palettes are stored in MongoDB and can be managed via the `/palettes` endpoints. Common palettes:
+- **positive**: Positive reaction emojis (👍, ❤️, 🔥, etc.)
+- **negative**: Negative reaction emojis (👎, 😡, 🤬, etc.)
+
+To view available palettes: `GET /palettes`
+To create custom palettes: `POST /palettes`
 
 ### Comment Action
 ```json
@@ -813,6 +956,24 @@ Available emoji palettes:
 
 ---
 
+## Palette Management
+
+Reaction palettes are now stored exclusively in MongoDB. To set up palettes:
+
+1. **View existing palettes**: `GET /palettes`
+2. **Create default palettes**: Run `python migrate_palettes.py --auto`
+3. **Create custom palette**: `POST /palettes` with your emoji set
+4. **Update palette**: `PUT /palettes/{palette_name}`
+5. **Delete palette**: `DELETE /palettes/{palette_name}`
+
+**Palette Configuration:**
+- **Random selection** (`ordered=false`): System picks a random emoji from the palette for each reaction
+- **Sequential selection** (`ordered=true`): System cycles through emojis in order
+
+**Note:** Tasks will fail if they reference a palette that doesn't exist in the database. Ensure palettes are created before running tasks.
+
+---
+
 ## Notes
 
 1. **Phone Numbers**: Should include country code (e.g., "+1234567890")
@@ -820,3 +981,5 @@ Available emoji palettes:
 3. **Task Dependencies**: Tasks require existing accounts and posts
 4. **Async Operations**: Task execution is asynchronous; use status endpoints to monitor progress
 5. **Database Storage**: Supports both file-based storage (JSON/CSV) and MongoDB based on configuration
+6. **Reaction Palettes**: Palettes are stored exclusively in MongoDB. Use `python migrate_palettes.py --auto` to create default palettes, or use the `/palettes` API endpoints to manage them
+7. **Palette Requirement**: Tasks with `type: "react"` require the specified palette to exist in the database, or the task will fail with a clear error message

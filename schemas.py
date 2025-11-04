@@ -70,12 +70,6 @@ class TaskStatus(Enum):
         return self.name
 
 
-class ReactionPalette(Enum):
-    """Available emoji reaction palettes."""
-    POSITIVE = "positive"
-    NEGATIVE = "negative"
-
-
 class ActionType(Enum):
     """Available action types for tasks."""
     REACT = "react"
@@ -375,12 +369,74 @@ class PostDict(BaseModel):
         arbitrary_types_allowed = True
 
 
+# ============= REACTION PALETTE SCHEMAS =============
+
+class ReactionPaletteBase(BaseModel):
+    """Base schema for Reaction Palette data."""
+    palette_name: str = Field(..., description="Unique palette name (e.g., 'positive', 'negative')", min_length=1, max_length=50)
+    emojis: List[str] = Field(..., description="List of emoji reactions", min_items=1)
+    ordered: bool = Field(False, description="If True, emojis are used in sequence; if False, chosen randomly")
+    description: Optional[str] = Field(None, description="Optional description of the palette", max_length=500)
+
+    @field_validator('palette_name')
+    def validate_palette_name(cls, v):
+        # Ensure palette name is lowercase and alphanumeric with underscores
+        if not v.replace('_', '').replace('-', '').isalnum():
+            raise ValueError("Palette name must contain only alphanumeric characters, underscores, and hyphens")
+        return v.lower()
+    
+    @field_validator('emojis')
+    def validate_emojis(cls, v):
+        # Ensure no empty strings in emoji list
+        if any(not emoji.strip() for emoji in v):
+            raise ValueError("Emoji list cannot contain empty strings")
+        return [emoji.strip() for emoji in v]
+
+
+class ReactionPaletteCreate(ReactionPaletteBase):
+    """Schema for creating new reaction palettes."""
+    pass
+
+
+class ReactionPaletteUpdate(BaseModel):
+    """Schema for updating existing reaction palettes."""
+    emojis: Optional[List[str]] = Field(None, description="List of emoji reactions", min_items=1)
+    ordered: Optional[bool] = Field(None, description="If True, emojis are used in sequence; if False, chosen randomly")
+    description: Optional[str] = Field(None, description="Optional description of the palette", max_length=500)
+
+    @field_validator('emojis')
+    def validate_emojis(cls, v):
+        if v is not None and any(not emoji.strip() for emoji in v):
+            raise ValueError("Emoji list cannot contain empty strings")
+        return [emoji.strip() for emoji in v] if v else v
+
+
+class ReactionPaletteResponse(ReactionPaletteBase, TimestampMixin):
+    """Schema for reaction palette responses (includes all fields)."""
+    
+    class Config:
+        use_enum_values = True
+
+
+class ReactionPaletteDict(BaseModel):
+    """Schema for ReactionPalette.to_dict() output."""
+    palette_name: str
+    emojis: List[str]
+    ordered: bool
+    description: Optional[str]
+    created_at: Union[str, datetime]
+    updated_at: Union[str, datetime]
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
 # ============= ACTION SCHEMAS =============
 
 class ReactAction(BaseModel):
     """Schema for reaction actions."""
     type: Literal["react"] = Field(default="react", description="Action type")
-    palette: ReactionPalette = Field(..., description="Emoji palette to use")
+    palette: str = Field(..., description="Emoji palette name to use (must exist in database)")
 
     class Config:
         use_enum_values = True
@@ -786,5 +842,5 @@ if __name__ == "__main__":
     )
     print(f"\nValid account: {account_data}")
     
-    task_action = ReactAction(palette=ReactionPalette.POSITIVE)
+    task_action = ReactAction(palette="positive")
     print(f"Valid action: {task_action}")

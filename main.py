@@ -1,4 +1,14 @@
-import asyncio, atexit, os, uuid, logging
+"""
+LikeBot FastAPI application.
+
+Defines the HTTP and WebSocket API for authentication, account/post/task CRUD,
+task actions, reporting, bulk operations and log streaming. Delegates data,
+auth and background work to modules: auth, database, agent, reporter,
+encryption and logger. Expects env vars (KEK, JWT_SECRET_KEY, db_url) and is
+typically run with uvicorn.
+"""
+
+import asyncio, atexit, os, logging
 from dotenv import load_dotenv
 from collections import deque
 from datetime import timedelta, datetime as dt, timezone
@@ -16,7 +26,8 @@ from schemas import (
     TaskCreate, TaskUpdate, TaskResponse,
     SuccessResponse, ErrorResponse, BulkOperationResult,
     DatabaseStats, ValidationResult, serialize_for_json,
-    LoginStatus, UserCreate, UserLogin, UserResponse, Token, UserRole
+    LoginStatus, UserCreate, UserLogin, UserResponse, Token, UserRole,
+    ReactionPaletteCreate, ReactionPaletteUpdate, ReactionPaletteResponse
 )
 from auth import (
     authenticate_user, get_current_user, get_current_verified_user,
@@ -33,7 +44,7 @@ atexit.register(cleanup_logging)  # Register cleanup function
 app = FastAPI(
     title="LikeBot API",
     description="Full API for LikeBot automation",
-    version="1.0.2"
+    version="1.0.4"
 )
 
 logger = logging.getLogger("likebot.main")
@@ -1130,7 +1141,8 @@ async def get_task_runs(
 
         eventManager = RunEventManager()
         runs: DataFrame = await eventManager.get_runs(task_id)
-        runs_json = json.loads(runs.drop(['_id'], axis=1).to_json(orient='records'))
+        # Drop _id column if it exists (database already removes it, but ensure it's gone)
+        runs_json = json.loads(runs.drop(columns=['_id'], errors='ignore').to_json(orient='records'))
 
         return {
             "task_id": task_id,
@@ -1618,6 +1630,221 @@ async def validate_post(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to validate post: {str(e)}")
+    
+
+# ============= REACTION PALETTES CRUD =============
+
+@app.get('/palettes', summary="Get all reaction palettes", tags=["Reaction Palettes"])
+@crash_handler
+async def get_palettes(
+    palette_name: Optional[str] = Query(None, description="Filter by palette name"),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get all reaction palettes with optional filtering.
+    
+    Palettes define emoji sets used for reactions in tasks.
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        
+        if palette_name:
+            palette = await db.get_palette(palette_name)
+            if not palette:
+                raise HTTPException(status_code=404, detail=f"Palette '{palette_name}' not found")
+            return [palette]
+        
+        palettes = await db.get_all_palettes()
+        return palettes
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get palettes: {str(e)}")
+
+
+@app.get('/palettes/{palette_name}', summary="Get palette by name", tags=["Reaction Palettes"])
+@crash_handler
+async def get_palette(
+    palette_name: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get a specific reaction palette by name.
+    
+    Returns palette configuration including emojis list and ordering settings.
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        palette = await db.get_palette(palette_name)
+        
+        if not palette:
+            raise HTTPException(status_code=404, detail=f"Palette '{palette_name}' not found")
+        
+        return palette
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get palette: {str(e)}")
+
+
+@app.post('/palettes', summary="Create new reaction palette", status_code=201, tags=["Reaction Palettes"])
+@crash_handler
+async def create_palette(
+    palette_name: str = Query(..., description="Unique palette name"),
+    emojis: str = Query(..., description="Comma-separated list of emojis"),
+    ordered: bool = Query(False, description="If true, emojis are used in sequence; if false, chosen randomly"),
+    description: Optional[str] = Query(None, description="Optional palette description"),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Create a new reaction palette.
+    
+    Palettes define sets of emojis that can be used in reaction tasks.
+    - **ordered=false**: Emojis are chosen randomly for each reaction
+    - **ordered=true**: Emojis are used sequentially in the order defined
+    
+    Requires authentication.
+    """
+    try:
+        from datetime import datetime, timezone
+        
+        db = get_db()
+        
+        # Check if palette already exists
+        existing = await db.get_palette(palette_name)
+        if existing:
+            raise HTTPException(status_code=409, detail=f"Palette '{palette_name}' already exists")
+        
+        # Parse emojis
+        emoji_list = [e.strip() for e in emojis.split(',') if e.strip()]
+        if not emoji_list:
+            raise HTTPException(status_code=400, detail="At least one emoji is required")
+        
+        # Create palette data
+        palette_data = {
+            'palette_name': palette_name.lower(),
+            'emojis': emoji_list,
+            'ordered': ordered,
+            'description': description or f"{palette_name.capitalize()} reactions palette",
+            'created_at': datetime.now(timezone.utc),
+            'updated_at': datetime.now(timezone.utc)
+        }
+        
+        success = await db.add_palette(palette_data)
+        
+        if success:
+            return {
+                "message": f"Palette '{palette_name}' created successfully",
+                "palette_name": palette_name.lower(),
+                "emoji_count": len(emoji_list)
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to create palette")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create palette: {str(e)}")
+
+
+@app.put('/palettes/{palette_name}', summary="Update reaction palette", tags=["Reaction Palettes"])
+@crash_handler
+async def update_palette(
+    palette_name: str,
+    emojis: Optional[str] = Query(None, description="Comma-separated list of emojis"),
+    ordered: Optional[bool] = Query(None, description="If true, emojis are used in sequence; if false, chosen randomly"),
+    description: Optional[str] = Query(None, description="Palette description"),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Update an existing reaction palette.
+    
+    Only provided fields will be updated. Palette name cannot be changed.
+    Requires authentication.
+    """
+    try:
+        from datetime import datetime, timezone
+        
+        db = get_db()
+        
+        # Check if palette exists
+        existing = await db.get_palette(palette_name)
+        if not existing:
+            raise HTTPException(status_code=404, detail=f"Palette '{palette_name}' not found")
+        
+        # Build update data
+        update_data = {}
+        
+        if emojis is not None:
+            emoji_list = [e.strip() for e in emojis.split(',') if e.strip()]
+            if not emoji_list:
+                raise HTTPException(status_code=400, detail="At least one emoji is required")
+            update_data['emojis'] = emoji_list
+        
+        if ordered is not None:
+            update_data['ordered'] = ordered
+        
+        if description is not None:
+            update_data['description'] = description
+        
+        if not update_data:
+            raise HTTPException(status_code=400, detail="No fields to update")
+        
+        update_data['updated_at'] = datetime.now(timezone.utc)
+        
+        success = await db.update_palette(palette_name, update_data)
+        
+        if success:
+            return {
+                "message": f"Palette '{palette_name}' updated successfully"
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to update palette")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update palette: {str(e)}")
+
+
+@app.delete('/palettes/{palette_name}', summary="Delete reaction palette", tags=["Reaction Palettes"])
+@crash_handler
+async def delete_palette(
+    palette_name: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Delete a reaction palette.
+    
+    Warning: Tasks using this palette will fail to execute.
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        
+        # Check if palette exists
+        existing = await db.get_palette(palette_name)
+        if not existing:
+            raise HTTPException(status_code=404, detail=f"Palette '{palette_name}' not found")
+        
+        success = await db.delete_palette(palette_name)
+        
+        if success:
+            return {
+                "message": f"Palette '{palette_name}' deleted successfully"
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to delete palette")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete palette: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn

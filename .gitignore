@@ -3,5 +3,5 @@
 logs/
 sessions/
 __pycache__
-misc
-tests/
+misc/
+test.ipynb

@@ -2,6 +2,9 @@ logging:
   level: "DEBUG"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
   console_log: true  # Enable logging to console
   save_to: "./logs/"  # Directory to save log files
+  max_log_size_mb: 10  # Maximum size of each log file in MB before rotation
+  backup_count: 3  # Number of backup log files to keep (e.g., log.1, log.2, log.3)
+  max_crash_reports: 15  # Maximum number of crash reports to keep
 
 filepaths:  # File paths for various resources
   sessions_folder: "sessions/"
@@ -12,18 +15,8 @@ database:
   batch_size: 100  # Number of events to batch before writing to DB
   batch_timeout: 0.5  # Timeout for batch flushing
 
-reactions_palettes:
-  positive:
-    - "👍"
-    - "❤️"
-    - "🔥"
-  negative:
-    - "👎"
-    - "😡"
-    - "🤬"
-    - "🤮"
-    - "💩"
-    - "🤡"
+proxy:
+  mode: "soft"  # "strict" or "soft" - strict fails on proxy error, soft falls back to no proxy
 
 delays:
   # Humanization level represents the level at which bot attempts to simulate human behaviour
@@ -34,5 +27,5 @@ delays:
   session_creation_retries: 2  # Number of retries for creating new session (code input attempts)
   connection_retries: 5  # Number of connection retries
   reconnect_delay: 3  # Delay between reconnection attempts
-  action_retries: 3  # Number of retries for actions
+  action_retries: 1  # Number of retries for actions
   action_retry_delay: 2  # Delay between action retries

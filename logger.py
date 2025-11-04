@@ -1,7 +1,7 @@
-import logging, time, sys, os, yaml, multiprocessing, threading, traceback, inspect
+import logging, time, sys, os, yaml, multiprocessing, threading, traceback, inspect, copy, glob
 from asyncio import CancelledError
 from functools import wraps
-from logging.handlers import QueueHandler, QueueListener
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from collections import defaultdict, deque
 
 # Load configuration from YAML
@@ -13,6 +13,11 @@ config = load_config()
 LOGGING_LEVEL = config['logging']['level']
 CONSOLE_LOG = config['logging']['console_log']
 SAVE_TO = config['logging']['save_to']
+
+# Log rotation settings
+MAX_LOG_SIZE = config['logging'].get('max_log_size_mb', 10) * 1024 * 1024  # Convert MB to bytes
+BACKUP_COUNT = config['logging'].get('backup_count', 3)  # Number of backup files to keep
+MAX_CRASH_REPORTS = config['logging'].get('max_crash_reports', 15)  # Maximum crash reports to keep
 
 if LOGGING_LEVEL == "DEBUG":
     LEVEL = logging.DEBUG
@@ -72,6 +77,57 @@ class CustomFormatter(logging.Formatter):
                 # Ultimate fallback
                 return f"LOGGING_FORMAT_ERROR: {str(record.msg)} (original error: {str(e)})"
 
+class SafeConsoleFormatter(CustomFormatter):
+    """
+    Formatter that forcefully casts string data to safe UTF representation
+    before formatting for console output, without mutating the original record.
+    """
+    def format(self, record):
+        # Work on a shallow copy so original record stays unchanged
+        rec = copy.copy(record)
+        try:
+            # Ensure message is a str; decode bytes to utf-8 with replacement
+            if isinstance(rec.msg, (bytes, bytearray)):
+                rec.msg = rec.msg.decode('utf-8', errors='replace')
+            else:
+                rec.msg = str(rec.msg)
+        except Exception:
+            pass
+
+        try:
+            # Normalize args to strings, preserving mapping or sequence shape
+            if rec.args:
+                if isinstance(rec.args, dict):
+                    safe_args = {}
+                    for k, v in rec.args.items():
+                        if isinstance(v, (bytes, bytearray)):
+                            safe_args[k] = v.decode('utf-8', errors='replace')
+                        else:
+                            safe_args[k] = str(v)
+                    rec.args = safe_args
+                else:
+                    safe_args = []
+                    for v in rec.args:
+                        if isinstance(v, (bytes, bytearray)):
+                            safe_args.append(v.decode('utf-8', errors='replace'))
+                        else:
+                            safe_args.append(str(v))
+                    rec.args = tuple(safe_args)
+        except Exception:
+            pass
+
+        # Also ensure record.getMessage() won't fail due to non-str parts
+        try:
+            # Precompute message so custom format uses safe string
+            rec.message = rec.getMessage()
+        except Exception:
+            try:
+                rec.message = str(rec.msg)
+            except Exception:
+                rec.message = "<unrepresentable message>"
+
+        return super().format(rec)
+
 class BufferingHandler(logging.Handler):
     """
     Handler that stores log records in a per-process buffer for crash reporting.
@@ -84,11 +140,16 @@ class BufferingHandler(logging.Handler):
 def write_crash_report(pid=None, exc_info=None, extra_info=None):
     """
     Write the buffered logs for the given PID to a crash report file.
+    Maintains a maximum of MAX_CRASH_REPORTS files by deleting oldest ones.
     """
     if pid is None:
         pid = os.getpid()
     timestamp = time.strftime('%Y%m%d_%H%M%S')
     crash_file = os.path.join(crashes_folder, f'crash_{pid}_{timestamp}.log')
+    
+    # Clean up old crash reports if we exceed the limit
+    _cleanup_old_crash_reports()
+    
     with _log_buffers_lock:
         buffer = list(_log_buffers.get(pid, []))
     with open(crash_file, 'w', encoding='utf-8') as f:
@@ -103,45 +164,126 @@ def write_crash_report(pid=None, exc_info=None, extra_info=None):
         for line in buffer:
             f.write(line + '\n')
 
+def _cleanup_old_crash_reports():
+    """
+    Remove oldest crash reports if we exceed MAX_CRASH_REPORTS.
+    """
+    try:
+        # Get all crash report files
+        crash_files = glob.glob(os.path.join(crashes_folder, 'crash_*.log'))
+        
+        # If we have more than the maximum allowed
+        if len(crash_files) >= MAX_CRASH_REPORTS:
+            # Sort by modification time (oldest first)
+            crash_files.sort(key=os.path.getmtime)
+            
+            # Calculate how many to delete
+            num_to_delete = len(crash_files) - MAX_CRASH_REPORTS + 1
+            
+            # Delete the oldest ones
+            for old_file in crash_files[:num_to_delete]:
+                try:
+                    os.remove(old_file)
+                except Exception:
+                    pass  # Silently ignore deletion errors
+    except Exception:
+        pass  # Silently ignore any errors in cleanup
+
 # Set up the logging queue and listener (main process only)
 _log_queue = multiprocessing.Queue(-1)
 
-# Handlers for the listener (file, console, buffer)
+# Map logger names to their intended log files
+_logger_file_map = {}
+_logger_file_map_lock = threading.Lock()
+
+# File handlers cache (file_path -> handler)
+_file_handlers = {}
+
+class RoutingHandler(logging.Handler):
+    """
+    Handler that routes log records to different file handlers based on logger name.
+    Uses RotatingFileHandler to automatically manage log file sizes.
+    """
+    def __init__(self):
+        super().__init__()
+        self.handlers_lock = threading.Lock()
+        
+    def emit(self, record):
+        logger_name = record.name
+        with _logger_file_map_lock:
+            log_file = _logger_file_map.get(logger_name, "main.log")
+        
+        file_path = os.path.join(SAVE_TO, log_file)
+        
+        with self.handlers_lock:
+            # Get or create rotating file handler for this file
+            if file_path not in _file_handlers:
+                # Ensure the directory exists
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                
+                formatter = CustomFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+                formatter.converter = lambda *args: time.localtime(*args)
+                formatter.default_time_format = '%Y-%m-%d %H:%M:%S'
+                formatter.default_msec_format = ''
+                
+                # Use RotatingFileHandler to automatically rotate logs when they get too big
+                file_handler = RotatingFileHandler(
+                    file_path, 
+                    maxBytes=MAX_LOG_SIZE,
+                    backupCount=BACKUP_COUNT,
+                    encoding='utf-8'
+                )
+                file_handler.setFormatter(formatter)
+                file_handler.setLevel(LEVEL)
+                _file_handlers[file_path] = file_handler
+            
+            handler = _file_handlers[file_path]
+            handler.emit(record)
+
+# Handlers for the listener (routing, console, buffer)
 _listener_handlers = []
 
-def _make_handlers(log_file):
+def _make_handlers():
     handlers = []
-    file_path = os.path.join(SAVE_TO, log_file)
+    
+    # Add routing handler for file output
+    routing_handler = RoutingHandler()
+    handlers.append(routing_handler)
+    
+    if CONSOLE_LOG:
+        # Use SafeConsoleFormatter for console output to avoid non-UTF problems
+        console_formatter = SafeConsoleFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        console_formatter.converter = lambda *args: time.localtime(*args)
+        console_formatter.default_time_format = '%Y-%m-%d %H:%M:%S'
+        console_formatter.default_msec_format = ''
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(console_formatter)
+        handlers.append(console_handler)
+    
     formatter = CustomFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     formatter.converter = lambda *args: time.localtime(*args)
     formatter.default_time_format = '%Y-%m-%d %H:%M:%S'
     formatter.default_msec_format = ''
-    file_handler = logging.FileHandler(file_path)
-    file_handler.setFormatter(formatter)
-    handlers.append(file_handler)
-    if CONSOLE_LOG:
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(formatter)
-        handlers.append(console_handler)
     buffer_handler = BufferingHandler()
     buffer_handler.setFormatter(formatter)
     handlers.append(buffer_handler)
+    
     return handlers
 
 _main_listener = None
 _main_listener_lock = threading.Lock()
 
-def _ensure_listener(log_file):
+def _ensure_listener():
     global _main_listener, _listener_handlers
     with _main_listener_lock:
         if _main_listener is None:
-            _listener_handlers = _make_handlers(log_file)
+            _listener_handlers = _make_handlers()
             _main_listener = QueueListener(_log_queue, *_listener_handlers, respect_handler_level=True)
             _main_listener.start()
 
 def cleanup_logging():
     """Clean up logging resources"""
-    global _main_listener, _listener_handlers, _log_queue
+    global _main_listener, _listener_handlers, _log_queue, _file_handlers
     with _main_listener_lock:
         if _main_listener is not None:
             try:
@@ -158,6 +300,14 @@ def cleanup_logging():
             except Exception:
                 pass
         _listener_handlers.clear()
+        
+        # Close all file handlers
+        for handler in _file_handlers.values():
+            try:
+                handler.close()
+            except Exception:
+                pass
+        _file_handlers.clear()
         
         # Close the queue (cancel join thread if any)
         try:
@@ -182,6 +332,11 @@ def setup_logger(name: str, log_file: str) -> logging.Logger:
         name = name.ljust(4, ' ')
     else:
         name = name.ljust(12, ' ')
+    
+    # Register this logger's log file in the mapping
+    with _logger_file_map_lock:
+        _logger_file_map[name] = log_file
+    
     # FORCE RESET: Remove any existing logger with this name
     if name in logging.Logger.manager.loggerDict:
         del logging.Logger.manager.loggerDict[name]
@@ -196,7 +351,7 @@ def setup_logger(name: str, log_file: str) -> logging.Logger:
     logger.addHandler(QueueHandler(_log_queue))
 
     # Ensure the listener is running (main process only)
-    _ensure_listener(log_file)
+    _ensure_listener()
 
     return logger
 

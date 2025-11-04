@@ -19,6 +19,7 @@ HKDF_INFO_PREFIX = b"likebot-secret-v1:"  # context (helps to differentiate secr
 # Well-known encryption purposes to avoid mismatches across the codebase
 PURPOSE_STRING_SESSION = b"StringSession"
 PURPOSE_PASSWORD = b"Password"
+PURPOSE_PROXY_PASSWORD = b"ProxyPassword"
 
 # Legacy purpose aliases – keep to decrypt older payloads that used different markers
 _LEGACY_PURPOSES: dict[bytes, tuple[bytes, ...]] = {
