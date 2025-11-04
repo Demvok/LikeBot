@@ -15,6 +15,7 @@ from telethon.sessions import StringSession
 from logger import setup_logger, load_config
 from dotenv import load_dotenv
 from schemas import AccountStatus, LoginStatus, LoginProcess
+from urllib.parse import urlparse, unquote
 from encryption import (
     decrypt_secret,
     encrypt_secret,
@@ -830,35 +831,74 @@ class Client(object):
         async for msg in self.client.iter_messages(discussion_chat, reply_to=discussion.messages[0].id, from_user='me'):
             await msg.delete()
 
-    async def get_message_ids(self, link):
+    async def get_message_ids(self, link: str):
         """
-        Extract integer chat_id and message_id from a Telegram message link.
-        Returns (int chat_id, int message_id).
-        Example link: https://t.me/c/123456789/12345 or https://t.me/username/12345
+        Extract (chat_id, message_id) from a Telegram link of types:
+        - https://t.me/c/<raw>/<msg>
+        - https://t.me/<username>/<msg>
+        - https://t.me/s/<username>/<msg>
+        - with or without @, with query params
         """
         try:
-            match = re.match(r'https://t\.me/(c/)?([\w\d_]+)/(\d+)', link)
-            if not match:
-                raise ValueError("Invalid Telegram message link format.")
+            link = link.strip()
+            # Додаємо схему, якщо її немає
+            if '://' not in link:
+                link = 'https://' + link
+            parsed = urlparse(unquote(link))
+            path = parsed.path.lstrip('/')
+            segments = [seg for seg in path.split('/') if seg != '']
+            if not segments or len(segments) < 2:
+                raise ValueError(f"Link format not recognized: {link}")
 
-            is_private = match.group(1) == 'c/'
-            chat_part = match.group(2)
-            message_id = int(match.group(3))
+            # випадок /c/<raw>/<msg>
+            if segments[0] == 'c':
+                if len(segments) < 3:
+                    raise ValueError(f"Invalid /c/ link: {link}")
+                raw = segments[1]
+                msg = segments[2]
+                if not raw.isdigit() or not msg.isdigit():
+                    raise ValueError(f"Non-numeric in /c/ link: {link}")
+                chat_id = int(f"-100{raw}")
+                message_id = int(msg)
+                return chat_id, message_id
 
-            if is_private:
-                # For private groups/channels, chat_id is -100 + chat_part
-                chat_id = int(f"-100{chat_part}")
+            # випадок /s/<username>/<msg>
+            if segments[0] == 's':
+                if len(segments) < 3:
+                    raise ValueError(f"Invalid /s/ link: {link}")
+                username = segments[1]
+                msg = segments[2]
             else:
-                # For public, chat_part is username, need to resolve to int id
-                await self.ensure_connected()
-                entity = await self.client.get_entity(chat_part)
-                chat_id = entity.id
+                # /<username>/<msg>
+                username = segments[0]
+                msg = segments[1]
 
-            self.logger.debug(f"Extracted chat_id {chat_id} and message_id {message_id} from link")
+            username = username.lstrip('@')
+            if not msg.isdigit():
+                raise ValueError(f"Message part is not numeric: {link}")
+            message_id = int(msg)
+
+            # отримуємо entity
+            await self.ensure_connected()
+            # Спроба передати повний URL (Telethon підтримує це)
+            try:
+                entity = await self.client.get_entity(username)
+            except Exception as e1:
+                # спробуємо з повним URL
+                try:
+                    # деякі варіанти Telethon підтримують прямий URL
+                    entity = await self.client.get_entity(parsed.netloc + '/' + username)
+                except Exception as e2:
+                    self.logger.error(f"Failed to resolve username '{username}': {e1}, fallback: {e2}")
+                    raise ValueError(f"Cannot resolve username '{username}' from link {link}")
+
+            chat_id = entity.id
             return chat_id, message_id
+
         except Exception as e:
-            self.logger.warning(f"Error extracting message IDs from link: {e}")
+            self.logger.warning(f"Error extracting IDs from '{link}': {e}")
             raise
+
 
     # Actions
 

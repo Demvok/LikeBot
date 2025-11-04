@@ -307,10 +307,11 @@ async def create_report(data, type=None):
     """
     from pandas import Series
     import asyncio
-    preprocessed_data = data.drop(['_id', 'task_id', 'run_id'], axis=1).reset_index(drop=True)
+    # Drop columns if they exist (database may have already removed _id)
+    preprocessed_data = data.drop(columns=['_id', 'task_id', 'run_id'], errors='ignore').reset_index(drop=True)
     preprocessed_data.ts = preprocessed_data.ts.dt.round('s')
     preprocessed_data.rename({'ts': 'datetime'}, axis=1, inplace=True)
-    preprocessed_data = preprocessed_data.join(preprocessed_data['payload'].apply(Series)).drop('payload', axis=1)
+    preprocessed_data = preprocessed_data.join(preprocessed_data['payload'].apply(Series)).drop(columns=['payload'], errors='ignore')
 
     async def gather_post_links(post_id: Series):
             async def fetch_post_link(post_id):
@@ -322,7 +323,7 @@ async def create_report(data, type=None):
             return await asyncio.gather(*tasks)
 
     if type == 'success':
-        success_report = preprocessed_data.loc[data['action_type'] == 'worker'].loc[preprocessed_data['event_type'] == 'info'].dropna(subset=['details']).drop(['action_type', 'event_type', 'level'], axis=1)
+        success_report = preprocessed_data.loc[data['action_type'] == 'worker'].loc[preprocessed_data['event_type'] == 'info'].dropna(subset=['details']).drop(columns=['action_type', 'event_type', 'level'], errors='ignore')
         if 'post_id' in success_report.columns:
             success_report['post_id'] = await gather_post_links(success_report['post_id'])
             success_report.rename({'post_id': 'message_link'}, axis=1, inplace=True)

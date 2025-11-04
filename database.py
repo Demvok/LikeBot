@@ -120,23 +120,130 @@ class MongoStorage():
             try:
                 # Import pymongo constants first
                 from pymongo import ASCENDING, IndexModel
+                from pymongo.errors import DuplicateKeyError, OperationFailure
                 
-                await cls._accounts.create_index("phone_number", unique=True, name="ux_accounts_phone")
-                await cls._accounts.create_index("account_id", unique=True, sparse=True, name="ux_accounts_account_id")
-                await cls._posts.create_index("post_id", unique=True, name="ux_posts_post_id")
-                await cls._tasks.create_index("task_id", unique=True, name="ux_tasks_task_id")
-                await cls._users.create_index("username", unique=True, name="ux_users_username")
-                await cls._proxies.create_index("proxy_name", unique=True, name="ux_proxies_proxy_name")
+                # Helper to create index with duplicate detection and name conflict handling
+                async def create_unique_index_safe(collection, field_spec, index_name, sparse=False):
+                    """Create unique index, handling duplicates and name conflicts."""
+                    try:
+                        if isinstance(field_spec, str):
+                            await collection.create_index(field_spec, unique=True, sparse=sparse, name=index_name)
+                        else:
+                            await collection.create_index(field_spec, unique=True, sparse=sparse, name=index_name)
+                    except (DuplicateKeyError, OperationFailure) as exc:
+                        # Check if index already exists with different name
+                        if 'IndexOptionsConflict' in str(exc) or 'already exists with a different name' in str(exc):
+                            logger.warning(f"Index conflict for {index_name}: {exc}")
+                            # Extract the existing index name from error message
+                            existing_name = None
+                            if 'different name:' in str(exc):
+                                parts = str(exc).split('different name:')
+                                if len(parts) > 1:
+                                    existing_name = parts[1].split(',')[0].strip()
+                            
+                            if existing_name:
+                                logger.info(f"Dropping existing index '{existing_name}' to recreate as '{index_name}'")
+                                try:
+                                    await collection.drop_index(existing_name)
+                                except Exception as drop_exc:
+                                    logger.warning(f"Failed to drop index {existing_name}: {drop_exc}")
+                            
+                            # Retry index creation
+                            if isinstance(field_spec, str):
+                                await collection.create_index(field_spec, unique=True, sparse=sparse, name=index_name)
+                            else:
+                                await collection.create_index(field_spec, unique=True, sparse=sparse, name=index_name)
+                            logger.info(f"Successfully recreated index {index_name}")
+                        # Check if error is due to duplicate keys
+                        elif 'E11000' in str(exc) or 'duplicate key' in str(exc).lower():
+                            logger.warning(f"Duplicate keys found for index {index_name}, attempting to resolve...")
+                            
+                            # Extract field name from field_spec
+                            if isinstance(field_spec, str):
+                                field_name = field_spec
+                            elif isinstance(field_spec, list) and len(field_spec) > 0:
+                                field_name = field_spec[0][0]  # First field in compound index
+                            else:
+                                raise
+                            
+                            # Find and remove duplicates, keeping the most recent
+                            pipeline = [
+                                {"$group": {
+                                    "_id": f"${field_name}",
+                                    "ids": {"$push": "$_id"},
+                                    "count": {"$sum": 1}
+                                }},
+                                {"$match": {"count": {"$gt": 1}}}
+                            ]
+                            
+                            duplicates = await collection.aggregate(pipeline).to_list(length=None)
+                            
+                            if duplicates:
+                                logger.warning(f"Found {len(duplicates)} duplicate values for {field_name}, removing older entries...")
+                                for dup in duplicates:
+                                    # Keep first ID, delete the rest
+                                    ids_to_delete = dup['ids'][1:]
+                                    if ids_to_delete:
+                                        result = await collection.delete_many({"_id": {"$in": ids_to_delete}})
+                                        logger.info(f"Removed {result.deleted_count} duplicate entries for {field_name}={dup['_id']}")
+                                
+                                # Retry index creation
+                                if isinstance(field_spec, str):
+                                    await collection.create_index(field_spec, unique=True, sparse=sparse, name=index_name)
+                                else:
+                                    await collection.create_index(field_spec, unique=True, sparse=sparse, name=index_name)
+                                logger.info(f"Successfully created index {index_name} after removing duplicates")
+                            else:
+                                # No duplicates found, might be a different issue
+                                raise
+                        else:
+                            raise
+                
+                # Create unique indexes with duplicate handling
+                await create_unique_index_safe(cls._accounts, "phone_number", "ux_accounts_phone")
+                await create_unique_index_safe(cls._accounts, "account_id", "ux_accounts_account_id", sparse=True)
+                await create_unique_index_safe(cls._posts, "post_id", "ux_posts_post_id")
+                await create_unique_index_safe(cls._tasks, "task_id", "ux_tasks_task_id")
+                await create_unique_index_safe(cls._users, "username", "ux_users_username")
+                await create_unique_index_safe(cls._proxies, "proxy_name", "ux_proxies_proxy_name")
+                
+                # Non-unique indexes (can be created normally)
                 await cls._proxies.create_index([("active", ASCENDING), ("connected_accounts", ASCENDING)], name="ix_proxies_active_usage")
                 
                 # Reporter collection indexes
-                await cls._runs.create_index([("run_id", ASCENDING)], unique=True, name="ux_runs_run_id")
-                await cls._events.create_indexes([
+                await create_unique_index_safe(cls._runs, [("run_id", ASCENDING)], "ux_runs_run_id")
+                
+                # Events indexes - handle conflicts individually
+                event_indexes = [
                     IndexModel([("run_id", ASCENDING), ("ts", ASCENDING)], name="ix_events_run_ts"),
                     IndexModel([("task_id", ASCENDING)], name="ix_events_task_id"),
                     IndexModel([("level", ASCENDING)], name="ix_events_level"),
                     IndexModel([("code", ASCENDING)], name="ix_events_code")
-                ])
+                ]
+                
+                for index_model in event_indexes:
+                    try:
+                        await cls._events.create_indexes([index_model])
+                    except OperationFailure as exc:
+                        if 'IndexOptionsConflict' in str(exc) or 'already exists with a different name' in str(exc):
+                            # Extract existing index name and drop it
+                            existing_name = None
+                            if 'different name:' in str(exc):
+                                parts = str(exc).split('different name:')
+                                if len(parts) > 1:
+                                    existing_name = parts[1].split(',')[0].strip()
+                            
+                            if existing_name:
+                                logger.info(f"Dropping existing events index '{existing_name}' to recreate as '{index_model.document['name']}'")
+                                try:
+                                    await cls._events.drop_index(existing_name)
+                                    await cls._events.create_indexes([index_model])
+                                    logger.info(f"Successfully recreated events index {index_model.document['name']}")
+                                except Exception as retry_exc:
+                                    logger.error(f"Failed to recreate events index {index_model.document['name']}: {retry_exc}")
+                                    raise
+                        else:
+                            raise
             except PyMongoError as exc:
                 logger.error("Failed to ensure MongoDB indexes: %s", exc)
                 raise RuntimeError("Failed to create required MongoDB indexes") from exc

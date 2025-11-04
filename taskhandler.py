@@ -98,22 +98,28 @@ class Post:
         return self
     
     @classmethod
-    async def mass_validate_posts(cls, posts, client, logger=None):
-        """Validate multiple posts asynchronously."""
+    async def mass_validate_posts(cls, posts, clients, logger=None, max_clients_per_post=3):
+        """Validate multiple posts asynchronously, trying multiple clients if one fails."""
         if logger:
             logger.info(f"Validating {len(posts)} posts...")
         if not posts:
             if logger:
                 logger.warning("No posts to validate.")
-            return
+            return []
         if not isinstance(posts, list):
             raise ValueError("Posts should be a list of Post objects.")
-        if not client:
-            raise ValueError("Client is not initialized.")
+        if not clients:
+            raise ValueError("No clients provided for validation.")
+        
+        # Ensure clients is a list
+        if not isinstance(clients, list):
+            clients = [clients]
+        
         from database import get_db
         db = get_db()
         already_validated, newly_validated, failed_validation = 0, 0, 0
         new_posts = []
+        
         for post in posts:
             try:               
                 if post.is_validated:
@@ -121,20 +127,51 @@ class Post:
                     new_posts.append(post)
                     continue
                 
-                if not post.is_validated:
-                    await post.validate(client=client, logger=logger)
-                    new_post = await db.get_post(post.post_id)
-                    new_posts.append(new_post)
+                # Try validation with limited number of clients
+                validation_succeeded = False
+                last_error = None
+                clients_to_try = min(max_clients_per_post, len(clients))
+                
+                for client_idx in range(clients_to_try):
+                    client = clients[client_idx]
+                    try:
+                        if logger:
+                            logger.debug(f"Attempting to validate post {post.post_id} with client {client_idx + 1}/{clients_to_try}")
+                        
+                        await post.validate(client=client, logger=logger)
+                        new_post = await db.get_post(post.post_id)
+                        new_posts.append(new_post)
 
-                    if new_post.is_validated:
-                        newly_validated += 1
-                        continue
-    
-                    failed_validation += 1
-                    continue
+                        if new_post.is_validated:
+                            newly_validated += 1
+                            validation_succeeded = True
+                            if logger:
+                                logger.debug(f"Post {post.post_id} validated successfully with client {client_idx + 1}")
+                            break
+                        else:
+                            if logger:
+                                logger.warning(f"Post {post.post_id} validation returned but not validated with client {client_idx + 1}")
                     
-                if logger:
-                    logger.warning(f"Post {post.post_id} failed validation after validate(). State: chat_id={post.chat_id}, message_id={post.message_id}, updated_at={post.updated_at}")
+                    except errors.RPCError as rpc_error:
+                        last_error = rpc_error
+                        if logger:
+                            logger.warning(f"Telegram error validating post {post.post_id} with client {client_idx + 1}/{clients_to_try}: {rpc_error}")
+                        # Try next client
+                        continue
+                    
+                    except Exception as client_error:
+                        last_error = client_error
+                        if logger:
+                            logger.warning(f"Error validating post {post.post_id} with client {client_idx + 1}/{clients_to_try}: {client_error}")
+                        # Try next client
+                        continue
+                
+                # If all attempted clients failed, add to failed count and raise the last error
+                if not validation_succeeded:
+                    failed_validation += 1
+                    if logger:
+                        logger.error(f"Post {post.post_id} failed validation with {clients_to_try} clients. Last error: {last_error}")
+                    raise last_error if last_error else ValueError(f"Post {post.post_id} failed validation with {clients_to_try} clients")
 
             except Exception as e:
                 if logger:
@@ -303,7 +340,13 @@ class Task:
                 await self._check_pause(reporter, run_id)
                 if self._clients:  # Validate posts to get corresponding ids
                     try:
-                        posts = await Post.mass_validate_posts(posts, self._clients[0], self.logger)
+                        posts = await Post.mass_validate_posts(posts, self._clients, self.logger)
+                    except errors.RPCError as rpc_exc:
+                        self.logger.error(f"Telegram API error while validating posts for task {self.task_id}: {rpc_exc}")
+                        await reporter.event(run_id, self.task_id, "ERROR", "error.telegram_post_validation_failed", f"Telegram API error while validating posts: {rpc_exc}", {'error': repr(rpc_exc)})
+                        self.status = Task.TaskStatus.CRASHED
+                        await self._update_status()
+                        raise
                     except (mg_errors.PyMongoError, ConnectionError) as db_exc:
                         self.logger.error(f"MongoDB error while validating posts for task {self.task_id}: {db_exc}")
                         await reporter.event(run_id, self.task_id, "ERROR", "error.db_mongo_post_validation_failed", f"MongoDB error while validating posts: {db_exc}", {'error': repr(db_exc)})
@@ -403,7 +446,8 @@ class Task:
                     attempt = 0
                     while attempt < retries:
                         try:
-                            await client.react(post.message_id, post.chat_id)
+                            # Use message_link for proper entity resolution (username-based links resolve better than bare IDs)
+                            await client.react(message_link=post.message_link)
                             self.logger.debug(f"Client {client.account_id} reacted to post {post.post_id}")
                             await reporter.event(run_id, self.task_id, "DEBUG", "info.worker.react", 
                                                  f"Client {client.phone_number} reacted to post {post.post_id} with {self.get_reaction_palette_name()}",
@@ -411,11 +455,13 @@ class Task:
                             break  # Success, exit retry loop
                         except errors.FloodWaitError as e:
                             attempt += 1
-                            self.logger.error(f"Client {client.account_id} hit FloodWaitError on post {post.post_id}: wait for {e.seconds} seconds. Attempt {attempt}/{retries}")
+                            wait_seconds = e.seconds
+                            required_sleep = wait_seconds + 5
+                            self.logger.error(f"Client {client.account_id} hit FloodWaitError on post {post.post_id}: wait for {wait_seconds} seconds. Attempt {attempt}/{retries}")
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.flood_wait", 
-                                                 f"Client {client.phone_number} hit FloodWaitError on post {post.post_id}: wait for {e.seconds} seconds. Attempt {attempt}/{retries}",
-                                                 {"client": client.phone_number, "post_id": post.post_id, "wait_seconds": e.seconds, "attempt": attempt})
-                            await asyncio.sleep(e.seconds + 5)  # Sleep for the required time plus a buffer
+                                                 f"Client {client.phone_number} hit FloodWaitError on post {post.post_id}: wait for {wait_seconds} seconds. Attempt {attempt}/{retries}",
+                                                 {"client": client.phone_number, "post_id": post.post_id, "wait_seconds": wait_seconds, "required_sleep": required_sleep, "attempt": attempt, "flood_wait_seconds": wait_seconds})
+                            await asyncio.sleep(required_sleep)  # Sleep for the required time plus a buffer
                         except errors.SessionPasswordNeededError:
                             self.logger.error(f"Client {client.account_id} requires 2FA password to proceed. Stopping worker.")
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.2fa_required", 
@@ -485,7 +531,18 @@ class Task:
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.message_id_invalid", 
                                                  f"Client {client.phone_number} encountered MessageIdInvalidError on post {post.post_id}. Skipping post.",
                                                  {"client": client.phone_number, "post_id": post.post_id})
-                            break                        
+                            break
+                        except ValueError as e:
+                            # Catches entity resolution errors like "Could not find the input entity"
+                            if "Could not find the input entity" in str(e) or "PeerUser" in str(e):
+                                self.logger.error(f"Client {client.account_id} could not resolve entity for post {post.post_id} (invalid chat_id or broken message link). Skipping post.")
+                                await reporter.event(run_id, self.task_id, "ERROR", "error.worker.entity_not_found", 
+                                                     f"Client {client.phone_number} could not resolve entity for post {post.post_id}. Possibly invalid chat_id or message link. Skipping post.",
+                                                     {"client": client.phone_number, "post_id": post.post_id, "error": str(e)})
+                                break
+                            else:
+                                # Other ValueError - raise it
+                                raise
                         except Exception as e:
                             self.logger.warning(f"Client {client.account_id} failed to react to post {post.post_id}: {e}")
                             await reporter.event(run_id, self.task_id, "WARNING", "error.worker.react", f"Client {client.phone_number} failed to react to post {post.post_id}: {e}", {'error': repr(e)})

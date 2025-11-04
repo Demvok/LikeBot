@@ -1141,7 +1141,8 @@ async def get_task_runs(
 
         eventManager = RunEventManager()
         runs: DataFrame = await eventManager.get_runs(task_id)
-        runs_json = json.loads(runs.drop(['_id'], axis=1).to_json(orient='records'))
+        # Drop _id column if it exists (database already removes it, but ensure it's gone)
+        runs_json = json.loads(runs.drop(columns=['_id'], errors='ignore').to_json(orient='records'))
 
         return {
             "task_id": task_id,
