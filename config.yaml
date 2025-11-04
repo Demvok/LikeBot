@@ -29,3 +29,11 @@ delays:
   reconnect_delay: 3  # Delay between reconnection attempts
   action_retries: 1  # Number of retries for actions
   action_retry_delay: 2  # Delay between action retries
+  
+  # CRITICAL ANTI-SPAM DELAYS (prevent account bans)
+  min_delay_between_reactions: 3  # Minimum seconds between reactions (per account)
+  max_delay_between_reactions: 8  # Maximum seconds between reactions (per account)
+  min_delay_before_reaction: 1  # Additional random delay before sending reaction (min)
+  max_delay_before_reaction: 3  # Additional random delay before sending reaction (max)
+  worker_start_delay_min: 2  # Minimum delay before worker starts (stagger workers)
+  worker_start_delay_max: 10  # Maximum delay before worker starts (stagger workers)

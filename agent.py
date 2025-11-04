@@ -50,6 +50,14 @@ class Account(object):
             self.status = account_data.get('status', self.AccountStatus.NEW)
             self.created_at = account_data.get('created_at', Timestamp.now())
             self.updated_at = account_data.get('updated_at', Timestamp.now())
+            
+            # Status tracking fields
+            self.last_error = account_data.get('last_error', None)
+            self.last_error_type = account_data.get('last_error_type', None)
+            self.last_error_time = account_data.get('last_error_time', None)
+            self.last_success_time = account_data.get('last_success_time', None)
+            self.last_checked = account_data.get('last_checked', None)
+            self.flood_wait_until = account_data.get('flood_wait_until', None)
 
         except KeyError as e:
             raise ValueError(f"Missing key in account configuration: {e}")
@@ -61,10 +69,80 @@ class Account(object):
             self.session_name = self.phone_number
     
     def __repr__(self):
-        return f"Account({self.account_id}, {self.phone_number})"
+        return f"Account({self.account_id}, {self.phone_number}, status={self.status})"
     
     def __str__(self):
-        return f"Account ID: {self.account_id}, phone: {self.phone_number}, session: {self.session_name}"
+        return f"Account ID: {self.account_id}, phone: {self.phone_number}, status: {self.status}"
+    
+    def is_usable(self) -> bool:
+        """Check if account can be used in tasks."""
+        return AccountStatus.is_usable(self.status)
+    
+    def needs_attention(self) -> bool:
+        """Check if account requires manual intervention."""
+        return AccountStatus.needs_attention(self.status)
+    
+    async def update_status(self, new_status: AccountStatus, error: Exception = None, success: bool = False):
+        """
+        Update account status and related tracking fields in database.
+        
+        Args:
+            new_status: New AccountStatus to set
+            error: Optional exception that caused the status change
+            success: If True, updates last_success_time
+        """
+        from database import get_db
+        from datetime import datetime, timezone
+        
+        db = get_db()
+        update_data = {
+            'status': new_status.name if isinstance(new_status, AccountStatus) else new_status,
+            'last_checked': datetime.now(timezone.utc),
+            'updated_at': datetime.now(timezone.utc)
+        }
+        
+        if error:
+            update_data['last_error'] = str(error)
+            update_data['last_error_type'] = type(error).__name__
+            update_data['last_error_time'] = datetime.now(timezone.utc)
+        
+        if success:
+            update_data['last_success_time'] = datetime.now(timezone.utc)
+            # Clear error fields on success
+            update_data['last_error'] = None
+            update_data['last_error_type'] = None
+        
+        # Update local instance
+        self.status = new_status
+        self.last_checked = update_data['last_checked']
+        if error:
+            self.last_error = update_data['last_error']
+            self.last_error_type = update_data['last_error_type']
+            self.last_error_time = update_data['last_error_time']
+        if success:
+            self.last_success_time = update_data['last_success_time']
+            self.last_error = None
+            self.last_error_type = None
+        
+        # Update database
+        await db.update_account(self.phone_number, update_data)
+    
+    async def set_flood_wait(self, seconds: int):
+        """Set flood wait status and expiration time."""
+        from database import get_db
+        from datetime import datetime, timezone, timedelta
+        
+        db = get_db()
+        flood_wait_until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        
+        await db.update_account(self.phone_number, {
+            'status': AccountStatus.FLOOD_WAIT.name,
+            'flood_wait_until': flood_wait_until,
+            'last_checked': datetime.now(timezone.utc)
+        })
+        
+        self.status = AccountStatus.FLOOD_WAIT
+        self.flood_wait_until = flood_wait_until
     
     def to_dict(self, secure=False):
         """Convert Account object to dictionary matching AccountDict schema.
@@ -81,7 +159,13 @@ class Account(object):
             'notes': self.notes,
             'status': self.status.name if isinstance(self.status, AccountStatus) else self.status,
             'created_at': self.created_at,
-            'updated_at': self.updated_at
+            'updated_at': self.updated_at,
+            'last_error': self.last_error,
+            'last_error_type': self.last_error_type,
+            'last_error_time': self.last_error_time,
+            'last_success_time': self.last_success_time,
+            'last_checked': self.last_checked,
+            'flood_wait_until': self.flood_wait_until
         }
         
         if not secure:
@@ -459,18 +543,22 @@ class Client(object):
                 try:
                     await self.client.get_me()
                     self.logger.debug(f"Client for {self.phone_number} started successfully.")
-                except errors.AuthKeyUnregisteredError:
+                    # Update status to ACTIVE on successful connection
+                    await self.account.update_status(AccountStatus.ACTIVE, success=True)
+                except errors.AuthKeyUnregisteredError as auth_error:
                     self.logger.warning(f"Session for {self.phone_number} is invalid/expired. Creating new session...")
                     self.session_encrypted = None
                     force_new_session = True
                     session_created = False
                     
+                    # Update account status
+                    await self.account.update_status(AccountStatus.AUTH_KEY_INVALID, error=auth_error)
+                    
                     # Update database to clear invalid session
                     from database import get_db
                     db = get_db()
                     await db.update_account(self.phone_number, {
-                        'session_encrypted': None, 
-                        'status': AccountStatus.NEW.name
+                        'session_encrypted': None
                     })
                     
                     await self.client.disconnect()
@@ -482,8 +570,17 @@ class Client(object):
                         self.logger.debug(f"Decremented usage counter for proxy {proxy_data.get('proxy_name')}")
                     
                     continue  # Retry with new session
-                except errors.UserDeactivatedError:
-                    self.logger.error(f"Account {self.phone_number} has been deactivated.")
+                except (errors.AuthKeyInvalidatedError, errors.UserDeactivatedError) as auth_error:
+                    self.logger.error(f"Account {self.phone_number} authentication failed: {auth_error}")
+                    # Update account status
+                    if isinstance(auth_error, errors.UserDeactivatedError):
+                        await self.account.update_status(AccountStatus.DEACTIVATED, error=auth_error)
+                    else:
+                        await self.account.update_status(AccountStatus.AUTH_KEY_INVALID, error=auth_error)
+                    raise
+                except errors.UserDeactivatedBanError as ban_error:
+                    self.logger.error(f"Account {self.phone_number} has been banned.")
+                    await self.account.update_status(AccountStatus.BANNED, error=ban_error)
                     raise
                 except errors.UserDeactivatedBanError:
                     self.logger.error(f"Account {self.phone_number} has been banned.")
@@ -494,12 +591,13 @@ class Client(object):
             
                 return self
                 
-            except (errors.AuthKeyUnregisteredError, errors.UserDeactivatedError, errors.UserDeactivatedBanError):
-                # Don't retry on these errors
+            except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidatedError, errors.UserDeactivatedError, errors.UserDeactivatedBanError):
+                # Don't retry on these errors - status already updated above
                 raise
             except ValueError as e:
                 # Session creation errors - don't retry connection
                 self.logger.error(f"Failed to create session for {self.phone_number}: {e}")
+                await self.account.update_status(AccountStatus.ERROR, error=e)
                 raise
             except Exception as e:
                 self.logger.error(f"Failed to connect client for {self.phone_number} (attempt {attempt}/{retries}): {e}")
@@ -507,6 +605,7 @@ class Client(object):
                     await asyncio.sleep(delay)
                 else:
                     self.logger.critical(f"All connection attempts failed for {self.phone_number}. Error: {e}")
+                    await self.account.update_status(AccountStatus.ERROR, error=e)
                     raise
 
     async def disconnect(self):
@@ -646,15 +745,26 @@ class Client(object):
         """
         await self.ensure_connected()
         
-        # Humanization delay
-        if config.get('delays', {}).get('humanisation_level', 1) >= 1:
+        # CRITICAL: ALWAYS add reading time delay to prevent spam detection
+        # Even at humanisation_level 0, we need basic delays
+        humanisation_level = config.get('delays', {}).get('humanisation_level', 1)
+        if humanisation_level >= 1:
+            # Full humanization: fetch message content and estimate reading time
             msg_content = await self.get_message_content(chat_id=target_chat.id if hasattr(target_chat, 'id') else target_chat, message_id=message.id)
-            if not msg_content:
-                self.logger.warning("Message content is empty, skipping reaction.")
-                return
-            reading_time = self.estimate_reading_time(msg_content)
-            self.logger.debug(f"Estimated reading time: {reading_time} seconds")
-            await asyncio.sleep(reading_time)
+            if msg_content:
+                reading_time = self.estimate_reading_time(msg_content)
+                self.logger.debug(f"Estimated reading time: {reading_time} seconds")
+                await asyncio.sleep(reading_time)
+            else:
+                # Message content empty - use fallback delay
+                fallback_delay = random.uniform(2, 5)
+                self.logger.debug(f"Message content empty, using fallback delay: {fallback_delay:.2f}s")
+                await asyncio.sleep(fallback_delay)
+        else:
+            # Minimal humanization: just add a random delay to prevent instant reactions
+            minimal_delay = random.uniform(1.5, 4)
+            self.logger.debug(f"Minimal humanization delay: {minimal_delay:.2f}s")
+            await asyncio.sleep(minimal_delay)
 
         # Check for active emoji palette
         if not self.active_emoji_palette:
@@ -709,8 +819,12 @@ class Client(object):
             self.logger.error(error_msg)
             raise ValueError(error_msg)
         
-        # Simulate human-like delay before reacting
-        await asyncio.sleep(random.uniform(0.5, 2))
+        # Simulate human-like delay before reacting (additional unpredictability)
+        min_delay = config.get('delays', {}).get('min_delay_before_reaction', 1)
+        max_delay = config.get('delays', {}).get('max_delay_before_reaction', 3)
+        pre_reaction_delay = random.uniform(min_delay, max_delay)
+        self.logger.debug(f"Pre-reaction delay: {pre_reaction_delay:.2f}s")
+        await asyncio.sleep(pre_reaction_delay)
         
         # Try to send reaction
         if self.palette_ordered:
@@ -883,18 +997,18 @@ class Client(object):
             # Спроба передати повний URL (Telethon підтримує це)
             try:
                 entity = await self.client.get_entity(username)
-            except errors.AuthKeyUnregisteredError as auth_error:
-                # Session is invalid/expired - re-raise for proper handling upstream
-                self.logger.error(f"Session invalid/expired while resolving '{username}': {auth_error}")
+            except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidatedError, errors.UserDeactivatedError, errors.UserDeactivatedBanError) as auth_error:
+                # Session is invalid/expired or account is banned - re-raise for proper handling upstream
+                self.logger.error(f"Session invalid/expired or account deactivated while resolving '{username}': {auth_error}")
                 raise
             except Exception as e1:
                 # спробуємо з повним URL
                 try:
                     # деякі варіанти Telethon підтримують прямий URL
                     entity = await self.client.get_entity(parsed.netloc + '/' + username)
-                except errors.AuthKeyUnregisteredError as auth_error:
-                    # Session is invalid/expired - re-raise for proper handling upstream
-                    self.logger.error(f"Session invalid/expired while resolving '{username}': {auth_error}")
+                except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidatedError, errors.UserDeactivatedError, errors.UserDeactivatedBanError) as auth_error:
+                    # Session is invalid/expired or account is banned - re-raise for proper handling upstream
+                    self.logger.error(f"Session invalid/expired or account deactivated while resolving '{username}': {auth_error}")
                     raise
                 except Exception as e2:
                     self.logger.error(f"Failed to resolve username '{username}': {e1}, fallback: {e2}")
@@ -903,7 +1017,7 @@ class Client(object):
             chat_id = entity.id
             return chat_id, message_id
 
-        except errors.AuthKeyUnregisteredError:
+        except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidatedError, errors.UserDeactivatedError, errors.UserDeactivatedBanError):
             # Re-raise auth errors without wrapping them
             raise
         except Exception as e:

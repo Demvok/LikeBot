@@ -41,11 +41,30 @@ class UserRole(Enum):
 
 
 class AccountStatus(Enum):
-    """Account status enumeration."""
-    ACTIVE = auto()
-    LOGGED_IN = auto()
+    """
+    Account status enumeration with detailed states.
+    
+    States:
+    - NEW: Account created but not logged in
+    - ACTIVE: Account is healthy and ready to use
+    - LOGGED_IN: Account successfully logged in (legacy, use ACTIVE)
+    - SESSION_EXPIRED: Session needs refresh (temporary state)
+    - AUTH_KEY_INVALID: Session invalid, needs re-login
+    - BANNED: Account banned by Telegram
+    - DEACTIVATED: Account deactivated by Telegram
+    - RESTRICTED: Account has restrictions
+    - FLOOD_WAIT: Account in flood wait state (temporary)
+    - ERROR: Generic error state (use more specific states when possible)
+    """
     NEW = auto()
+    ACTIVE = auto()
+    LOGGED_IN = auto()  # Legacy, equivalent to ACTIVE
+    SESSION_EXPIRED = auto()
+    AUTH_KEY_INVALID = auto()
     BANNED = auto()
+    DEACTIVATED = auto()
+    RESTRICTED = auto()
+    FLOOD_WAIT = auto()
     ERROR = auto()
     
     def __str__(self):
@@ -53,6 +72,26 @@ class AccountStatus(Enum):
     
     def __repr__(self):
         return self.name
+    
+    @classmethod
+    def is_usable(cls, status) -> bool:
+        """Check if account status allows usage in tasks."""
+        if isinstance(status, str):
+            try:
+                status = cls[status]
+            except KeyError:
+                return False
+        return status in (cls.ACTIVE, cls.LOGGED_IN)
+    
+    @classmethod
+    def needs_attention(cls, status) -> bool:
+        """Check if account status requires manual intervention."""
+        if isinstance(status, str):
+            try:
+                status = cls[status]
+            except KeyError:
+                return True
+        return status in (cls.AUTH_KEY_INVALID, cls.BANNED, cls.DEACTIVATED, cls.ERROR)
 
 
 class TaskStatus(Enum):
@@ -192,6 +231,14 @@ class AccountBase(BaseModel):
     twofa: bool = Field(False, description="Is 2FA enabled for this account?")
     password_encrypted: Optional[str] = Field(None, description="Encrypted password for 2FA")
     notes: Optional[str] = Field("", description="Account notes")
+    
+    # Status tracking fields
+    last_error: Optional[str] = Field(None, description="Last error message encountered")
+    last_error_type: Optional[str] = Field(None, description="Type of last error (e.g., AuthKeyUnregisteredError)")
+    last_error_time: Optional[datetime] = Field(None, description="Timestamp of last error")
+    last_success_time: Optional[datetime] = Field(None, description="Timestamp of last successful operation")
+    last_checked: Optional[datetime] = Field(None, description="Last time account status was checked")
+    flood_wait_until: Optional[datetime] = Field(None, description="Timestamp until which account is in flood wait")
 
     @field_validator('phone_number')
     def validate_phone_number(cls, v):

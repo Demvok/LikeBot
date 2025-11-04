@@ -1,5 +1,5 @@
 from pandas import Timestamp
-import asyncio, datetime
+import asyncio, datetime, random
 from enum import Enum, auto
 
 from telethon import errors
@@ -152,15 +152,15 @@ class Post:
                             if logger:
                                 logger.warning(f"Post {post.post_id} validation returned but not validated with client {client_idx + 1}")
                     
-                    except errors.AuthKeyUnregisteredError as auth_error:
+                    except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidatedError) as auth_error:
                         last_error = auth_error
                         if logger:
                             logger.error(f"Client {client.phone_number} has invalid/expired session while validating post {post.post_id}: {auth_error}")
-                        # Mark account as ERROR in database
+                        # Update account status using centralized method
                         try:
-                            await db.update_account(client.phone_number, {'status': Account.AccountStatus.ERROR.name})
+                            await client.account.update_status(Account.AccountStatus.AUTH_KEY_INVALID, error=auth_error)
                             if logger:
-                                logger.info(f"Marked account {client.phone_number} as ERROR due to invalid session")
+                                logger.info(f"Marked account {client.phone_number} as AUTH_KEY_INVALID due to invalid session")
                         except Exception as update_error:
                             if logger:
                                 logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
@@ -171,9 +171,9 @@ class Post:
                         last_error = ban_error
                         if logger:
                             logger.error(f"Client {client.phone_number} is banned: {ban_error}")
-                        # Mark account as BANNED in database
+                        # Update account status using centralized method
                         try:
-                            await db.update_account(client.phone_number, {'status': Account.AccountStatus.BANNED.name})
+                            await client.account.update_status(Account.AccountStatus.BANNED, error=ban_error)
                             if logger:
                                 logger.info(f"Marked account {client.phone_number} as BANNED")
                         except Exception as update_error:
@@ -186,9 +186,9 @@ class Post:
                         last_error = ban_error
                         if logger:
                             logger.error(f"Client {client.phone_number} phone number is banned: {ban_error}")
-                        # Mark account as BANNED in database
+                        # Update account status using centralized method
                         try:
-                            await db.update_account(client.phone_number, {'status': Account.AccountStatus.BANNED.name})
+                            await client.account.update_status(Account.AccountStatus.BANNED, error=ban_error)
                             if logger:
                                 logger.info(f"Marked account {client.phone_number} as BANNED")
                         except Exception as update_error:
@@ -383,6 +383,30 @@ class Task:
                     await self._update_status()
                     raise
                 await reporter.event(run_id, self.task_id, "DEBUG", "info.init.data_loaded", f"Got accounts and posts objects.")
+                
+                # Filter accounts by status - only use usable accounts
+                total_accounts = len(accounts)
+                usable_accounts = [acc for acc in accounts if acc.is_usable()]
+                unusable_accounts = [acc for acc in accounts if not acc.is_usable()]
+                
+                if unusable_accounts:
+                    unusable_details = [f"{acc.phone_number} ({acc.status.name})" for acc in unusable_accounts]
+                    self.logger.warning(f"Excluding {len(unusable_accounts)}/{total_accounts} accounts with unusable status: {', '.join(unusable_details)}")
+                    await reporter.event(run_id, self.task_id, "WARNING", "warn.accounts_filtered", 
+                                       f"Excluding {len(unusable_accounts)}/{total_accounts} accounts with unusable status",
+                                       {"excluded_accounts": unusable_details, "total": total_accounts, "usable": len(usable_accounts)})
+                
+                if not usable_accounts:
+                    error_msg = f"No usable accounts available. All {total_accounts} accounts have non-usable status."
+                    self.logger.error(error_msg)
+                    await reporter.event(run_id, self.task_id, "ERROR", "error.no_usable_accounts", error_msg,
+                                       {"unusable_accounts": unusable_details})
+                    self.status = Task.TaskStatus.CRASHED
+                    await self._update_status()
+                    raise ValueError(error_msg)
+                
+                accounts = usable_accounts
+                self.logger.info(f"Using {len(accounts)} usable accounts out of {total_accounts} total accounts")
 
                 await self._check_pause(reporter, run_id)
                 self._clients = await Client.connect_clients(accounts, self.logger)
@@ -392,7 +416,7 @@ class Task:
                 if self._clients:  # Validate posts to get corresponding ids
                     try:
                         posts = await Post.mass_validate_posts(posts, self._clients, self.logger)
-                    except errors.AuthKeyUnregisteredError as auth_exc:
+                    except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidatedError) as auth_exc:
                         self.logger.error(f"Session invalid/expired while validating posts for task {self.task_id}: {auth_exc}")
                         await reporter.event(run_id, self.task_id, "ERROR", "error.session_invalid_post_validation", f"Session invalid/expired while validating posts: {auth_exc}. Please re-login affected accounts.", {'error': repr(auth_exc)})
                         self.status = Task.TaskStatus.CRASHED
@@ -485,6 +509,13 @@ class Task:
 
     @crash_handler
     async def client_worker(self, client, posts, reporter, run_id):
+        # CRITICAL: Stagger worker starts to prevent all accounts hitting API simultaneously
+        worker_delay_min = config.get('delays', {}).get('worker_start_delay_min', 2)
+        worker_delay_max = config.get('delays', {}).get('worker_start_delay_max', 10)
+        start_delay = random.uniform(worker_delay_min, worker_delay_max)
+        self.logger.info(f"Worker for {client.phone_number} starting in {start_delay:.2f}s (anti-spam stagger)")
+        await asyncio.sleep(start_delay)
+        
         await reporter.event(run_id, self.task_id, "INFO", "info.worker", f"Worker started for client {client.phone_number}")
         if self.get_action_type() == 'react':
             await reporter.event(run_id, self.task_id, "DEBUG", "info.worker.action", "Worker proceeds to reacting")
@@ -518,6 +549,12 @@ class Task:
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.flood_wait", 
                                                  f"Client {client.phone_number} hit FloodWaitError on post {post.post_id}: wait for {wait_seconds} seconds. Attempt {attempt}/{retries}",
                                                  {"client": client.phone_number, "post_id": post.post_id, "wait_seconds": wait_seconds, "required_sleep": required_sleep, "attempt": attempt, "flood_wait_seconds": wait_seconds})
+                            # Update account with flood wait status
+                            try:
+                                await client.account.set_flood_wait(wait_seconds, error=e)
+                                self.logger.info(f"Marked account {client.phone_number} as FLOOD_WAIT until {wait_seconds}s from now")
+                            except Exception as update_error:
+                                self.logger.warning(f"Failed to update flood wait status for {client.phone_number}: {update_error}")
                             await asyncio.sleep(required_sleep)  # Sleep for the required time plus a buffer
                         except errors.SessionPasswordNeededError:
                             self.logger.error(f"Client {client.account_id} requires 2FA password to proceed. Stopping worker.")
@@ -549,45 +586,39 @@ class Task:
                                                  f"Client {client.phone_number} cannot access the chat for post {post.post_id} (channel might be private). Skipping post.",
                                                  {"client": client.phone_number, "post_id": post.post_id})
                             break
-                        except errors.PhoneNumberBannedError:
+                        except errors.PhoneNumberBannedError as e:
                             self.logger.error(f"Client {client.account_id} is banned. Stopping worker.")
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.phone_banned", 
                                                  f"Client {client.phone_number} is banned. Stopping worker.",
                                                  {"client": client.phone_number})
-                            # Mark account as BANNED in database
-                            from database import get_db
+                            # Update account status using centralized method
                             try:
-                                db = get_db()
-                                await db.update_account(client.phone_number, {'status': Account.AccountStatus.BANNED.name})
+                                await client.account.update_status(Account.AccountStatus.BANNED, error=e)
                                 self.logger.info(f"Marked account {client.phone_number} as BANNED")
                             except Exception as update_error:
                                 self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
                             return
-                        except errors.UserDeactivatedBanError:
+                        except errors.UserDeactivatedBanError as e:
                             self.logger.error(f"Client {client.account_id} account is deactivated/banned. Stopping worker.")
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.user_deactivated_ban", 
                                                  f"Client {client.phone_number} account is deactivated/banned. Stopping worker.",
                                                  {"client": client.phone_number})
-                            # Mark account as BANNED in database
-                            from database import get_db
+                            # Update account status using centralized method
                             try:
-                                db = get_db()
-                                await db.update_account(client.phone_number, {'status': Account.AccountStatus.BANNED.name})
-                                self.logger.info(f"Marked account {client.phone_number} as BANNED")
+                                await client.account.update_status(Account.AccountStatus.DEACTIVATED, error=e)
+                                self.logger.info(f"Marked account {client.phone_number} as DEACTIVATED")
                             except Exception as update_error:
                                 self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
                             return
-                        except errors.AuthKeyUnregisteredError:
+                        except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidatedError) as e:
                             self.logger.error(f"Client {client.account_id} has invalid/expired session. Stopping worker.")
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.session_invalid", 
                                                  f"Client {client.phone_number} has invalid/expired session. Stopping worker.",
                                                  {"client": client.phone_number})
-                            # Mark account as ERROR in database
-                            from database import get_db
+                            # Update account status using centralized method
                             try:
-                                db = get_db()
-                                await db.update_account(client.phone_number, {'status': Account.AccountStatus.ERROR.name})
-                                self.logger.info(f"Marked account {client.phone_number} as ERROR due to invalid session")
+                                await client.account.update_status(Account.AccountStatus.AUTH_KEY_INVALID, error=e)
+                                self.logger.info(f"Marked account {client.phone_number} as AUTH_KEY_INVALID due to invalid session")
                             except Exception as update_error:
                                 self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
                             return
@@ -643,7 +674,13 @@ class Task:
                     if attempt == retries:   # Optionally, log/report if all retries failed
                         self.logger.error(f"Client {client.account_id} failed to react to post {post.post_id} after {retries} attempts due to repeated FloodWaitError.")
                         await reporter.event(run_id, self.task_id, "ERROR", "error.worker.react.max_retries", f"Client {client.phone_number} failed to react to post {post.post_id} after {retries} FloodWaitError retries.", {"client": client.phone_number, "post_id": post.post_id, "retries": retries})
-                # add per-post sleep
+                
+                # CRITICAL: Add delay between reactions to prevent spam detection
+                min_delay = config.get('delays', {}).get('min_delay_between_reactions', 3)
+                max_delay = config.get('delays', {}).get('max_delay_between_reactions', 8)
+                inter_reaction_delay = random.uniform(min_delay, max_delay)
+                self.logger.debug(f"Waiting {inter_reaction_delay:.2f}s before next reaction (anti-spam delay)")
+                await asyncio.sleep(inter_reaction_delay)
 
 
         if self.get_action_type() == 'comment':  # Logic to handle comment actions can be added here
