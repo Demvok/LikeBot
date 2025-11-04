@@ -152,26 +152,77 @@ class Post:
                             if logger:
                                 logger.warning(f"Post {post.post_id} validation returned but not validated with client {client_idx + 1}")
                     
+                    except errors.AuthKeyUnregisteredError as auth_error:
+                        last_error = auth_error
+                        if logger:
+                            logger.error(f"Client {client.phone_number} has invalid/expired session while validating post {post.post_id}: {auth_error}")
+                        # Mark account as ERROR in database
+                        try:
+                            await db.update_account(client.phone_number, {'status': Account.AccountStatus.ERROR.name})
+                            if logger:
+                                logger.info(f"Marked account {client.phone_number} as ERROR due to invalid session")
+                        except Exception as update_error:
+                            if logger:
+                                logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
+                        # Try next client
+                        continue
+                    
+                    except errors.UserDeactivatedBanError as ban_error:
+                        last_error = ban_error
+                        if logger:
+                            logger.error(f"Client {client.phone_number} is banned: {ban_error}")
+                        # Mark account as BANNED in database
+                        try:
+                            await db.update_account(client.phone_number, {'status': Account.AccountStatus.BANNED.name})
+                            if logger:
+                                logger.info(f"Marked account {client.phone_number} as BANNED")
+                        except Exception as update_error:
+                            if logger:
+                                logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
+                        # Try next client
+                        continue
+                    
+                    except errors.PhoneNumberBannedError as ban_error:
+                        last_error = ban_error
+                        if logger:
+                            logger.error(f"Client {client.phone_number} phone number is banned: {ban_error}")
+                        # Mark account as BANNED in database
+                        try:
+                            await db.update_account(client.phone_number, {'status': Account.AccountStatus.BANNED.name})
+                            if logger:
+                                logger.info(f"Marked account {client.phone_number} as BANNED")
+                        except Exception as update_error:
+                            if logger:
+                                logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
+                        # Try next client
+                        continue
+                    
                     except errors.RPCError as rpc_error:
                         last_error = rpc_error
                         if logger:
-                            logger.warning(f"Telegram error validating post {post.post_id} with client {client_idx + 1}/{clients_to_try}: {rpc_error}")
+                            logger.warning(f"Telegram error validating post {post.post_id} with client {client.phone_number}: {rpc_error}")
                         # Try next client
                         continue
                     
                     except Exception as client_error:
                         last_error = client_error
                         if logger:
-                            logger.warning(f"Error validating post {post.post_id} with client {client_idx + 1}/{clients_to_try}: {client_error}")
+                            logger.warning(f"Error validating post {post.post_id} with client {client.phone_number}: {client_error}")
                         # Try next client
                         continue
                 
                 # If all attempted clients failed, add to failed count and raise the last error
                 if not validation_succeeded:
                     failed_validation += 1
+                    error_type = type(last_error).__name__ if last_error else "Unknown"
                     if logger:
-                        logger.error(f"Post {post.post_id} failed validation with {clients_to_try} clients. Last error: {last_error}")
-                    raise last_error if last_error else ValueError(f"Post {post.post_id} failed validation with {clients_to_try} clients")
+                        logger.error(f"Post {post.post_id} failed validation with {clients_to_try} clients. Last error ({error_type}): {last_error}")
+                    
+                    # Provide more helpful error message based on error type
+                    if isinstance(last_error, errors.AuthKeyUnregisteredError):
+                        raise ValueError(f"Post {post.post_id} validation failed: All {clients_to_try} client sessions are invalid/expired. Please re-login accounts.")
+                    else:
+                        raise last_error if last_error else ValueError(f"Post {post.post_id} failed validation with {clients_to_try} clients")
 
             except Exception as e:
                 if logger:
@@ -341,6 +392,12 @@ class Task:
                 if self._clients:  # Validate posts to get corresponding ids
                     try:
                         posts = await Post.mass_validate_posts(posts, self._clients, self.logger)
+                    except errors.AuthKeyUnregisteredError as auth_exc:
+                        self.logger.error(f"Session invalid/expired while validating posts for task {self.task_id}: {auth_exc}")
+                        await reporter.event(run_id, self.task_id, "ERROR", "error.session_invalid_post_validation", f"Session invalid/expired while validating posts: {auth_exc}. Please re-login affected accounts.", {'error': repr(auth_exc)})
+                        self.status = Task.TaskStatus.CRASHED
+                        await self._update_status()
+                        raise
                     except errors.RPCError as rpc_exc:
                         self.logger.error(f"Telegram API error while validating posts for task {self.task_id}: {rpc_exc}")
                         await reporter.event(run_id, self.task_id, "ERROR", "error.telegram_post_validation_failed", f"Telegram API error while validating posts: {rpc_exc}", {'error': repr(rpc_exc)})
@@ -497,6 +554,42 @@ class Task:
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.phone_banned", 
                                                  f"Client {client.phone_number} is banned. Stopping worker.",
                                                  {"client": client.phone_number})
+                            # Mark account as BANNED in database
+                            from database import get_db
+                            try:
+                                db = get_db()
+                                await db.update_account(client.phone_number, {'status': Account.AccountStatus.BANNED.name})
+                                self.logger.info(f"Marked account {client.phone_number} as BANNED")
+                            except Exception as update_error:
+                                self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
+                            return
+                        except errors.UserDeactivatedBanError:
+                            self.logger.error(f"Client {client.account_id} account is deactivated/banned. Stopping worker.")
+                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.user_deactivated_ban", 
+                                                 f"Client {client.phone_number} account is deactivated/banned. Stopping worker.",
+                                                 {"client": client.phone_number})
+                            # Mark account as BANNED in database
+                            from database import get_db
+                            try:
+                                db = get_db()
+                                await db.update_account(client.phone_number, {'status': Account.AccountStatus.BANNED.name})
+                                self.logger.info(f"Marked account {client.phone_number} as BANNED")
+                            except Exception as update_error:
+                                self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
+                            return
+                        except errors.AuthKeyUnregisteredError:
+                            self.logger.error(f"Client {client.account_id} has invalid/expired session. Stopping worker.")
+                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.session_invalid", 
+                                                 f"Client {client.phone_number} has invalid/expired session. Stopping worker.",
+                                                 {"client": client.phone_number})
+                            # Mark account as ERROR in database
+                            from database import get_db
+                            try:
+                                db = get_db()
+                                await db.update_account(client.phone_number, {'status': Account.AccountStatus.ERROR.name})
+                                self.logger.info(f"Marked account {client.phone_number} as ERROR due to invalid session")
+                            except Exception as update_error:
+                                self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
                             return
                         except ConnectionError as e:
                             attempt += 1

@@ -883,11 +883,19 @@ class Client(object):
             # Спроба передати повний URL (Telethon підтримує це)
             try:
                 entity = await self.client.get_entity(username)
+            except errors.AuthKeyUnregisteredError as auth_error:
+                # Session is invalid/expired - re-raise for proper handling upstream
+                self.logger.error(f"Session invalid/expired while resolving '{username}': {auth_error}")
+                raise
             except Exception as e1:
                 # спробуємо з повним URL
                 try:
                     # деякі варіанти Telethon підтримують прямий URL
                     entity = await self.client.get_entity(parsed.netloc + '/' + username)
+                except errors.AuthKeyUnregisteredError as auth_error:
+                    # Session is invalid/expired - re-raise for proper handling upstream
+                    self.logger.error(f"Session invalid/expired while resolving '{username}': {auth_error}")
+                    raise
                 except Exception as e2:
                     self.logger.error(f"Failed to resolve username '{username}': {e1}, fallback: {e2}")
                     raise ValueError(f"Cannot resolve username '{username}' from link {link}")
@@ -895,6 +903,9 @@ class Client(object):
             chat_id = entity.id
             return chat_id, message_id
 
+        except errors.AuthKeyUnregisteredError:
+            # Re-raise auth errors without wrapping them
+            raise
         except Exception as e:
             self.logger.warning(f"Error extracting IDs from '{link}': {e}")
             raise
