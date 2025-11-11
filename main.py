@@ -994,7 +994,8 @@ async def get_task_status(
             raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
         
         status = await task.get_status()
-        return {"task_id": task_id, "status": status.name if hasattr(status, 'name') else str(status)}
+        from schemas import status_name
+        return {"task_id": task_id, "status": status_name(status)}
     except HTTPException:
         raise
     except Exception as e:

@@ -9,12 +9,13 @@ database persistence integration, and a global pending_logins registry with clea
 import re, os, random, asyncio, uuid
 from datetime import datetime, timezone, timedelta
 from pandas import Timestamp 
-from telethon.tl.functions.messages import SendReactionRequest
+from telethon.tl.functions.messages import SendReactionRequest, GetMessagesViewsRequest
 from telethon import TelegramClient, functions, types, errors
 from telethon.sessions import StringSession
 from logger import setup_logger, load_config
 from dotenv import load_dotenv
-from schemas import AccountStatus, LoginStatus, LoginProcess
+from schemas import AccountStatus, LoginStatus, LoginProcess, status_name
+from telethon_error_handler import map_telethon_exception
 from urllib.parse import urlparse, unquote
 from encryption import (
     decrypt_secret,
@@ -96,7 +97,7 @@ class Account(object):
         
         db = get_db()
         update_data = {
-            'status': new_status.name if isinstance(new_status, AccountStatus) else new_status,
+            'status': status_name(new_status),
             'last_checked': datetime.now(timezone.utc),
             'updated_at': datetime.now(timezone.utc)
         }
@@ -127,22 +128,40 @@ class Account(object):
         # Update database
         await db.update_account(self.phone_number, update_data)
     
-    async def set_flood_wait(self, seconds: int):
-        """Set flood wait status and expiration time."""
+    async def set_flood_wait(self, seconds: int, error: Exception = None):
+        """Set flood wait status and expiration time.
+
+        Args:
+            seconds: number of seconds the flood wait will last
+            error: optional exception to record in last_error/last_error_type
+        """
         from database import get_db
         from datetime import datetime, timezone, timedelta
         
         db = get_db()
         flood_wait_until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
-        
-        await db.update_account(self.phone_number, {
-            'status': AccountStatus.FLOOD_WAIT.name,
+
+        # The explicit FLOOD_WAIT status was removed from AccountStatus. Use
+        # ERROR to flag the account for attention while still recording the
+        # flood-wait expiration. Record the error details when available.
+        update_payload = {
+            'status': AccountStatus.ERROR.name,
             'flood_wait_until': flood_wait_until,
             'last_checked': datetime.now(timezone.utc)
-        })
+        }
+        if error:
+            update_payload['last_error'] = str(error)
+            update_payload['last_error_type'] = type(error).__name__
+            update_payload['last_error_time'] = datetime.now(timezone.utc)
+
+        await db.update_account(self.phone_number, update_payload)
         
-        self.status = AccountStatus.FLOOD_WAIT
+        self.status = AccountStatus.ERROR
         self.flood_wait_until = flood_wait_until
+        if error:
+            self.last_error = update_payload.get('last_error')
+            self.last_error_type = update_payload.get('last_error_type')
+            self.last_error_time = update_payload.get('last_error_time')
     
     def to_dict(self, secure=False):
         """Convert Account object to dictionary matching AccountDict schema.
@@ -157,7 +176,7 @@ class Account(object):
             'session_encrypted': self.session_encrypted,
             'twofa': self.twofa,
             'notes': self.notes,
-            'status': self.status.name if isinstance(self.status, AccountStatus) else self.status,
+            'status': status_name(self.status),
             'created_at': self.created_at,
             'updated_at': self.updated_at,
             'last_error': self.last_error,
@@ -234,11 +253,25 @@ class Client(object):
 
     def __init__(self, account):
         self.account = account
-        try:
-            for attr in vars(account):  # Copy all fields from account
-                setattr(self, attr, getattr(account, attr))
-        except KeyError as e:
-            raise ValueError(f"Missing key in account configuration: {e}")
+        # Copy non-conflicting attributes from Account to Client instance.
+        # Some names (like phone_number, status, etc.) are exposed on Client
+        # as @property delegating to self.account; attempting to setattr on
+        # those will raise AttributeError because properties have no setter.
+        # To avoid that, skip attributes that are defined as properties on the
+        # Client class.
+        for attr, val in vars(account).items():
+            cls_attr = getattr(self.__class__, attr, None)
+            if isinstance(cls_attr, property):
+                # property exists on Client, skip copying to avoid AttributeError
+                continue
+            # set plain attribute on instance
+            try:
+                setattr(self, attr, val)
+            except Exception:
+                # Be defensive: if setting fails for any reason, skip it.
+                # The Client still retains a reference to the Account so
+                # callers can access authoritative values via client.account.
+                continue
         
         # Active emoji palette will be set during task execution from database
         self.active_emoji_palette = []
@@ -256,6 +289,38 @@ class Client(object):
     
     def __str__(self):
         return f"Client ({'connected' if self.is_connected else 'disconnected'}) for {self.phone_number} with session {self.session_name}"
+
+    # Expose dynamic properties from the underlying Account so that updates
+    # performed via Account.update_status(...) are immediately visible on the
+    # Client instance. This prevents stale client-level attributes when the
+    # account record is updated (DB + Account object) elsewhere.
+    @property
+    def phone_number(self):
+        return self.account.phone_number
+
+    @property
+    def account_id(self):
+        return self.account.account_id
+
+    @property
+    def status(self):
+        return self.account.status
+
+    @property
+    def last_error(self):
+        return self.account.last_error
+
+    @property
+    def last_error_type(self):
+        return self.account.last_error_type
+
+    @property
+    def last_error_time(self):
+        return self.account.last_error_time
+
+    @property
+    def flood_wait_until(self):
+        return self.account.flood_wait_until
 
     @property
     def is_connected(self):
@@ -421,7 +486,7 @@ class Client(object):
                     
                     from database import get_db  # Avoid circular import if any
                     db = get_db()
-                    await db.update_account(self.phone_number, {'session_encrypted': self.session_encrypted, 'status': AccountStatus.LOGGED_IN.name})
+                    await db.update_account(self.phone_number, {'session_encrypted': self.session_encrypted, 'status': AccountStatus.ACTIVE.name})
                     
                     self.logger.info(f"Session for {self.phone_number} saved.")
 
@@ -546,41 +611,52 @@ class Client(object):
                     # Update status to ACTIVE on successful connection
                     await self.account.update_status(AccountStatus.ACTIVE, success=True)
                 except errors.AuthKeyUnregisteredError as auth_error:
+                    # Centralized handling for auth-key invalid / revoked sessions
                     self.logger.warning(f"Session for {self.phone_number} is invalid/expired. Creating new session...")
                     self.session_encrypted = None
                     force_new_session = True
                     session_created = False
-                    
-                    # Update account status
-                    await self.account.update_status(AccountStatus.AUTH_KEY_INVALID, error=auth_error)
-                    
+
+                    mapping = map_telethon_exception(auth_error)
+                    try:
+                        if mapping.get('status'):
+                            await self.account.update_status(mapping['status'], error=auth_error)
+                    except Exception as _u:
+                        self.logger.warning(f"Failed to update account status for {self.phone_number}: {_u}")
+
                     # Update database to clear invalid session
                     from database import get_db
                     db = get_db()
                     await db.update_account(self.phone_number, {
                         'session_encrypted': None
                     })
-                    
+
                     await self.client.disconnect()
-                    
+
                     # Decrement proxy usage if it was incremented
                     if proxy_assigned and proxy_data:
                         await db.decrement_proxy_usage(proxy_data.get('proxy_name'))
                         proxy_assigned = False
                         self.logger.debug(f"Decremented usage counter for proxy {proxy_data.get('proxy_name')}")
-                    
+
                     continue  # Retry with new session
-                except (errors.AuthKeyInvalidatedError, errors.UserDeactivatedError) as auth_error:
+                except (errors.AuthKeyInvalidError, errors.UserDeactivatedError) as auth_error:
                     self.logger.error(f"Account {self.phone_number} authentication failed: {auth_error}")
-                    # Update account status
-                    if isinstance(auth_error, errors.UserDeactivatedError):
-                        await self.account.update_status(AccountStatus.DEACTIVATED, error=auth_error)
-                    else:
-                        await self.account.update_status(AccountStatus.AUTH_KEY_INVALID, error=auth_error)
+                    mapping = map_telethon_exception(auth_error)
+                    try:
+                        if mapping.get('status'):
+                            await self.account.update_status(mapping['status'], error=auth_error)
+                    except Exception as _u:
+                        self.logger.warning(f"Failed to update account status for {self.phone_number}: {_u}")
                     raise
                 except errors.UserDeactivatedBanError as ban_error:
                     self.logger.error(f"Account {self.phone_number} has been banned.")
-                    await self.account.update_status(AccountStatus.BANNED, error=ban_error)
+                    mapping = map_telethon_exception(ban_error)
+                    try:
+                        if mapping.get('status'):
+                            await self.account.update_status(mapping['status'], error=ban_error)
+                    except Exception as _u:
+                        self.logger.warning(f"Failed to update account status for {self.phone_number}: {_u}")
                     raise
                 except errors.UserDeactivatedBanError:
                     self.logger.error(f"Account {self.phone_number} has been banned.")
@@ -591,7 +667,7 @@ class Client(object):
             
                 return self
                 
-            except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidatedError, errors.UserDeactivatedError, errors.UserDeactivatedBanError):
+            except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.UserDeactivatedError, errors.UserDeactivatedBanError):
                 # Don't retry on these errors - status already updated above
                 raise
             except ValueError as e:
@@ -746,6 +822,12 @@ class Client(object):
         """
         await self.ensure_connected()
         
+        await self.client(GetMessagesViewsRequest(
+            peer=target_chat,
+            id=[message.id],
+            increment=True
+        ))
+
         # CRITICAL: ALWAYS add reading time delay to prevent spam detection
         # Even at humanisation_level 0, we need basic delays
         humanisation_level = config.get('delays', {}).get('humanisation_level', 1)
@@ -895,6 +977,13 @@ class Client(object):
 
     async def _comment(self, message, target_chat, content):
         await self.ensure_connected()
+
+        await self.client(GetMessagesViewsRequest(
+            peer=target_chat,
+            id=[message.id],
+            increment=True
+        ))
+
         if config.get('delays', {}).get('humanisation_level', 1) >= 1:  # If humanisation level is 1 it should consider reading time
             msg_content = await self.get_message_content(chat_id=target_chat.id if hasattr(target_chat, 'id') else target_chat, message_id=message.id)
             reading_time = self.estimate_reading_time(msg_content)
@@ -923,6 +1012,13 @@ class Client(object):
 
     async def _undo_reaction(self, message, target_chat):
         await self.ensure_connected()
+        
+        await self.client(GetMessagesViewsRequest(
+            peer=target_chat,
+            id=[message.id],
+            increment=True
+        ))
+        
         await asyncio.sleep(random.uniform(0.5, 1))  # Prevent spam if everything is broken
         await self.client(SendReactionRequest(
             peer=target_chat,
@@ -936,6 +1032,13 @@ class Client(object):
         Deletes all user comments on given post.
         """
         await self.ensure_connected()
+
+        await self.client(GetMessagesViewsRequest(
+            peer=target_chat,
+            id=[message.id],
+            increment=True
+        ))
+
         await asyncio.sleep(random.uniform(0.5, 1))  # Prevent spam if everything is broken
         discussion = await self.client(functions.messages.GetDiscussionMessageRequest(
             peer=target_chat,
@@ -956,9 +1059,32 @@ class Client(object):
         """
         try:
             link = link.strip()
-            # Додаємо схему, якщо її немає
             if '://' not in link:
                 link = 'https://' + link
+            
+            # First, try to find a stored Post in DB with the same link. If it exists and
+            # is already validated, use its chat_id/message_id and skip network resolution.
+            try:
+                from database import get_db
+                db = get_db()
+
+                try:
+                    post_obj = await db.get_post_by_link(link)
+                    if post_obj and getattr(post_obj, 'is_validated', False):
+                        # Ensure both ids exist and are integers
+                        if post_obj.chat_id is not None and post_obj.message_id is not None:
+                            try:
+                                chat_id_db = int(post_obj.chat_id)
+                                message_id_db = int(post_obj.message_id)
+                                self.logger.debug(f"Found validated post in DB for link {link}: chat_id={chat_id_db}, message_id={message_id_db}")
+                                return chat_id_db, message_id_db
+                            except Exception:
+                                self.logger.debug(f"DB post for link {link} had non-integer ids, falling back to resolution")
+                except Exception as _db_err:
+                    # Do not fail on DB errors; fall back to Telethon resolution
+                    self.logger.debug(f"DB lookup by message_link failed for '{link}': {_db_err}")
+            except Exception:
+                pass
             parsed = urlparse(unquote(link))
             path = parsed.path.lstrip('/')
             segments = [seg for seg in path.split('/') if seg != '']
@@ -998,27 +1124,44 @@ class Client(object):
             # Спроба передати повний URL (Telethon підтримує це)
             try:
                 entity = await self.client.get_entity(username)
-            except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidatedError, errors.UserDeactivatedError, errors.UserDeactivatedBanError) as auth_error:
-                # Session is invalid/expired or account is banned - re-raise for proper handling upstream
+            except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.SessionRevokedError, errors.UserDeactivatedError, errors.UserDeactivatedBanError) as auth_error:
+                # Session is invalid/expired/revoked or account is banned - re-raise for proper handling upstream
+                # Include SessionRevokedError explicitly so it isn't swallowed and can be mapped to account status
                 self.logger.error(f"Session invalid/expired or account deactivated while resolving '{username}': {auth_error}")
                 raise
             except Exception as e1:
-                # спробуємо з повним URL
-                try:
-                    # деякі варіанти Telethon підтримують прямий URL
-                    entity = await self.client.get_entity(parsed.netloc + '/' + username)
-                except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidatedError, errors.UserDeactivatedError, errors.UserDeactivatedBanError) as auth_error:
-                    # Session is invalid/expired or account is banned - re-raise for proper handling upstream
-                    self.logger.error(f"Session invalid/expired or account deactivated while resolving '{username}': {auth_error}")
-                    raise
-                except Exception as e2:
-                    self.logger.error(f"Failed to resolve username '{username}': {e1}, fallback: {e2}")
+                # Try several fallbacks: full URL with scheme, http, www variant, and @username.
+                # Some Telethon versions accept a full URL but others don't, so try multiple formats.
+                last_exc = e1
+                tried = []
+                candidates = [
+                    f"https://{parsed.netloc}/{username}",
+                    f"http://{parsed.netloc}/{username}",
+                    f"{parsed.netloc}/{username}",
+                    f"@{username}",
+                ]
+                entity = None
+                for candidate in candidates:
+                    tried.append(candidate)
+                    try:
+                        entity = await self.client.get_entity(candidate)
+                        break
+                    except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.SessionRevokedError, errors.UserDeactivatedError, errors.UserDeactivatedBanError) as auth_error:
+                        # Re-raise auth related errors immediately so they can be handled upstream
+                        self.logger.error(f"Session invalid/expired or account deactivated while resolving '{username}' using '{candidate}': {auth_error}")
+                        raise
+                    except Exception as e2:
+                        last_exc = e2
+                        self.logger.debug(f"get_entity failed for candidate '{candidate}': {e2}")
+
+                if entity is None:
+                    self.logger.error(f"Failed to resolve username '{username}' from link {link}. Tried: {tried}. Errors: {e1}, last: {last_exc}")
                     raise ValueError(f"Cannot resolve username '{username}' from link {link}")
 
             chat_id = entity.id
             return chat_id, message_id
 
-        except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidatedError, errors.UserDeactivatedError, errors.UserDeactivatedBanError):
+        except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.UserDeactivatedError, errors.UserDeactivatedBanError):
             # Re-raise auth errors without wrapping them
             raise
         except Exception as e:
@@ -1028,19 +1171,15 @@ class Client(object):
 
     # Actions
 
-    async def undo_reaction(self, message_id: int=None, chat_id: str=None, message_link:str=None):
+    async def undo_reaction(self, message_link:str=None):
         retries = config.get('delays', {}).get('action_retries', 3)
         delay = config.get('delays', {}).get('action_retry_delay', 3)
         attempt = 0
         while attempt < retries:
             try:
-                if message_link:
-                    chat_id, message_id = await self.get_message_ids(message_link)
-                    entity = await self.client.get_entity(chat_id)
-                    message = await self.client.get_messages(entity, ids=message_id)
-                else:
-                    entity = await self.client.get_entity(chat_id)
-                    message = await self.client.get_messages(entity, ids=message_id)
+                chat_id, message_id = await self.get_message_ids(message_link)
+                entity = await self.client.get_entity(chat_id)
+                message = await self.client.get_messages(entity, ids=message_id)
                 await self._undo_reaction(message, entity)
                 self.logger.info("Reaction removed successfully")
                 return
@@ -1052,19 +1191,15 @@ class Client(object):
                 else:
                     raise
 
-    async def undo_comment(self, message_id: int=None, chat_id: str=None, message_link:str=None):
+    async def undo_comment(self, message_link:str=None):
         retries = config.get('delays', {}).get('action_retries', 3)
         delay = config.get('delays', {}).get('action_retry_delay', 3)
         attempt = 0
         while attempt < retries:
             try:
-                if message_link:
-                    chat_id, message_id = await self.get_message_ids(message_link)
-                    entity = await self.client.get_entity(chat_id)
-                    message = await self.client.get_messages(entity, ids=message_id)
-                else:
-                    entity = await self.client.get_entity(chat_id)
-                    message = await self.client.get_messages(entity, ids=message_id)
+                chat_id, message_id = await self.get_message_ids(message_link)
+                entity = await self.client.get_entity(chat_id)
+                message = await self.client.get_messages(entity, ids=message_id)
                 await self._undo_comment(message, entity)
                 self.logger.info(f"Comment {message} deleted successfully!")
                 return
@@ -1076,28 +1211,22 @@ class Client(object):
                 else:
                     raise
 
-    async def react(self, message_id:int=None, chat_id:str=None, message_link:str=None):
+    async def react(self, message_link:str):
         """
         React to a message by its ID in a specific chat.
         
         Args:
-            message_id: Telegram message ID
-            chat_id: Telegram chat ID
-            message_link: Telegram message link (alternative to message_id + chat_id)
+            message_link: Telegram message link
         """
         retries = config.get('delays', {}).get('action_retries', 1)
         delay = config.get('delays', {}).get('action_retry_delay', 3)
         attempt = 0
         while attempt < retries:
             try:
-                if message_link:
-                    chat_id, message_id = await self.get_message_ids(message_link)
-                    entity = await self.client.get_entity(chat_id)
-                    message = await self.client.get_messages(entity, ids=message_id)
-                else:
-                    entity = await self.client.get_entity(chat_id)
-                    message = await self.client.get_messages(entity, ids=message_id)
-                await self._react(message, entity)
+                chat_id, message_id = await self.get_message_ids(message_link)
+                entity = await self.client.get_entity(chat_id)
+                message = await self.client.get_messages(entity, ids=message_id)                
+                await self._react(message, entity)                
                 self.logger.info("Reaction added successfully")
                 return
             except Exception as e:
@@ -1115,13 +1244,9 @@ class Client(object):
         attempt = 0
         while attempt < retries:
             try:
-                if message_link:
-                    chat_id, message_id = await self.get_message_ids(message_link)
-                    entity = await self.client.get_entity(chat_id)
-                    message = await self.client.get_messages(entity, ids=message_id)
-                else:
-                    entity = await self.client.get_entity(chat_id)
-                    message = await self.client.get_messages(entity, ids=message_id)
+                chat_id, message_id = await self.get_message_ids(message_link)
+                entity = await self.client.get_entity(chat_id)
+                message = await self.client.get_messages(entity, ids=message_id)
                 await self._comment(message=message, target_chat=entity, content=content)
                 self.logger.info("Comment added successfully!")
                 return
@@ -1227,7 +1352,7 @@ async def start_login(
                 'session_encrypted': encrypted_session,
                 'twofa': False,
                 'notes': notes if notes else "",
-                'status': AccountStatus.LOGGED_IN.name,
+                'status': AccountStatus.ACTIVE.name,
                 'created_at': datetime.now(timezone.utc),
                 'updated_at': datetime.now(timezone.utc)
             }
@@ -1279,7 +1404,7 @@ async def start_login(
                 'twofa': True,
                 'password_encrypted': encrypted_password,
                 'notes': notes if notes else "",
-                'status': AccountStatus.LOGGED_IN.name,
+                'status': AccountStatus.ACTIVE.name,
                 'created_at': datetime.now(timezone.utc),
                 'updated_at': datetime.now(timezone.utc)
             }
@@ -1316,7 +1441,3 @@ def cleanup_expired_logins():
     ]
     for login_id in expired:
         del pending_logins[login_id]
-
-
-
-

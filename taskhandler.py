@@ -1,6 +1,5 @@
 from pandas import Timestamp
 import asyncio, datetime, random
-from enum import Enum, auto
 
 from telethon import errors
 from pymongo import errors as mg_errors
@@ -9,9 +8,25 @@ from pandas import errors as pd_errors
 from agent import Account, Client
 from reporter import Reporter
 from logger import setup_logger, load_config, crash_handler, handle_task_exception
-from schemas import TaskStatus
+from schemas import TaskStatus, status_name
+from telethon_error_handler import map_telethon_exception, reporter_payload_from_mapping
 
 config = load_config()
+
+
+def _status_name(status) -> str:
+    """Return a stable string for a status value that may be an Enum or a plain string."""
+    # Delegate to central helper in schemas for consistent behavior across the repo
+    try:
+        from schemas import status_name as _sn
+        return _sn(status)
+    except Exception:
+        try:
+            if hasattr(status, 'name'):
+                return status.name
+        except Exception:
+            pass
+        return str(status)
 
 
 class Post:
@@ -127,13 +142,20 @@ class Post:
                     new_posts.append(post)
                     continue
                 
-                # Try validation with limited number of clients
+                # Try validation with limited number of clients.
+                # Skip any clients that are currently non-usable (status changed while running)
                 validation_succeeded = False
                 last_error = None
-                clients_to_try = min(max_clients_per_post, len(clients))
-                
-                for client_idx in range(clients_to_try):
-                    client = clients[client_idx]
+                usable_clients = [c for c in clients if getattr(c, 'account', None) and c.account.is_usable()]
+                if not usable_clients:
+                    # Nothing to try - all clients are non-usable
+                    if logger:
+                        logger.error(f"No usable clients available to validate post {post.post_id}.")
+                    raise ValueError(f"No usable clients available to validate post {post.post_id}.")
+
+                clients_to_try = min(max_clients_per_post, len(usable_clients))
+
+                for client_idx, client in enumerate(usable_clients[:clients_to_try]):
                     try:
                         if logger:
                             logger.debug(f"Attempting to validate post {post.post_id} with client {client_idx + 1}/{clients_to_try}")
@@ -152,15 +174,17 @@ class Post:
                             if logger:
                                 logger.warning(f"Post {post.post_id} validation returned but not validated with client {client_idx + 1}")
                     
-                    except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidatedError) as auth_error:
+                    except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.SessionRevokedError) as auth_error:
                         last_error = auth_error
                         if logger:
                             logger.error(f"Client {client.phone_number} has invalid/expired session while validating post {post.post_id}: {auth_error}")
-                        # Update account status using centralized method
+                        # Use centralized mapping to decide action and status
+                        mapping = map_telethon_exception(auth_error)
                         try:
-                            await client.account.update_status(Account.AccountStatus.AUTH_KEY_INVALID, error=auth_error)
-                            if logger:
-                                logger.info(f"Marked account {client.phone_number} as AUTH_KEY_INVALID due to invalid session")
+                            if mapping.get('status'):
+                                await client.account.update_status(mapping['status'], error=auth_error)
+                                if logger:
+                                    logger.info(f"Marked account {client.phone_number} as {mapping['status']}")
                         except Exception as update_error:
                             if logger:
                                 logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
@@ -171,11 +195,12 @@ class Post:
                         last_error = ban_error
                         if logger:
                             logger.error(f"Client {client.phone_number} is banned: {ban_error}")
-                        # Update account status using centralized method
+                        mapping = map_telethon_exception(ban_error)
                         try:
-                            await client.account.update_status(Account.AccountStatus.BANNED, error=ban_error)
-                            if logger:
-                                logger.info(f"Marked account {client.phone_number} as BANNED")
+                            if mapping.get('status'):
+                                await client.account.update_status(mapping['status'], error=ban_error)
+                                if logger:
+                                    logger.info(f"Marked account {client.phone_number} as {mapping['status']}")
                         except Exception as update_error:
                             if logger:
                                 logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
@@ -186,11 +211,12 @@ class Post:
                         last_error = ban_error
                         if logger:
                             logger.error(f"Client {client.phone_number} phone number is banned: {ban_error}")
-                        # Update account status using centralized method
+                        mapping = map_telethon_exception(ban_error)
                         try:
-                            await client.account.update_status(Account.AccountStatus.BANNED, error=ban_error)
-                            if logger:
-                                logger.info(f"Marked account {client.phone_number} as BANNED")
+                            if mapping.get('status'):
+                                await client.account.update_status(mapping['status'], error=ban_error)
+                                if logger:
+                                    logger.info(f"Marked account {client.phone_number} as {mapping['status']}")
                         except Exception as update_error:
                             if logger:
                                 logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
@@ -219,8 +245,8 @@ class Post:
                         logger.error(f"Post {post.post_id} failed validation with {clients_to_try} clients. Last error ({error_type}): {last_error}")
                     
                     # Provide more helpful error message based on error type
-                    if isinstance(last_error, errors.AuthKeyUnregisteredError):
-                        raise ValueError(f"Post {post.post_id} validation failed: All {clients_to_try} client sessions are invalid/expired. Please re-login accounts.")
+                    if isinstance(last_error, (errors.AuthKeyUnregisteredError, errors.SessionRevokedError)):
+                        raise ValueError(f"Post {post.post_id} validation failed: All {clients_to_try} client sessions are invalid/expired or revoked. Please re-login accounts.")
                     else:
                         raise last_error if last_error else ValueError(f"Post {post.post_id} failed validation with {clients_to_try} clients")
 
@@ -274,7 +300,7 @@ class Task:
             'post_ids': self.post_ids,
             'accounts': self.accounts,
             'action': self.action,
-            'status': self.status.name if isinstance(self.status, Task.TaskStatus) else self.status,
+            'status': status_name(self.status),
             'created_at': self.created_at.isoformat() if isinstance(self.created_at, Timestamp) else self.created_at,
             'updated_at': self.updated_at.isoformat() if isinstance(self.updated_at, Timestamp) else self.updated_at
         }
@@ -337,7 +363,7 @@ class Task:
     async def _update_status(self):
         from database import get_db
         db = get_db()
-        await db.update_task(self.task_id, {'status': self.status.name if isinstance(self.status, Task.TaskStatus) else self.status})
+        await db.update_task(self.task_id, {'status': status_name(self.status)})
 
 # Actions
 
@@ -349,7 +375,7 @@ class Task:
 
         reporter = Reporter()
         await reporter.start()
-        async with reporter.run_context(self.task_id, meta={"task_name": self.name, "action": self.get_action_type()}) as run_id:
+        async with await reporter.run_context(self.task_id, meta={"task_name": self.name, "action": self.get_action_type()}) as run_id:
             try:
                 self._current_run_id = run_id
                 await reporter.event(run_id, self.task_id, "INFO", "info.init.run_start", f"Starting run for task.")
@@ -390,7 +416,7 @@ class Task:
                 unusable_accounts = [acc for acc in accounts if not acc.is_usable()]
                 
                 if unusable_accounts:
-                    unusable_details = [f"{acc.phone_number} ({acc.status.name})" for acc in unusable_accounts]
+                    unusable_details = [f"{acc.phone_number} ({status_name(acc.status)})" for acc in unusable_accounts]
                     self.logger.warning(f"Excluding {len(unusable_accounts)}/{total_accounts} accounts with unusable status: {', '.join(unusable_details)}")
                     await reporter.event(run_id, self.task_id, "WARNING", "warn.accounts_filtered", 
                                        f"Excluding {len(unusable_accounts)}/{total_accounts} accounts with unusable status",
@@ -416,7 +442,7 @@ class Task:
                 if self._clients:  # Validate posts to get corresponding ids
                     try:
                         posts = await Post.mass_validate_posts(posts, self._clients, self.logger)
-                    except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidatedError) as auth_exc:
+                    except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.SessionRevokedError) as auth_exc:
                         self.logger.error(f"Session invalid/expired while validating posts for task {self.task_id}: {auth_exc}")
                         await reporter.event(run_id, self.task_id, "ERROR", "error.session_invalid_post_validation", f"Session invalid/expired while validating posts: {auth_exc}. Please re-login affected accounts.", {'error': repr(auth_exc)})
                         self.status = Task.TaskStatus.CRASHED
@@ -508,7 +534,7 @@ class Task:
         await reporter.stop()  # stop reporter and flush            
 
     @crash_handler
-    async def client_worker(self, client, posts, reporter, run_id):
+    async def client_worker(self, client: Client, posts: list[Post], reporter: Reporter, run_id):
         # CRITICAL: Stagger worker starts to prevent all accounts hitting API simultaneously
         worker_delay_min = config.get('delays', {}).get('worker_start_delay_min', 2)
         worker_delay_max = config.get('delays', {}).get('worker_start_delay_max', 10)
@@ -552,7 +578,7 @@ class Task:
                             # Update account with flood wait status
                             try:
                                 await client.account.set_flood_wait(wait_seconds, error=e)
-                                self.logger.info(f"Marked account {client.phone_number} as FLOOD_WAIT until {wait_seconds}s from now")
+                                self.logger.info(f"Marked account {client.phone_number} as ERROR due to flood-wait until {wait_seconds}s from now (flood_wait_until set)")
                             except Exception as update_error:
                                 self.logger.warning(f"Failed to update flood wait status for {client.phone_number}: {update_error}")
                             await asyncio.sleep(required_sleep)  # Sleep for the required time plus a buffer
@@ -588,37 +614,46 @@ class Task:
                             break
                         except errors.PhoneNumberBannedError as e:
                             self.logger.error(f"Client {client.account_id} is banned. Stopping worker.")
-                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.phone_banned", 
+                            mapping = map_telethon_exception(e)
+                            payload = reporter_payload_from_mapping(mapping, e, {"client": client.phone_number})
+                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.phone_banned",
                                                  f"Client {client.phone_number} is banned. Stopping worker.",
-                                                 {"client": client.phone_number})
-                            # Update account status using centralized method
+                                                 payload)
+                            # Update account status using centralized mapping
                             try:
-                                await client.account.update_status(Account.AccountStatus.BANNED, error=e)
-                                self.logger.info(f"Marked account {client.phone_number} as BANNED")
+                                if mapping.get('status'):
+                                    await client.account.update_status(mapping['status'], error=e)
+                                    self.logger.info(f"Marked account {client.phone_number} as {mapping['status']}")
                             except Exception as update_error:
                                 self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
                             return
                         except errors.UserDeactivatedBanError as e:
                             self.logger.error(f"Client {client.account_id} account is deactivated/banned. Stopping worker.")
-                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.user_deactivated_ban", 
+                            mapping = map_telethon_exception(e)
+                            payload = reporter_payload_from_mapping(mapping, e, {"client": client.phone_number})
+                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.user_deactivated_ban",
                                                  f"Client {client.phone_number} account is deactivated/banned. Stopping worker.",
-                                                 {"client": client.phone_number})
-                            # Update account status using centralized method
+                                                 payload)
+                            # Update account status using centralized mapping
                             try:
-                                await client.account.update_status(Account.AccountStatus.DEACTIVATED, error=e)
-                                self.logger.info(f"Marked account {client.phone_number} as DEACTIVATED")
+                                if mapping.get('status'):
+                                    await client.account.update_status(mapping['status'], error=e)
+                                    self.logger.info(f"Marked account {client.phone_number} as {mapping['status']}")
                             except Exception as update_error:
                                 self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
                             return
-                        except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidatedError) as e:
+                        except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.SessionRevokedError) as e:
                             self.logger.error(f"Client {client.account_id} has invalid/expired session. Stopping worker.")
-                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.session_invalid", 
+                            mapping = map_telethon_exception(e)
+                            payload = reporter_payload_from_mapping(mapping, e, {"client": client.phone_number})
+                            await reporter.event(run_id, self.task_id, "ERROR", "error.worker.session_invalid",
                                                  f"Client {client.phone_number} has invalid/expired session. Stopping worker.",
-                                                 {"client": client.phone_number})
-                            # Update account status using centralized method
+                                                 payload)
+                            # Update account status using centralized mapping
                             try:
-                                await client.account.update_status(Account.AccountStatus.AUTH_KEY_INVALID, error=e)
-                                self.logger.info(f"Marked account {client.phone_number} as AUTH_KEY_INVALID due to invalid session")
+                                if mapping.get('status'):
+                                    await client.account.update_status(mapping['status'], error=e)
+                                    self.logger.info(f"Marked account {client.phone_number} as {mapping['status']} due to invalid session")
                             except Exception as update_error:
                                 self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
                             return
@@ -668,9 +703,35 @@ class Task:
                                 # Other ValueError - raise it
                                 raise
                         except Exception as e:
+                            # Centralized mapping for unknown/other exceptions
                             self.logger.warning(f"Client {client.account_id} failed to react to post {post.post_id}: {e}")
-                            await reporter.event(run_id, self.task_id, "WARNING", "error.worker.react", f"Client {client.phone_number} failed to react to post {post.post_id}: {e}", {'error': repr(e)})
-                            raise  # On other errors, do not retry
+                            mapping = map_telethon_exception(e)
+                            payload = reporter_payload_from_mapping(mapping, e, {"client": client.phone_number, "post_id": post.post_id})
+                            # Report event including message code and details
+                            await reporter.event(run_id, self.task_id, "WARNING", "error.worker.react", f"Client {client.phone_number} failed to react to post {post.post_id}: {e}", payload)
+
+                            # Decide next action based on mapping
+                            action = mapping.get('action')
+                            if action == 'retry' and attempt < retries:
+                                attempt += 1
+                                await asyncio.sleep(5)
+                                continue
+                            elif action == 'ignore':
+                                break
+                            elif mapping.get('status'):
+                                # Mark account with mapped status and stop worker
+                                try:
+                                    await client.account.update_status(mapping['status'], error=e)
+                                except Exception as update_error:
+                                    self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
+                                return
+                            else:
+                                # Fallback: mark account as ERROR and stop
+                                try:
+                                    await client.account.update_status(Account.AccountStatus.ERROR, error=e)
+                                except Exception as update_error:
+                                    self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
+                                return
                     if attempt == retries:   # Optionally, log/report if all retries failed
                         self.logger.error(f"Client {client.account_id} failed to react to post {post.post_id} after {retries} attempts due to repeated FloodWaitError.")
                         await reporter.event(run_id, self.task_id, "ERROR", "error.worker.react.max_retries", f"Client {client.phone_number} failed to react to post {post.post_id} after {retries} FloodWaitError retries.", {"client": client.phone_number, "post_id": post.post_id, "retries": retries})

@@ -47,24 +47,18 @@ class AccountStatus(Enum):
     States:
     - NEW: Account created but not logged in
     - ACTIVE: Account is healthy and ready to use
-    - LOGGED_IN: Account successfully logged in (legacy, use ACTIVE)
-    - SESSION_EXPIRED: Session needs refresh (temporary state)
     - AUTH_KEY_INVALID: Session invalid, needs re-login
     - BANNED: Account banned by Telegram
     - DEACTIVATED: Account deactivated by Telegram
     - RESTRICTED: Account has restrictions
-    - FLOOD_WAIT: Account in flood wait state (temporary)
     - ERROR: Generic error state (use more specific states when possible)
     """
     NEW = auto()
     ACTIVE = auto()
-    LOGGED_IN = auto()  # Legacy, equivalent to ACTIVE
-    SESSION_EXPIRED = auto()
     AUTH_KEY_INVALID = auto()
     BANNED = auto()
     DEACTIVATED = auto()
     RESTRICTED = auto()
-    FLOOD_WAIT = auto()
     ERROR = auto()
     
     def __str__(self):
@@ -81,7 +75,9 @@ class AccountStatus(Enum):
                 status = cls[status]
             except KeyError:
                 return False
-        return status in (cls.ACTIVE, cls.LOGGED_IN)
+        # Only ACTIVE accounts are considered usable. Keep logic strict so
+        # other statuses (including error/invalid/banned) are excluded.
+        return status is cls.ACTIVE
     
     @classmethod
     def needs_attention(cls, status) -> bool:
@@ -774,6 +770,20 @@ def validate_telegram_link(link: str) -> str:
         raise ValueError('Message link must be a valid Telegram link starting with https://t.me/')
     
     return link
+
+
+def status_name(status) -> str:
+    """Return a stable string for a status value that may be an Enum or a plain string.
+
+    Prefer using this across the codebase when serializing or logging statuses so
+    both Enum members and raw strings are handled consistently.
+    """
+    try:
+        if hasattr(status, 'name'):
+            return status.name
+    except Exception:
+        pass
+    return str(status)
 
 
 # ============= MIGRATION HELPER =============

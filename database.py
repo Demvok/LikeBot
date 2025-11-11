@@ -308,7 +308,7 @@ class MongoStorage():
     @ensure_async
     async def update_account(cls, phone_number, update_data):
         await cls._ensure_ready()
-        logger.info(f"Upserting account {phone_number} in MongoDB with data: {update_data}")
+        logger.info(f"Upserting account {phone_number} in MongoDB with data: {update_data.keys()}")
         if not isinstance(update_data, dict):
             raise ValueError(f"update_data must be a dict mapping field names to values, got {type(update_data)}: {update_data}")
         update_data.pop('_id', None)
@@ -386,9 +386,45 @@ class MongoStorage():
 
     @classmethod
     @ensure_async
+    async def get_post_by_link(cls, message_link: str):
+        """
+        Find a post document by its exact message_link.
+
+        Returns:
+            Post object if found, else None
+        """
+        await cls._ensure_ready()
+        logger.info(f"Getting post from MongoDB by message_link: {message_link}")
+        # Try exact match first
+        post = await cls._posts.find_one({"message_link": message_link})
+        if post and '_id' in post:
+            post.pop('_id')
+        if post:
+            logger.debug(f"Post found in MongoDB by link: {post.get('post_id', '')}, link: {post.get('message_link', '')}")
+            return Post(**post)
+
+        # Fallback: try without scheme (strip https:// or http://) if exact match failed
+        try:
+            if message_link.startswith('https://') or message_link.startswith('http://'):
+                stripped = message_link.split('://', 1)[1]
+                post = await cls._posts.find_one({"message_link": stripped})
+                if post and '_id' in post:
+                    post.pop('_id')
+                if post:
+                    logger.debug(f"Post found in MongoDB by stripped link: {post.get('post_id', '')}, link: {post.get('message_link', '')}")
+                    return Post(**post)
+        except Exception:
+            # Ignore fallback errors and return None
+            logger.debug(f"Fallback lookup by stripped link failed for: {message_link}")
+
+        logger.debug(f"No post found in MongoDB for link: {message_link}")
+        return None
+
+    @classmethod
+    @ensure_async
     async def update_post(cls, post_id, update_data):
         await cls._ensure_ready()
-        logger.info(f"Upserting post {post_id} in MongoDB with data: {update_data}")
+        logger.info(f"Upserting post {post_id} in MongoDB with data: {update_data.keys()}")
         if not isinstance(update_data, dict):
             raise ValueError(f"update_data must be a dict mapping field names to values, got {type(update_data)}: {update_data}")
         update_data.pop('_id', None)
@@ -507,7 +543,7 @@ class MongoStorage():
     @ensure_async
     async def update_task(cls, task_id, update_data):
         await cls._ensure_ready()
-        logger.info(f"Upserting task {task_id} in MongoDB with data: {update_data}")
+        logger.info(f"Upserting task {task_id} in MongoDB with data: {update_data.keys()}")
         if not isinstance(update_data, dict):
             raise ValueError(f"update_data must be a dict mapping field names to values, got {type(update_data)}: {update_data}")
         update_data.pop('_id', None)

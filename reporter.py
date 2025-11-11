@@ -1,5 +1,5 @@
 import pandas as pd
-import asyncio, uuid, os
+import asyncio, uuid
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
@@ -349,7 +349,18 @@ async def create_report(data, type=None):
     preprocessed_data = data.drop(columns=['_id', 'task_id', 'run_id'], errors='ignore').reset_index(drop=True)
     preprocessed_data.ts = preprocessed_data.ts.dt.round('s')
     preprocessed_data.rename({'ts': 'datetime'}, axis=1, inplace=True)
-    preprocessed_data = preprocessed_data.join(preprocessed_data['payload'].apply(Series)).drop(columns=['payload'], errors='ignore')
+    # Expand payload dict into separate columns. If payload contains keys that would
+    # overlap with existing columns (for example 'message' or 'details'), rename
+    # those payload columns to keep both sets of information and avoid pandas
+    # "columns overlap but no suffix specified" errors.
+    payload_df = preprocessed_data['payload'].apply(Series)
+    if not payload_df.empty:
+        # Find overlapping column names and rename payload columns to keep them distinct
+        overlap_cols = set(preprocessed_data.columns).intersection(payload_df.columns)
+        if overlap_cols:
+            rename_map = {col: f"{col}_payload" for col in overlap_cols}
+            payload_df = payload_df.rename(columns=rename_map)
+    preprocessed_data = preprocessed_data.join(payload_df).drop(columns=['payload'], errors='ignore')
 
     async def gather_post_links(post_id: Series):
             async def fetch_post_link(post_id):
