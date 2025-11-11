@@ -145,11 +145,6 @@ class Reporter:
         async with reporter.run_context("task-1") as run_id:
             await reporter.event(...)
         """
-        # # graceful shutdown on signals
-        # loop = asyncio.get_running_loop()
-        # stop = asyncio.Event()
-        # for sig in (signal.SIGINT, signal.SIGTERM):
-        #     loop.add_signal_handler(sig, stop.set)
         class _RunCtx:
             def __init__(self, reporter, task_id, meta):
                 self.reporter = reporter
@@ -160,11 +155,54 @@ class Reporter:
                 self.run_id = await self.reporter.new_run(self.task_id, self.meta)
                 return self.run_id
             async def __aexit__(self, exc_type, exc, tb):
-                if exc:
-                    await self.reporter.event(self.run_id, self.task_id, "ERROR", "error", f'Error: {exc}', {'exc': str(exc)})
-                    await self.reporter.end_run(self.run_id, status="failed", meta_patch={"error": str(exc)})
-                else:
-                    await self.reporter.end_run(self.run_id, status="success")
+                # Handle different exit scenarios with proper error isolation
+                try:
+                    if exc_type is None:
+                        # Normal exit - mark as success
+                        await self.reporter.end_run(self.run_id, status="success")
+                    elif exc_type is asyncio.CancelledError:
+                        # Task was cancelled - mark as cancelled
+                        try:
+                            await self.reporter.event(
+                                self.run_id, self.task_id, "WARNING", "warning.cancelled",
+                                "Run was cancelled", {'exc_type': exc_type.__name__}
+                            )
+                        except Exception as log_exc:
+                            logger.warning(f"Failed to log cancellation event: {log_exc}")
+                        try:
+                            await self.reporter.end_run(self.run_id, status="cancelled", meta_patch={"cancelled": True})
+                        except Exception as end_exc:
+                            logger.error(f"Failed to end run on cancellation: {end_exc}")
+                    else:
+                        # Exception occurred - mark as failed
+                        try:
+                            await self.reporter.event(
+                                self.run_id, self.task_id, "ERROR", "error.exception",
+                                f'Error: {exc}', 
+                                {
+                                    'exc': str(exc), 
+                                    'exc_type': exc_type.__name__,
+                                    'exc_module': exc_type.__module__
+                                }
+                            )
+                        except Exception as log_exc:
+                            logger.warning(f"Failed to log error event: {log_exc}")
+                        try:
+                            await self.reporter.end_run(
+                                self.run_id, status="failed", 
+                                meta_patch={
+                                    "error": str(exc),
+                                    "error_type": exc_type.__name__
+                                }
+                            )
+                        except Exception as end_exc:
+                            logger.error(f"Failed to end run on error: {end_exc}")
+                except Exception as cleanup_exc:
+                    # Prevent cleanup errors from masking the original exception
+                    logger.error(f"Error during run context cleanup: {cleanup_exc}")
+                
+                # Return None to let exceptions propagate (or True to suppress them)
+                return None
         return _RunCtx(self, task_id, meta)
 
 

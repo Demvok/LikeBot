@@ -480,10 +480,27 @@ class MongoStorage():
         await cls._ensure_ready()
         logger.info(f"Getting task from MongoDB with task_id: {task_id}")
         task = await cls._tasks.find_one({"task_id": task_id})
-        if task and '_id' in task:
-            task.pop('_id')
+
+        # Normalize to plain dict to avoid pandas.Series.pop('_id') KeyError ("'_id' not found in axis")
+        if task is not None and not isinstance(task, dict):
+            try:
+                task = dict(task)
+            except Exception:
+                if hasattr(task, "to_dict"):
+                    try:
+                        task = dict(task.to_dict())
+                    except Exception:
+                        # leave as-is if conversion fails
+                        pass
+
+        if isinstance(task, dict):
+            task.pop('_id', None)
+
         if task:
-            logger.debug(f"Task found in MongoDB: {task.get('task_id', '')}, status: {task.get('status', '')}, updated_at: {task.get('updated_at', '')}, posts: {len(task.get('post_ids', []))}, accounts: {len(task.get('accounts', []))}")
+            # Safe counts in case fields are None
+            post_count = len(task.get('post_ids') or [])
+            acc_count = len(task.get('accounts') or [])
+            logger.debug(f"Task found in MongoDB: {task.get('task_id', '')}, status: {task.get('status', '')}, updated_at: {task.get('updated_at', '')}, posts: {post_count}, accounts: {acc_count}")
         return Task(**task) if task else None
 
     @classmethod

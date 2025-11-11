@@ -349,7 +349,7 @@ class Task:
 
         reporter = Reporter()
         await reporter.start()
-        async with await reporter.run_context(self.task_id, meta={"task_name": self.name, "action": self.get_action_type()}) as run_id:
+        async with reporter.run_context(self.task_id, meta={"task_name": self.name, "action": self.get_action_type()}) as run_id:
             try:
                 self._current_run_id = run_id
                 await reporter.event(run_id, self.task_id, "INFO", "info.init.run_start", f"Starting run for task.")

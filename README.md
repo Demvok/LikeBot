@@ -11,10 +11,12 @@
 - fix multiple palette import, only once needed
 
 - add creation of neccessary files if they dont exist
-- add signal stops for reporter context?
 
 
 ## Changelog
+
+### v.1.0.5
+- improved report context handling on crashes
 
 ### v.1.0.4
 - fixed logger file writing issue

@@ -44,7 +44,7 @@ atexit.register(cleanup_logging)  # Register cleanup function
 app = FastAPI(
     title="LikeBot API",
     description="Full API for LikeBot automation",
-    version="1.0.4"
+    version="1.0.5"
 )
 
 logger = logging.getLogger("likebot.main")

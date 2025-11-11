@@ -705,6 +705,7 @@ class Client(object):
                 await db.update_account(self.phone_number, {'account_id': account_id})
                 self.logger.info(f"Updated account_id for {self.phone_number} to {account_id}")
                 self.account.account_id = account_id
+                self.account_id = account_id
             else:
                 self.logger.warning("Could not fetch account_id from Telegram.")
         except Exception as e:
