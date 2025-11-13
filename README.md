@@ -2,19 +2,26 @@
 
 ### TO DO:
 
-- add task's runs and events clearup on delete
-- add neccessary filtering on db loading, not loading all and filtering
-- add timestamp for task
-
-- ensure views on posts correct counting
-
-- fix multiple palette import, only once needed
-
+- review pauses and retries for flood avoiding
 - add creation of neccessary files if they dont exist
-- add signal stops for reporter context?
-
 
 ## Changelog
+
+### v.1.0.6
+- fixed multiple palette import, only on task startup
+- added task's runs and events clearup on task delete
+- added timestamp storage for task (for more persistence)
+- optimized database interactions
+- improved task status change on crashes 
+- improved and tested proxies
+
+### v.1.0.5
+- improved report context handling on crashes
+- centralized telethon error handling
+- fixed account error writing (status, last error)
+- fixed post validation (to use only active accounts)
+- fixed post url parser (yet again)
+- ensured views on posts correct counting
 
 ### v.1.0.4
 - fixed logger file writing issue

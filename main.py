@@ -20,15 +20,7 @@ from logger import crash_handler, cleanup_logging, get_log_directory
 from taskhandler import *
 from database import get_db
 from fastapi.middleware.cors import CORSMiddleware
-from schemas import (
-    AccountCreate, AccountUpdate, AccountResponse, AccountPasswordResponse,
-    PostCreate, PostUpdate, PostResponse,
-    TaskCreate, TaskUpdate, TaskResponse,
-    SuccessResponse, ErrorResponse, BulkOperationResult,
-    DatabaseStats, ValidationResult, serialize_for_json,
-    LoginStatus, UserCreate, UserLogin, UserResponse, Token, UserRole,
-    ReactionPaletteCreate, ReactionPaletteUpdate, ReactionPaletteResponse
-)
+from schemas import *
 from auth import (
     authenticate_user, get_current_user, get_current_verified_user,
     get_current_admin_user, create_user_account, create_user_token, decode_access_token
@@ -44,7 +36,7 @@ atexit.register(cleanup_logging)  # Register cleanup function
 app = FastAPI(
     title="LikeBot API",
     description="Full API for LikeBot automation",
-    version="1.0.4"
+    version="1.0.6"
 )
 
 logger = logging.getLogger("likebot.main")
@@ -994,7 +986,8 @@ async def get_task_status(
             raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
         
         status = await task.get_status()
-        return {"task_id": task_id, "status": status.name if hasattr(status, 'name') else str(status)}
+        from schemas import status_name
+        return {"task_id": task_id, "status": status_name(status)}
     except HTTPException:
         raise
     except Exception as e:
