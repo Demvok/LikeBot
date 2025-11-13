@@ -261,8 +261,7 @@ class Client(object):
         # Client class.
         for attr, val in vars(account).items():
             cls_attr = getattr(self.__class__, attr, None)
-            if isinstance(cls_attr, property):
-                # property exists on Client, skip copying to avoid AttributeError
+            if isinstance(cls_attr, property):  # property exists on Client, skip copying to avoid AttributeError                
                 continue
             # set plain attribute on instance
             try:
@@ -273,12 +272,10 @@ class Client(object):
                 # callers can access authoritative values via client.account.
                 continue
         
-        # Active emoji palette will be set during task execution from database
-        self.active_emoji_palette = []
+        self.active_emoji_palette = []  # Active emoji palette will be set during task execution from database
         self.palette_ordered = False  # Whether to use emojis sequentially or randomly
         
-        # Initialize proxy_name as None - will be set during connection
-        self.proxy_name = None
+        self.proxy_name = None # Initialize proxy_name as None - will be set during connection
         
         self.logger = setup_logger(f"{self.phone_number}", f"accounts/account_{self.phone_number}.log")
         self.logger.info(f"Initializing client for {self.phone_number}. Awaiting connection...")
@@ -290,10 +287,6 @@ class Client(object):
     def __str__(self):
         return f"Client ({'connected' if self.is_connected else 'disconnected'}) for {self.phone_number} with session {self.session_name}"
 
-    # Expose dynamic properties from the underlying Account so that updates
-    # performed via Account.update_status(...) are immediately visible on the
-    # Client instance. This prevents stale client-level attributes when the
-    # account record is updated (DB + Account object) elsewhere.
     @property
     def phone_number(self):
         return self.account.phone_number
@@ -348,78 +341,19 @@ class Client(object):
         """
         Get proxy configuration for this connection.
         Selects the least-used active proxy for load balancing.
-        Returns a tuple (proxy_dict, proxy_config) where:
-        - proxy_dict is the telethon proxy configuration dict or None
-        - proxy_config is the raw proxy data from database
+        Returns a tuple (proxy_candidates, proxy_data) where:
+        - proxy_candidates is a list of proxy dicts to try (ordered by preference)
+        - proxy_data is the raw proxy data from database
         """
-        from database import get_db
-        db = get_db()
+        from proxy import get_proxy_config
         
-        # Get least used active proxy (balances on every connection)
-        proxy_data = await db.get_least_used_proxy()
-        if not proxy_data:
-            self.logger.info("No active proxies available, connecting without proxy")
-            return None, None
+        candidates, proxy_data = await get_proxy_config(self.phone_number, self.logger)
         
-        # Store proxy name for usage tracking (not a permanent assignment)
-        self.proxy_name = proxy_data.get('proxy_name')
-        self.logger.info(f"Selected proxy {self.proxy_name} for {self.phone_number} (current usage: {proxy_data.get('connected_accounts', 0)})")
+        if proxy_data:
+            # Store proxy name for usage tracking (not a permanent assignment)
+            self.proxy_name = proxy_data.get('proxy_name')
         
-        return self._build_proxy_dict(proxy_data), proxy_data
-    
-    def _build_proxy_dict(self, proxy_data):
-        """
-        Build a telethon-compatible proxy configuration dictionary.
-        
-        Args:
-            proxy_data: Proxy data from database
-            
-        Returns:
-            Dictionary compatible with TelegramClient proxy parameter
-        """
-        if not proxy_data:
-            return None
-        
-        try:
-            import socks  # PySocks, installed as dependency of telethon
-        except ImportError:
-            self.logger.error("PySocks not installed. Install with: pip install PySocks")
-            return None
-        
-        # Map proxy type string to socks constant
-        proxy_type_map = {
-            'socks5': socks.SOCKS5,
-            'socks4': socks.SOCKS4,
-            'http': socks.HTTP
-        }
-        
-        proxy_type = proxy_data.get('type', 'socks5').lower()
-        if proxy_type not in proxy_type_map:
-            self.logger.error(f"Unsupported proxy type: {proxy_type}")
-            return None
-        
-        # Ensure port is an integer
-        try:
-            port = int(proxy_data.get('port'))
-        except (ValueError, TypeError) as e:
-            self.logger.error(f"Invalid port value: {proxy_data.get('port')} - {e}")
-            return None
-        
-        proxy_dict = {
-            'proxy_type': proxy_type_map[proxy_type],
-            'addr': proxy_data.get('host'),
-            'port': port,
-            'rdns': proxy_data.get('rdns', True)
-        }
-        
-        # Add credentials if provided
-        if proxy_data.get('username'):
-            proxy_dict['username'] = proxy_data.get('username')
-        if proxy_data.get('password'):
-            proxy_dict['password'] = proxy_data.get('password')
-        
-        self.logger.debug(f"Built proxy config: {proxy_type}://{proxy_dict['addr']}:{proxy_dict['port']}")
-        return proxy_dict
+        return candidates, proxy_data
 
     async def _get_session(self, force_new=False):
         if self.session_encrypted and not force_new:
@@ -545,64 +479,71 @@ class Client(object):
                 
                 # Get proxy (or None if soft mode and proxy previously failed)
                 if proxy_failed and proxy_mode == 'soft':
-                    proxy_dict, proxy_data = None, None
+                    proxy_candidates, proxy_data = None, None
                     self.logger.info(f"Connecting without proxy (fallback after proxy failure)")
                 else:
-                    proxy_dict, proxy_data = await self._get_proxy_config()
-                    if proxy_dict:
-                        self.logger.info(f"Connecting with proxy: {proxy_data.get('proxy_name')}")
+                    proxy_candidates, proxy_data = await self._get_proxy_config()
+                    if proxy_candidates:
+                        self.logger.info(f"Connecting with proxy record: {proxy_data.get('proxy_name')}")
                     else:
                         self.logger.info(f"Connecting without proxy")
-                
-                try:
-                    self.client = TelegramClient(
-                        session=session,
-                        api_id=api_id,
-                        api_hash=api_hash,
-                        proxy=proxy_dict
-                    )                
-                    if not self.client:
-                        raise ValueError("TelegramClient is not initialized.")
 
-                    self.logger.debug(f"Starting client for {self.phone_number}...")
-                    await self.client.connect()
-                    
-                    # Connection successful - clear proxy error if using proxy
-                    if proxy_data:
+                    selected_candidate = None
+                    # If proxy_candidates is a list, try them in order until one connects
+                    if proxy_candidates:
                         from database import get_db
                         db = get_db()
-                        await db.clear_proxy_error(proxy_data.get('proxy_name'))
-                        
-                        # Increment proxy usage counter
-                        if not proxy_assigned:
-                            await db.increment_proxy_usage(proxy_data.get('proxy_name'))
-                            proxy_assigned = True
-                            self.logger.debug(f"Incremented usage counter for proxy {proxy_data.get('proxy_name')}")
-                    
-                except (OSError, TimeoutError, ConnectionError) as proxy_error:
-                    # Connection failed - could be proxy-related
-                    if proxy_data:
-                        error_msg = f"Proxy connection failed: {type(proxy_error).__name__}: {str(proxy_error)}"
-                        self.logger.warning(error_msg)
-                        
-                        # Update proxy error in database
-                        from database import get_db
-                        db = get_db()
-                        await db.set_proxy_error(proxy_data.get('proxy_name'), error_msg)
-                        
-                        # Mark proxy as failed
-                        proxy_failed = True
-                        
-                        if proxy_mode == 'strict':
-                            self.logger.error("Strict proxy mode: Proxy connection failed")
-                            raise ConnectionError(f"Strict mode - proxy failed: {error_msg}")
-                        else:  # soft mode
-                            self.logger.warning("Soft proxy mode: Will retry without proxy")
-                            # Will retry in next iteration without proxy
-                            continue
+                        for candidate in proxy_candidates:
+                            try:
+                                self.logger.debug(f"Attempting connection via proxy candidate {candidate.get('addr')}:{candidate.get('port')}")
+                                self.client = TelegramClient(
+                                    session=session,
+                                    api_id=api_id,
+                                    api_hash=api_hash,
+                                    proxy=candidate
+                                )
+                                if not self.client:
+                                    raise ValueError("TelegramClient is not initialized.")
+
+                                await self.client.connect()
+                                # success for this candidate
+                                selected_candidate = candidate
+                                # Clear proxy error on success
+                                await db.clear_proxy_error(proxy_data.get('proxy_name'))
+                                # Increment proxy usage counter once per assigned proxy record
+                                if not proxy_assigned:
+                                    await db.increment_proxy_usage(proxy_data.get('proxy_name'))
+                                    proxy_assigned = True
+                                    self.logger.debug(f"Incremented usage counter for proxy {proxy_data.get('proxy_name')}")
+                                break
+                            except (OSError, TimeoutError, ConnectionError) as proxy_error:
+                                # Candidate failed - record the error and try next candidate
+                                error_msg = f"Proxy candidate {candidate.get('addr')}:{candidate.get('port')} failed: {type(proxy_error).__name__}: {str(proxy_error)}"
+                                self.logger.warning(error_msg)
+                                await db.set_proxy_error(proxy_data.get('proxy_name'), error_msg)
+                                # try next candidate
+                                continue
+                        # If none succeeded, raise a ConnectionError to be handled below
+                        if selected_candidate is None:
+                            proxy_failed = True
+                            if proxy_mode == 'strict':
+                                raise ConnectionError(f"Strict mode - all proxy candidates failed for {proxy_data.get('proxy_name')}")
+                            else:
+                                self.logger.warning("Soft proxy mode: all proxy candidates failed, will retry without proxy")
+                                # Loop will continue and attempt without proxy
+                                continue
                     else:
-                        # No proxy was used, propagate the error
-                        raise
+                        # No proxy - normal client creation
+                        self.client = TelegramClient(
+                            session=session,
+                            api_id=api_id,
+                            api_hash=api_hash
+                        )
+                        if not self.client:
+                            raise ValueError("TelegramClient is not initialized.")
+
+                        self.logger.debug(f"Starting client for {self.phone_number}...")
+                        await self.client.connect()
                 
                 # Verify the session is still valid
                 try:

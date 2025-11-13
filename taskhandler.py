@@ -365,6 +365,56 @@ class Task:
         db = get_db()
         await db.update_task(self.task_id, {'status': status_name(self.status)})
 
+    async def _mark_crashed(self, exc: Exception | None = None, context: str | None = None):
+        """Mark the task as crashed and persist status to DB.
+
+        This helper is safe to call from done-callbacks (schedule with create_task).
+        """
+        try:
+            # Best-effort logging
+            self.logger.error(f"Marking task {self.task_id} as CRASHED (context={context}) due to: {repr(exc)}")
+        except Exception:
+            pass
+        try:
+            self.status = Task.TaskStatus.CRASHED
+            await self._update_status()
+        except Exception as e:
+            # Avoid raising from done-callbacks
+            try:
+                self.logger.warning(f"Failed to persist crashed status for task {self.task_id}: {e}")
+            except Exception:
+                pass
+
+    async def _handle_worker_done(self, worker_task: asyncio.Task):
+        """Async handler invoked when a worker finishes; if it errored, mark the parent task crashed."""
+        try:
+            # Obtain exception without raising
+            exc = None
+            try:
+                exc = worker_task.exception()
+            except asyncio.CancelledError:
+                return
+            if exc:
+                # Do not swallow - mark task crashed in DB
+                await self._mark_crashed(exc=exc, context='worker_task')
+        except Exception:
+            # Swallow everything in background callback
+            return
+
+    async def _handle_main_done(self, main_task: asyncio.Task):
+        """Called when the main task finishes; persist crashed state if it finished with an exception."""
+        try:
+            exc = None
+            try:
+                exc = main_task.exception()
+            except asyncio.CancelledError:
+                # Treat cancellation as non-crash (handled elsewhere)
+                return
+            if exc:
+                await self._mark_crashed(exc=exc, context='main_task')
+        except Exception:
+            return
+
 # Actions
 
     @crash_handler
@@ -374,8 +424,24 @@ class Task:
             raise ValueError("Task ID is not set.")
 
         reporter = Reporter()
-        await reporter.start()
-        async with await reporter.run_context(self.task_id, meta={"task_name": self.name, "action": self.get_action_type()}) as run_id:
+        # Ensure reporter.start() or run_context creation failures are handled
+        try:
+            await reporter.start()
+            _run_ctx = await reporter.run_context(self.task_id, meta={"task_name": self.name, "action": self.get_action_type()})
+        except Exception as e:
+            # If reporter fails to init we should mark the task crashed and persist that
+            import sys
+            self.logger.error(f"Failed to initialize reporter for task {self.task_id}: {e}")
+            try:
+                # best-effort: reporter may be partially initialized
+                await reporter.event(None, self.task_id, "ERROR", "error.reporter_init", f"Reporter init failed: {e}", {'error': repr(e)})
+            except Exception:
+                pass
+            self.status = Task.TaskStatus.CRASHED
+            await self._update_status()
+            raise
+
+        async with _run_ctx as run_id:
             try:
                 self._current_run_id = run_id
                 await reporter.event(run_id, self.task_id, "INFO", "info.init.run_start", f"Starting run for task.")
@@ -480,6 +546,29 @@ class Task:
                         raise
                 await reporter.event(run_id, self.task_id, "INFO", "info.connecting.posts_validated", f"Validated {len(posts)} posts.")
 
+                # Pre-load reaction palette once for the whole task if action is 'react'.
+                # The palette is identical for all clients in the task and can be copied to each client
+                # to avoid repeated DB calls per-worker.
+                if self.get_action_type() == 'react':
+                    try:
+                        emojis, palette_ordered = await self.get_reaction_emojis()
+                        # Copy palette to each connected client so workers don't hit the DB again
+                        if self._clients:
+                            for client in self._clients:
+                                # store a shallow copy to avoid accidental shared-mutations
+                                client.active_emoji_palette = list(emojis)
+                                client.palette_ordered = palette_ordered
+                        await reporter.event(run_id, self.task_id, "INFO", "info.action.palette_loaded",
+                                               f"Loaded reaction palette '{self.get_reaction_palette_name()}' with {len(emojis)} emojis.")
+                        self.logger.info(f"Loaded reaction palette '{self.get_reaction_palette_name()}' with {len(emojis)} emojis for task {self.task_id}")
+                    except Exception as e:
+                        self.logger.error(f"Failed to load reaction palette for task {self.task_id}: {e}")
+                        await reporter.event(run_id, self.task_id, "ERROR", "error.action.palette_load_failed",
+                                               f"Failed to load reaction palette: {e}", {'error': repr(e)})
+                        self.status = Task.TaskStatus.CRASHED
+                        await self._update_status()
+                        raise
+
                 if self.get_action() is None:
                     self.logger.error("No action defined for the task.")
                     await reporter.event(run_id, self.task_id, "WARNING", "error.no_action", "No action defined for the task.")
@@ -492,7 +581,10 @@ class Task:
                         for client in self._clients
                     ]
                     for worker in workers:
+                        # Keep existing crash reporting hook
                         worker.add_done_callback(handle_task_exception)
+                        # Schedule parent task crash persistence if a worker errors
+                        worker.add_done_callback(lambda t, s=self: asyncio.create_task(s._handle_worker_done(t)))
 
                     self.logger.info(f"Created {len(workers)} workers for task {self.task_id}.")
                     results = await asyncio.gather(*workers, return_exceptions=True)
@@ -526,10 +618,17 @@ class Task:
                 self._task = None  # Mark task as finished
             
             await reporter.event(run_id, self.task_id, "INFO", "info.run_end", "Run has ended.")
-            # If you got here - task succeeded
-            self.status = Task.TaskStatus.FINISHED
-            await self._update_status()
-            self.logger.info(f"Task {self.task_id} completed successfully.")
+            # If you got here - run ended. Only mark FINISHED if not already marked CRASHED
+            if self.status != Task.TaskStatus.CRASHED:
+                self.status = Task.TaskStatus.FINISHED
+                await self._update_status()
+                self.logger.info(f"Task {self.task_id} completed successfully.")
+            else:
+                # status already persisted as CRASHED by callbacks/handlers
+                try:
+                    self.logger.info(f"Task {self.task_id} ended with status {status_name(self.status)}.")
+                except Exception:
+                    pass
             return
         await reporter.stop()  # stop reporter and flush            
 
@@ -545,13 +644,11 @@ class Task:
         await reporter.event(run_id, self.task_id, "INFO", "info.worker", f"Worker started for client {client.phone_number}")
         if self.get_action_type() == 'react':
             await reporter.event(run_id, self.task_id, "DEBUG", "info.worker.action", "Worker proceeds to reacting")
-            
-            # Get palette emojis and ordering flag, then set on client
-            emojis, palette_ordered = await self.get_reaction_emojis()
-            client.active_emoji_palette = emojis
-            client.palette_ordered = palette_ordered
-            
-            self.logger.debug(f"Client {client.phone_number} using palette with {len(emojis)} emojis, ordered={palette_ordered}")
+            # The task preloads the palette once and copies it to each client during _run();
+            # here we simply trust the client to already have the palette assigned.
+            palette = getattr(client, 'active_emoji_palette', []) or []
+            palette_ordered = getattr(client, 'palette_ordered', False)
+            self.logger.debug(f"Client {client.phone_number} using palette with {len(palette)} emojis, ordered={palette_ordered}")
             
             retries = config.get('delays', {}).get('action_retries', 5)
             for post in posts:
@@ -812,6 +909,8 @@ class Task:
             self._current_run_id = None  # Will empty if exists, but if exists and finished will be used for statistics
             self.logger.info(f"Starting task {self.task_id} - {self.name}...")
             self._task = asyncio.create_task(self._run())
+            # Ensure that an unhandled exception in the main task is persisted
+            self._task.add_done_callback(lambda t, s=self: asyncio.create_task(s._handle_main_done(t)))
             self.updated_at = Timestamp.now()
             self.status = Task.TaskStatus.RUNNING
             await self._update_status()

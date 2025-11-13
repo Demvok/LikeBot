@@ -22,6 +22,7 @@ Environment:
 import os, inspect, asyncio
 from typing import Optional
 from pandas import Timestamp
+from datetime import datetime, timezone
 from functools import wraps
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -44,7 +45,8 @@ def ensure_async(func):
 
     @wraps(func)
     async def wrapper(*args, **kwargs):
-        return func(*args, **kwargs)
+        # Run potentially blocking sync helpers in a thread to avoid blocking the event loop
+        return await asyncio.to_thread(func, *args, **kwargs)
 
     return wrapper
 
@@ -59,6 +61,7 @@ class MongoStorage():
     _runs = None
     _proxies = None
     _palettes = None
+    _counters = None
     _client: Optional[AsyncIOMotorClient] = None
     _indexes_initialized = False
     _index_lock: Optional[asyncio.Lock] = None
@@ -86,6 +89,7 @@ class MongoStorage():
         cls._users = cls._db["users"]
         cls._proxies = cls._db["proxies"]
         cls._palettes = cls._db["reaction_palettes"]
+        cls._counters = cls._db["counters"]
         
         # Reporter collections with write concerns
         from pymongo.write_concern import WriteConcern
@@ -206,6 +210,13 @@ class MongoStorage():
                 await create_unique_index_safe(cls._tasks, "task_id", "ux_tasks_task_id")
                 await create_unique_index_safe(cls._users, "username", "ux_users_username")
                 await create_unique_index_safe(cls._proxies, "proxy_name", "ux_proxies_proxy_name")
+
+                # Ensure counters collection has an index on _id for fast lookups
+                try:
+                    await cls._counters.create_index([("_id", 1)], unique=True)
+                except Exception:
+                    # Non-critical if index creation fails here; available migrations can handle it
+                    logger.debug("Counters index creation skipped or failed during startup")
                 
                 # Non-unique indexes (can be created normally)
                 await cls._proxies.create_index([("active", ASCENDING), ("connected_accounts", ASCENDING)], name="ix_proxies_active_usage")
@@ -267,9 +278,10 @@ class MongoStorage():
     @ensure_async
     async def add_account(cls, account_data):
         await cls._ensure_ready()
-        logger.info(f"Adding account to MongoDB: {account_data}")
+
         if hasattr(account_data, 'to_dict'):
             account_data = account_data.to_dict()
+        logger.info("Adding account to MongoDB: phone=%s, account_id=%s", account_data.get('phone_number'), account_data.get('account_id'))
         # Ensure all AccountBase/AccountDict fields are present
         for field in [
             'phone_number', 'account_id', 'session_name', 'session_encrypted', 'twofa',
@@ -347,30 +359,71 @@ class MongoStorage():
     @ensure_async
     async def add_post(cls, post):
         await cls._ensure_ready()
-        logger.info(f"Adding post to MongoDB: {post}")
         if hasattr(post, 'to_dict'):
             post = post.to_dict()
         post_id = post.get('post_id')
+
+        # If post_id is not provided, allocate an atomic numeric id from counters collection
         if not post_id:
-            posts = await cls.load_all_posts()
-            used_ids = set()
-            for p in posts:
+            # Use a small retry loop in case of rare DuplicateKey after allocation
+            from pymongo import ReturnDocument
+            from pymongo.errors import DuplicateKeyError
+
+            for attempt in range(3):
+                seq_doc = await cls._counters.find_one_and_update(
+                    {"_id": "post_id"}, {"$inc": {"seq": 1}}, upsert=True,
+                    return_document=ReturnDocument.AFTER
+                )
                 try:
-                    used_ids.add(int(p.post_id))
+                    post_id = int(seq_doc.get('seq'))
                 except Exception:
+                    post_id = None
+                if post_id is None:
                     continue
-            post_id = 1
-            while post_id in used_ids:
-                post_id += 1
-            post['post_id'] = post_id
+
+                post['post_id'] = post_id
+
+                # If a post with this id already exists, loop to get next id
+                existing_post = await cls._posts.find_one({"post_id": post_id})
+                if existing_post:
+                    # Try next sequence number
+                    continue
+                break
+
+            if post_id is None:
+                # Fallback to 1 if something goes terribly wrong
+                post_id = 1
+                post['post_id'] = post_id
+
+        logger.info("Adding post to MongoDB: post_id=%s, link=%s", post.get('post_id'), post.get('message_link'))
+
+        # If post exists, update; else insert. Handle DuplicateKeyError with a retry if necessary.
         existing_post = await cls.get_post(post_id)
         if existing_post:
-            logger.debug(f"Post with post_id {post_id} exists in MongoDB. Updating.")
+            logger.debug("Post with post_id %s exists in MongoDB. Updating.", post_id)
             return await cls.update_post(post_id, post)
+
         post.pop('_id', None)
-        await cls._posts.insert_one(post)
-        logger.debug(f"Post with post_id {post_id} added to MongoDB.")
-        return True
+        from pymongo.errors import DuplicateKeyError
+        for attempt in range(3):
+            try:
+                await cls._posts.insert_one(post)
+                logger.debug("Post with post_id %s added to MongoDB.", post_id)
+                return True
+            except DuplicateKeyError:
+                # Race: another writer inserted same post_id; get next sequence and retry
+                seq_doc = await cls._counters.find_one_and_update({"_id": "post_id"}, {"$inc": {"seq": 1}}, upsert=True, return_document=ReturnDocument.AFTER)
+                try:
+                    post_id = int(seq_doc.get('seq'))
+                except Exception:
+                    post_id = None
+                if post_id is None:
+                    continue
+                post['post_id'] = post_id
+                continue
+
+        # If all retries failed, raise
+        raise RuntimeError("Failed to insert post after several attempts due to ID conflicts")
 
     @classmethod
     @ensure_async
@@ -486,29 +539,71 @@ class MongoStorage():
     @ensure_async
     async def add_task(cls, task):
         await cls._ensure_ready()
-        logger.info(f"Adding task to MongoDB: {task}")
         if hasattr(task, 'to_dict'):
             task = task.to_dict()
+
         task_id = task.get('task_id')
+
+        # If task_id not provided, allocate atomically from counters
         if not task_id:
-            tasks = await cls.load_all_tasks()
-            used_ids = set()
-            for t in tasks:
+            from pymongo import ReturnDocument
+            from pymongo.errors import DuplicateKeyError
+
+            for attempt in range(3):
+                seq_doc = await cls._counters.find_one_and_update(
+                    {"_id": "task_id"}, {"$inc": {"seq": 1}}, upsert=True,
+                    return_document=ReturnDocument.AFTER
+                )
                 try:
-                    used_ids.add(int(t.task_id))
+                    task_id = int(seq_doc.get('seq'))
                 except Exception:
+                    task_id = None
+                if task_id is None:
                     continue
-            task_id = 1
-            while task_id in used_ids:
-                task_id += 1
-            task['task_id'] = task_id
+
+                task['task_id'] = task_id
+
+                existing_task = await cls._tasks.find_one({"task_id": task_id})
+                if existing_task:
+                    continue
+                break
+
+            if task_id is None:
+                task_id = 1
+                task['task_id'] = task_id
+
+        logger.info("Adding task to MongoDB: task_id=%s, name=%s", task.get('task_id'), task.get('name'))
         existing_task = await cls.get_task(task_id)
         if existing_task:
             logger.debug(f"Task with task_id {task_id} exists in MongoDB. Updating.")
             return await cls.update_task(task_id, task)
-        await cls._tasks.insert_one(task)
-        logger.debug(f"Task with task_id {task_id} added to MongoDB.")
-        return True
+
+        if 'created_at' not in task:
+            task['created_at'] = datetime.now(timezone.utc)
+        if 'updated_at' not in task:
+            task['updated_at'] = datetime.now(timezone.utc)
+
+        # Insert with duplicate-key retry in case of race
+        from pymongo.errors import DuplicateKeyError
+        from pymongo import ReturnDocument
+
+        for attempt in range(3):
+            try:
+                await cls._tasks.insert_one(task)
+                logger.debug("Task with task_id %s added to MongoDB.", task_id)
+                return True
+            except DuplicateKeyError:
+                seq_doc = await cls._counters.find_one_and_update({"_id": "task_id"}, {"$inc": {"seq": 1}}, upsert=True, return_document=ReturnDocument.AFTER)
+                try:
+                    task_id = int(seq_doc.get('seq'))
+                except Exception:
+                    task_id = None
+                if task_id is None:
+                    continue
+                task['task_id'] = task_id
+                continue
+
+        raise RuntimeError("Failed to insert task after several attempts due to ID conflicts")
 
     @classmethod
     @ensure_async
@@ -549,6 +644,9 @@ class MongoStorage():
         update_data.pop('_id', None)
         # Ensure task_id is set in the update data for upserts
         update_data['task_id'] = task_id
+        # Update the modification timestamp
+        from datetime import datetime, timezone
+        update_data['updated_at'] = datetime.now(timezone.utc)
         result = await cls._tasks.update_one({"task_id": task_id}, {"$set": update_data}, upsert=True)
         logger.debug(f"Task {task_id} upsert result: modified={result.modified_count}, upserted_id={result.upserted_id}")
         return result.modified_count > 0 or result.upserted_id is not None
@@ -560,6 +658,14 @@ class MongoStorage():
         logger.info(f"Deleting task from MongoDB with task_id: {task_id}")
         if hasattr(task_id, 'task_id'):
             task_id = task_id.task_id
+        # Cascade: delete all runs and their events linked to this task first
+        try:
+            cleared = await cls.clear_runs_by_task(task_id)
+            logger.info(f"Cleared runs for task {task_id} before deleting task: {cleared}")
+        except Exception as e:
+            # Log and proceed to delete the task record itself; do not fail the whole operation
+            logger.warning(f"Failed to clear runs for task {task_id} prior to task deletion: {e}")
+
         result = await cls._tasks.delete_one({"task_id": task_id})
         logger.debug(f"Task {task_id} delete result: {result.deleted_count}")
         return result.deleted_count > 0

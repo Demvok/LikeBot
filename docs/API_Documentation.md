@@ -22,6 +22,18 @@ This document describes the full CRUD API for the LikeBot automation system.
 6. [Error Responses](#error-responses)
 7. [Notes](#notes)
 
+## Changelog
+
+The following notes summarize important changes in the codebase since the previous documented version (1.0.2):
+
+- Bumped API version to **1.0.6** (see health-check response below).
+- Added CORS support that can be configured via the `frontend_http` environment variable (used by the API to allow frontend origins).
+- Startup now enforces critical environment variables at launch (e.g., `KEK`, `JWT_SECRET_KEY`, `db_url`) and will fail fast if they are missing.
+- The application registers a cleanup handler on process exit to ensure logging/resources are cleaned up (clean shutdown behavior).
+- WebSocket `/ws/logs` accepts a `tail` query parameter (0-1000, default 200) and will send token-expiry warnings when an access token is nearing expiry.
+
+Notes: these changes are reflected in the `main.py` implementation. The rest of this document describes the current API surface.
+
 ## Base URL
 ```
 http://localhost:8080
@@ -207,7 +219,7 @@ Get server status.
 ```json
 {
   "message": "LikeBot API Server is running",
-  "version": "1.0.2"
+  "version": "1.0.6"
 }
 ```
 
@@ -1423,6 +1435,114 @@ Available emoji palettes:
   "content": "Your comment text here"
 }
 ```
+
+---
+
+## Reaction Palettes CRUD
+
+Reaction palettes let you define named emoji sets that tasks can reference when performing react actions. The API provides CRUD endpoints to manage palettes.
+
+### GET /palettes
+Get all palettes or filter by name.
+
+Authentication: Required
+
+Query parameters:
+- `palette_name` (optional): Filter by palette name
+
+Response (200):
+```json
+[
+  {
+    "palette_name": "positive",
+    "emojis": ["👍","❤️","🔥"],
+    "ordered": false,
+    "description": "Positive reactions palette",
+    "created_at": "2025-01-01T00:00:00Z",
+    "updated_at": "2025-01-01T00:00:00Z"
+  }
+]
+```
+
+### GET /palettes/{palette_name}
+Get a specific palette by name.
+
+Authentication: Required
+
+Response (200):
+```json
+{
+  "palette_name": "positive",
+  "emojis": ["👍","❤️","🔥"],
+  "ordered": false,
+  "description": "Positive reactions palette",
+  "created_at": "2025-01-01T00:00:00Z",
+  "updated_at": "2025-01-01T00:00:00Z"
+}
+```
+
+Error responses:
+- `404`: Palette not found
+
+### POST /palettes
+Create a new palette.
+
+Authentication: Required
+
+Query parameters (form/query style):
+- `palette_name` (required): Unique name for the palette (case-insensitive; stored lowercased)
+- `emojis` (required): Comma-separated list of emojis (e.g. "👍,❤️,🔥")
+- `ordered` (optional, default false): If true, the palette will be used sequentially by tasks; if false, emojis are chosen randomly.
+- `description` (optional): Human-friendly description
+
+Notes:
+- The endpoint parses the comma-separated `emojis` string into an array and validates at least one emoji is provided.
+- `palette_name` is normalized to lowercase when stored.
+
+Response (201):
+```json
+{
+  "message": "Palette 'positive' created successfully",
+  "palette_name": "positive",
+  "emoji_count": 3
+}
+```
+
+Error responses:
+- `400`: Validation error (e.g., no emojis provided)
+- `409`: Palette already exists
+
+### PUT /palettes/{palette_name}
+Update an existing palette. Only provided fields are changed.
+
+Authentication: Required
+
+Query parameters (optional):
+- `emojis`: Comma-separated list of emojis (replaces existing list)
+- `ordered`: true/false
+- `description`: New description
+
+Response (200):
+```json
+{ "message": "Palette 'positive' updated successfully" }
+```
+
+Error responses:
+- `400`: No fields provided or invalid emoji list
+- `404`: Palette not found
+
+### DELETE /palettes/{palette_name}
+Delete a palette.
+
+Authentication: Required
+
+Response (200):
+```json
+{ "message": "Palette 'positive' deleted successfully" }
+```
+
+Warning: Tasks that reference a deleted palette will fail to execute until the palette is recreated or tasks are updated to use an existing palette.
+
 
 ---
 
