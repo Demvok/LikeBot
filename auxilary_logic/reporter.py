@@ -3,7 +3,7 @@ import asyncio, uuid
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
-from logger import setup_logger, load_config
+from utils.logger import setup_logger, load_config
 
 load_dotenv()
 
@@ -27,7 +27,7 @@ class Reporter:
 
     async def init(self):
         """Initialize database (ensure indexes are created)"""
-        from database import get_db
+        from main_logic.database import get_db
         db = get_db()
         await db._ensure_ready()
 
@@ -35,7 +35,7 @@ class Reporter:
 
     # ---- Public reporter API used by workers ----
     async def new_run(self, task_id: str, meta: Optional[Dict[str, Any]] = None) -> str:
-        from database import get_db
+        from main_logic.database import get_db
         db = get_db()
         run_id = str(uuid.uuid4())
         # write run doc immediately for stronger traceability
@@ -43,7 +43,7 @@ class Reporter:
         return run_id
 
     async def end_run(self, run_id: str, status: str = "success", meta_patch: Optional[Dict[str, Any]] = None):
-        from database import get_db
+        from main_logic.database import get_db
         db = get_db()
         await db.end_run(run_id, status, meta_patch)
 
@@ -78,7 +78,7 @@ class Reporter:
 
     async def _writer_loop(self):
         """Background task for writing events to the database."""
-        from database import get_db
+        from main_logic.database import get_db
         db = get_db()
         
         buffer: List[Dict[str, Any]] = []
@@ -214,7 +214,7 @@ class RunEventManager:
 
     async def refresh(self):
         """Reload data from MongoDB asynchronously."""
-        from database import get_db
+        from main_logic.database import get_db
         db = get_db()
         
         # Get all runs and events using centralized methods
@@ -229,7 +229,7 @@ class RunEventManager:
         Returns a pandas DataFrame with all unique task_ids and the number of runs for each.
         Ensures columns are ordered: task_id, run_count.
         """
-        from database import get_db
+        from main_logic.database import get_db
         db = get_db()
         
         results = await db.get_all_task_summaries()
@@ -243,7 +243,7 @@ class RunEventManager:
         Return all runs for a given task_id, with an additional column 'event_count'
         indicating the number of events for each run, ordered by started_at descending.
         """
-        from database import get_db
+        from main_logic.database import get_db
         db = get_db()
         
         # Get all runs for the task_id
@@ -263,7 +263,7 @@ class RunEventManager:
 
     async def get_task_details(self, task_id):
         """Return details for a single task."""
-        from database import get_db
+        from main_logic.database import get_db
         db = get_db()
         
         runs = await db.get_runs_by_task(task_id)
@@ -275,7 +275,7 @@ class RunEventManager:
         Splits the 'code' field into 'event_type', 'action_type', and 'details' columns.
         Removes the original 'code' column.
         """
-        from database import get_db
+        from main_logic.database import get_db
         db = get_db()
         
         events = await db.get_events_by_run(run_id)
@@ -294,7 +294,7 @@ class RunEventManager:
         Splits the 'code' field into 'event_type', 'action_type', and 'details' columns.
         Removes the original 'code' field.
         """
-        from database import get_db
+        from main_logic.database import get_db
         
         db = get_db()
         event = await db.get_event_by_id(event_id)
@@ -311,7 +311,7 @@ class RunEventManager:
 
     async def delete_run(self, run_id):
         """Delete a run by run_id and all linked events."""
-        from database import get_db
+        from main_logic.database import get_db
         db = get_db()
         
         result = await db.delete_run(run_id)
@@ -320,7 +320,7 @@ class RunEventManager:
 
     async def delete_event(self, event_id):
         """Delete an event by event_id."""
-        from database import get_db
+        from main_logic.database import get_db
         
         db = get_db()
         result = await db.delete_event_by_id(event_id)
@@ -329,7 +329,7 @@ class RunEventManager:
 
     async def clear_runs(self, task_id):
         """Delete all runs for a given task_id and all linked events, then refresh data."""
-        from database import get_db
+        from main_logic.database import get_db
         db = get_db()
         
         result = await db.clear_runs_by_task(task_id)
@@ -364,7 +364,7 @@ async def create_report(data, type=None):
 
     async def gather_post_links(post_id: Series):
             async def fetch_post_link(post_id):
-                from database import get_db
+                from main_logic.database import get_db
                 db = get_db()
                 post = await db.get_post(post_id) if post_id else None
                 return post.message_link if post else None

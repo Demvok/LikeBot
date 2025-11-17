@@ -366,6 +366,8 @@ def crash_handler(func):
         async def wrapper(*args, **kwargs):
             try:
                 return await func(*args, **kwargs)
+            except (CancelledError, GeneratorExit, KeyboardInterrupt): # Don't log these as crashes - they're normal control flow
+                raise
             except Exception:
                 import sys
                 flush_crash_report(exc_info=sys.exc_info())
@@ -375,6 +377,8 @@ def crash_handler(func):
         def wrapper(*args, **kwargs):
             try:
                 return func(*args, **kwargs)
+            except (GeneratorExit, KeyboardInterrupt): # Don't log these as crashes - they're normal control flow
+                raise
             except Exception:
                 import sys
                 flush_crash_report(exc_info=sys.exc_info())

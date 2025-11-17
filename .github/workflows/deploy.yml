@@ -21,8 +21,21 @@ jobs:
           key: ${{ secrets.VPS_KEY }}
           script: |
             cd /home/ivand/LikeBot
-            git fetch --all
+            
+            git fetch --all  # Check if requirements.txt changed
+            REQUIREMENTS_CHANGED=$(git diff HEAD origin/main -- requirements.txt | wc -l)
+            
             git reset --hard origin/main
+
+            # Install dependencies if requirements.txt changed
+            if [ "$REQUIREMENTS_CHANGED" -gt 0 ]; then
+              echo "requirements.txt changed, updating dependencies..."
+              source venv/bin/activate
+              pip install -r requirements.txt
+              deactivate
+            else
+              echo "requirements.txt unchanged, skipping dependency installation"
+            fi
 
             # Installing XDG_RUNTIME_DIR manually for user services
             export XDG_RUNTIME_DIR=/run/user/$(id -u)

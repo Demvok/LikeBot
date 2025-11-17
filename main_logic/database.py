@@ -27,9 +27,10 @@ from functools import wraps
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import PyMongoError, ServerSelectionTimeoutError
-from logger import setup_logger, load_config
-from agent import Account
-from taskhandler import Post, Task
+from utils.logger import setup_logger, load_config
+from main_logic.agent import Account
+from main_logic.post import Post
+from main_logic.task import Task
 
 config = load_config()
 logger = setup_logger("DB", "main.log")
@@ -731,7 +732,7 @@ class MongoStorage():
         Returns:
             Tuple of (success: bool, user_data: dict | None)
         """
-        from encryption import verify_password
+        from auxilary_logic.encryption import verify_password
         
         await cls._ensure_ready()
         logger.info(f"Verifying credentials for user: {username}")
@@ -1209,7 +1210,7 @@ class MongoStorage():
         
         # Encrypt password if provided
         if proxy_data.get('password'):
-            from encryption import encrypt_secret, PURPOSE_PROXY_PASSWORD
+            from auxilary_logic.encryption import encrypt_secret, PURPOSE_PROXY_PASSWORD
             logger.debug(f"Encrypting password for proxy {proxy_name}")
             proxy_data['password_encrypted'] = encrypt_secret(proxy_data['password'], PURPOSE_PROXY_PASSWORD)
             proxy_data.pop('password')  # Remove plain password
@@ -1236,7 +1237,7 @@ class MongoStorage():
         Returns:
             Proxy dictionary if found (with decrypted password), None otherwise
         """
-        from encryption import decrypt_secret, PURPOSE_PROXY_PASSWORD
+        from auxilary_logic.encryption import decrypt_secret, PURPOSE_PROXY_PASSWORD
         
         await cls._ensure_ready()
         logger.info(f"Getting proxy from MongoDB: {proxy_name}")
@@ -1264,7 +1265,7 @@ class MongoStorage():
         Returns:
             List of proxy dictionaries (with decrypted passwords)
         """
-        from encryption import decrypt_secret, PURPOSE_PROXY_PASSWORD
+        from auxilary_logic.encryption import decrypt_secret, PURPOSE_PROXY_PASSWORD
         
         await cls._ensure_ready()
         logger.info("Loading all proxies from MongoDB")
@@ -1294,7 +1295,7 @@ class MongoStorage():
         Returns:
             List of active proxy dictionaries (with decrypted passwords)
         """
-        from encryption import decrypt_secret, PURPOSE_PROXY_PASSWORD
+        from auxilary_logic.encryption import decrypt_secret, PURPOSE_PROXY_PASSWORD
         
         await cls._ensure_ready()
         logger.info("Loading active proxies from MongoDB")
@@ -1324,7 +1325,7 @@ class MongoStorage():
         Returns:
             Proxy dictionary if found (with decrypted password), None otherwise
         """
-        from encryption import decrypt_secret, PURPOSE_PROXY_PASSWORD
+        from auxilary_logic.encryption import decrypt_secret, PURPOSE_PROXY_PASSWORD
         
         await cls._ensure_ready()
         logger.info("Getting least used active proxy from MongoDB")
@@ -1372,7 +1373,7 @@ class MongoStorage():
         
         # Encrypt password if provided
         if update_data.get('password'):
-            from encryption import encrypt_secret, PURPOSE_PROXY_PASSWORD
+            from auxilary_logic.encryption import encrypt_secret, PURPOSE_PROXY_PASSWORD
             logger.debug(f"Encrypting new password for proxy {proxy_name}")
             update_data['password_encrypted'] = encrypt_secret(update_data['password'], PURPOSE_PROXY_PASSWORD)
             update_data.pop('password')  # Remove plain password

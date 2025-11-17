@@ -22,7 +22,7 @@ async def test_proxy_module():
     print("=" * 60)
     
     # Import proxy module
-    from proxy import build_proxy_dict, build_proxy_candidates
+    from auxilary_logic.proxy import build_proxy_dict, build_proxy_candidates
     
     # Test data: proxy with both SOCKS5 and HTTP ports
     test_proxy = {
@@ -91,7 +91,7 @@ async def test_database_operations():
     print("=" * 60)
     
     try:
-        from database import get_db
+        from main_logic.database import get_db
         
         db = get_db()
         
@@ -200,7 +200,7 @@ async def show_all_proxies():
     print("=" * 60)
     
     try:
-        from database import get_db
+        from main_logic.database import get_db
         
         db = get_db()
         proxies = await db.get_all_proxies()

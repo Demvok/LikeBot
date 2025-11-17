@@ -1,38 +1,33 @@
 """
 Telegram account and client management utilities using Telethon.
 Defines Account and Client classes to manage account data, session creation,
-connection lifecycle, and common actions (react/comment/undo). Implements
-an interactive login flow (start_login) with 2FA support, session encryption,
-database persistence integration, and a global pending_logins registry with cleanup.
+connection lifecycle, and common actions (react/comment/undo).
 """
 
-import re, os, random, asyncio, uuid
-from datetime import datetime, timezone, timedelta
+import os, random, asyncio, time
 from pandas import Timestamp 
 from telethon.tl.functions.messages import SendReactionRequest, GetMessagesViewsRequest
 from telethon import TelegramClient, functions, types, errors
 from telethon.sessions import StringSession
-from logger import setup_logger, load_config
+from utils.logger import setup_logger, load_config
 from dotenv import load_dotenv
-from schemas import AccountStatus, LoginStatus, LoginProcess, status_name
-from telethon_error_handler import map_telethon_exception
+from main_logic.schemas import AccountStatus, status_name
+from auxilary_logic.telethon_error_handler import map_telethon_exception
 from urllib.parse import urlparse, unquote
-from encryption import (
+from auxilary_logic.encryption import (
     decrypt_secret,
     encrypt_secret,
     PURPOSE_PASSWORD,
     PURPOSE_STRING_SESSION,
 )
+from auxilary_logic.humaniser import rate_limiter, estimate_reading_time
+from collections import OrderedDict
 
 load_dotenv()
 api_id = os.getenv('api_id')
 api_hash = os.getenv('api_hash')
 
 config = load_config()
-
-# Global storage for active login processes
-# Format: {login_session_id: LoginProcess}
-pending_logins: dict[str, LoginProcess] = {}
 
 
 class Account(object):
@@ -92,7 +87,7 @@ class Account(object):
             error: Optional exception that caused the status change
             success: If True, updates last_success_time
         """
-        from database import get_db
+        from main_logic.database import get_db
         from datetime import datetime, timezone
         
         db = get_db()
@@ -135,7 +130,7 @@ class Account(object):
             seconds: number of seconds the flood wait will last
             error: optional exception to record in last_error/last_error_type
         """
-        from database import get_db
+        from main_logic.database import get_db
         from datetime import datetime, timezone, timedelta
         
         db = get_db()
@@ -206,7 +201,7 @@ class Account(object):
         self.password_encrypted = encrypt_secret(password, PURPOSE_PASSWORD)
         self.twofa = True
 
-        from database import get_db  # Avoid circular import if any
+        from main_logic.database import get_db  # Avoid circular import if any
         db = get_db()
         await db.update_account(self.phone_number, {'password_encrypted': self.password_encrypted, 'twofa': self.twofa})
 
@@ -243,7 +238,7 @@ class Account(object):
     @classmethod
     async def get_accounts(cls, phones:list):
         """Get a list of Account objects from a list of phone numbers."""
-        from database import get_db
+        from main_logic.database import get_db
         db = get_db()
         all_accounts = await db.load_all_accounts()
         return [elem for elem in all_accounts if elem.phone_number in phones]
@@ -276,6 +271,11 @@ class Client(object):
         self.palette_ordered = False  # Whether to use emojis sequentially or randomly
         
         self.proxy_name = None # Initialize proxy_name as None - will be set during connection
+        
+        # Entity cache with LRU eviction (max 100 entities, 5 min TTL)
+        self._entity_cache = OrderedDict()  # {identifier: (entity, timestamp)}
+        self._entity_cache_max_size = 100
+        self._entity_cache_ttl = 300  # 5 minutes
         
         self.logger = setup_logger(f"{self.phone_number}", f"accounts/account_{self.phone_number}.log")
         self.logger.info(f"Initializing client for {self.phone_number}. Awaiting connection...")
@@ -328,15 +328,6 @@ class Client(object):
             await self.client.disconnect()
             self.logger.info(f"Client for {self.phone_number} disconnected.")
 
-
-
-    async def _fetch_verification_code(self):
-        """Fetch the verification code from an external source or user input."""
-        # Placeholder for actual implementation
-        # For now, we will just ask the user to input the code manually
-        code = input(f'Enter the verification code for {self.phone_number}: ').strip()
-        return code
-
     async def _get_proxy_config(self):
         """
         Get proxy configuration for this connection.
@@ -345,7 +336,7 @@ class Client(object):
         - proxy_candidates is a list of proxy dicts to try (ordered by preference)
         - proxy_data is the raw proxy data from database
         """
-        from proxy import get_proxy_config
+        from auxilary_logic.proxy import get_proxy_config
         
         candidates, proxy_data = await get_proxy_config(self.phone_number, self.logger)
         
@@ -356,97 +347,29 @@ class Client(object):
         return candidates, proxy_data
 
     async def _get_session(self, force_new=False):
+        """
+        Get the Telethon session for this account.
+        
+        Args:
+            force_new: If True, clears the current session (used when session becomes invalid)
+            
+        Returns:
+            StringSession object
+            
+        Raises:
+            ValueError: If no session exists (user must login via API first)
+        """
         if self.session_encrypted and not force_new:
             self.logger.info(f"Using existing session for {self.phone_number}.")
             return StringSession(decrypt_secret(self.session_encrypted, PURPOSE_STRING_SESSION))
         else:
-            self.logger.info(f"Creating new session for {self.phone_number}.")
-
-            # Get retry configuration for session creation (limited attempts)
-            session_creation_retries = config.get('delays', {}).get('session_creation_retries', 2)
-            
-            for attempt in range(1, session_creation_retries + 1):
-                try:
-                    session_folder = config.get('filepaths', {}).get('sessions_folder', 'sessions/')
-
-                    if not os.path.exists(session_folder):
-                        os.makedirs(session_folder)
-
-                    self.client = TelegramClient(
-                        f"{session_folder}{self.session_name}",
-                        api_id=api_id,
-                        api_hash=api_hash
-                    )
-
-                    await self.client.connect()  # Connect before checking authorization
-                    
-                    if await self.client.is_user_authorized():
-                        self.logger.info(f"Client for {self.phone_number} is already authorized.")
-                    else:
-                        self.logger.info(f"Client for {self.phone_number} is not authorized. Sending code...")
-                        
-                        await self.client.send_code_request(self.phone_number)  # Sending the verification code
-                        self.logger.debug(f"Verification code sent to {self.phone_number}.")
-
-                        code = await self._fetch_verification_code()
-                        if not code:
-                            self.logger.warning("No verification code provided.")
-                            raise ValueError("Verification code cannot be empty.")
-                        else:
-                            self.logger.debug(f"Received verification code: {code}")
-
-                        try:
-                            self.logger.debug("Attempting to sign in with verification code.")
-                            await self.client.sign_in(phone=self.phone_number, code=code)
-                        except errors.SessionPasswordNeededError:
-                            self.logger.info(f"2FA is enabled for {self.phone_number}, password required.")
-                            if not self.password_encrypted:
-                                self.logger.error("2FA is required but no password is configured.")
-                                raise ValueError("2FA password is required but not provided.")
-                            
-                            password = decrypt_secret(self.password_encrypted, PURPOSE_PASSWORD)
-                            if not password:
-                                self.logger.error("Failed to decrypt 2FA password.")
-                                raise ValueError("Failed to decrypt 2FA password.")
-                            
-                            self.logger.debug("Signing in with 2FA password.")
-                            await self.client.sign_in(password=password)
-                        except Exception as e:
-                            self.logger.error(f"Error during sign-in for {self.phone_number}: {e}")
-                            raise
-
-                    self.session_encrypted = encrypt_secret(StringSession.save(self.client.session), PURPOSE_STRING_SESSION)
-                    await self.client.disconnect()  # Ensure the session file is closed before deleting
-                    
-                    from database import get_db  # Avoid circular import if any
-                    db = get_db()
-                    await db.update_account(self.phone_number, {'session_encrypted': self.session_encrypted, 'status': AccountStatus.ACTIVE.name})
-                    
-                    self.logger.info(f"Session for {self.phone_number} saved.")
-
-                    return StringSession(decrypt_secret(self.session_encrypted, PURPOSE_STRING_SESSION))
-                    
-                except (errors.PhoneCodeInvalidError, errors.PhoneCodeExpiredError) as e:
-                    self.logger.warning(f"Code error on attempt {attempt}/{session_creation_retries}: {e}")
-                    if attempt < session_creation_retries:
-                        self.logger.info(f"Retrying session creation for {self.phone_number}...")
-                        continue
-                    else:
-                        self.logger.error(f"Failed to create session after {session_creation_retries} attempts.")
-                        raise
-                except Exception as e:
-                    self.logger.error(f"Session creation failed on attempt {attempt}/{session_creation_retries}: {e}")
-                    raise
-                finally:
-                    try:                
-                        if self.client and self.client.is_connected():
-                            await self.client.disconnect()
-                        session_file = f"{config.get('filepaths', {}).get('sessions_folder', 'sessions/')}{self.session_name}.session"
-                        if os.path.exists(session_file):
-                            os.remove(session_file)
-                            self.logger.info(f"Temporary session file deleted for {self.phone_number}.")
-                    except Exception as e:
-                        self.logger.error(f"Failed to delete temporary session file for {self.phone_number}: {e}")
+            # No session exists - user must login through the API endpoint
+            error_msg = (
+                f"No session found for {self.phone_number}. "
+                "Please use the /accounts/create API endpoint to login this account first."
+            )
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
 
     async def connect(self):
         retries = config.get('delays', {}).get('connection_retries', 5)
@@ -491,7 +414,7 @@ class Client(object):
                     selected_candidate = None
                     # If proxy_candidates is a list, try them in order until one connects
                     if proxy_candidates:
-                        from database import get_db
+                        from main_logic.database import get_db
                         db = get_db()
                         for candidate in proxy_candidates:
                             try:
@@ -566,7 +489,7 @@ class Client(object):
                         self.logger.warning(f"Failed to update account status for {self.phone_number}: {_u}")
 
                     # Update database to clear invalid session
-                    from database import get_db
+                    from main_logic.database import get_db
                     db = get_db()
                     await db.update_account(self.phone_number, {
                         'session_encrypted': None
@@ -637,7 +560,7 @@ class Client(object):
                 
                 # Decrement proxy usage counter if a proxy was used
                 if self.proxy_name:
-                    from database import get_db
+                    from main_logic.database import get_db
                     db = get_db()
                     await db.decrement_proxy_usage(self.proxy_name)
                     self.logger.debug(f"Decremented usage counter for proxy {self.proxy_name}")
@@ -658,6 +581,76 @@ class Client(object):
         if not self.client or not self.is_connected:
             self.logger.info(f"Client for {self.phone_number} is not connected. Reconnecting...")
             await self.connect()
+
+# Caching with rate limiting for get_entity
+
+    def _get_cache_key(self, identifier):
+        """Convert identifier to cache key (normalize format)."""
+        if isinstance(identifier, int):
+            return f"id:{identifier}"
+        elif isinstance(identifier, str):
+            # Normalize username format
+            username = identifier.strip().lstrip('@').lower()
+            # Remove URL parts if present
+            if '/' in username:
+                username = username.split('/')[-1]
+            return f"username:{username}"
+        return str(identifier)
+    
+    def _cleanup_entity_cache(self):
+        """Remove expired entries and enforce max size (LRU)."""
+        now = time.time()
+        # Remove expired entries
+        expired_keys = [
+            key for key, (entity, timestamp) in self._entity_cache.items()
+            if now - timestamp > self._entity_cache_ttl
+        ]
+        for key in expired_keys:
+            del self._entity_cache[key]
+        
+        # Enforce max size (LRU: remove oldest)
+        while len(self._entity_cache) > self._entity_cache_max_size:
+            self._entity_cache.popitem(last=False)
+    
+    async def get_entity_cached(self, identifier):
+        """
+        Get entity with caching and rate limiting.
+        
+        Args:
+            identifier: Can be username, user_id, or other entity identifier
+            
+        Returns:
+            Entity object from Telegram
+        """
+        cache_key = self._get_cache_key(identifier)
+        now = time.time()
+        
+        # Check cache first
+        if cache_key in self._entity_cache:
+            entity, timestamp = self._entity_cache[cache_key]
+            if now - timestamp < self._entity_cache_ttl:
+                self.logger.debug(f"Cache hit for entity: {cache_key}")
+                # Move to end (mark as recently used)
+                self._entity_cache.move_to_end(cache_key)
+                return entity
+            else:
+                # Expired, remove it
+                del self._entity_cache[cache_key]
+        
+        # Cache miss - fetch from Telegram with rate limiting
+        self.logger.debug(f"Cache miss for entity: {cache_key}, fetching from Telegram")
+        await rate_limiter.wait_if_needed('get_entity')
+        
+        await self.ensure_connected()
+        entity = await self.client.get_entity(identifier)
+        
+        # Store in cache
+        self._entity_cache[cache_key] = (entity, now)
+        self._cleanup_entity_cache()
+        
+        return entity
+
+#
 
     @classmethod
     async def connect_clients(cls, accounts: list[Account], logger):
@@ -703,7 +696,10 @@ class Client(object):
                 if not chat_id or not message_id:
                     raise ValueError("Either message_link or both chat_id and message_id must be provided.")
 
-            entity = await self.client.get_entity(chat_id)
+            # Use cached get_entity with rate limiting
+            entity = await self.get_entity_cached(chat_id)
+            # Rate limit message fetching
+            await rate_limiter.wait_if_needed('get_messages')
             message = await self.client.get_messages(entity, ids=message_id)
             return message.message if message else None
         except Exception as e:
@@ -717,7 +713,7 @@ class Client(object):
             me = await self.client.get_me()
             account_id = me.id if hasattr(me, 'id') else None
             if account_id:
-                from database import get_db  # Avoid circular import if any
+                from main_logic.database import get_db  # Avoid circular import if any
                 db = get_db()
                 await db.update_account(self.phone_number, {'account_id': account_id})
                 self.logger.info(f"Updated account_id for {self.phone_number} to {account_id}")
@@ -728,25 +724,6 @@ class Client(object):
         except Exception as e:
             self.logger.error(f"Error updating account_id from Telegram: {e}")
             raise
-
-    @staticmethod
-    def estimate_reading_time(text:str, wpm=None) -> float:
-        """
-        Estimate the reading time for a given text in seconds. It uses a statistical model to predict reading speed.
-        """
-        from scipy.stats import skewnorm
-        from numpy import arange, random as rnd
-        try:
-            words = len(str(text).split())
-            if wpm is None:
-                wpm_list = arange(160, 301, dtype=int)
-                wpm_distribution = skewnorm.pdf(wpm_list, loc=230, scale=30, a=0)
-                wpm_distribution = wpm_distribution / wpm_distribution.max()
-                probs = wpm_distribution / wpm_distribution.sum()
-                wpm = rnd.choice(wpm_list, p=probs, size=1)[0]
-            return round(float(words / wpm * 60), 3)
-        except Exception as e:
-            raise ValueError(f"Error estimating reading time: {e}")
 
     # Basic actions
 
@@ -776,7 +753,7 @@ class Client(object):
             # Full humanization: fetch message content and estimate reading time
             msg_content = await self.get_message_content(chat_id=target_chat.id if hasattr(target_chat, 'id') else target_chat, message_id=message.id)
             if msg_content:
-                reading_time = self.estimate_reading_time(msg_content)
+                reading_time = estimate_reading_time(msg_content)
                 self.logger.debug(f"Estimated reading time: {reading_time} seconds")
                 await asyncio.sleep(reading_time)
             else:
@@ -800,6 +777,8 @@ class Client(object):
         allowed_reactions = None
         try:
             # Fetch full message to get reactions attribute
+            # Rate limit message fetching
+            await rate_limiter.wait_if_needed('get_messages')
             full_message = await self.client.get_messages(target_chat, ids=message.id)
             
             if hasattr(full_message, 'reactions') and full_message.reactions:
@@ -857,6 +836,8 @@ class Client(object):
             for idx, emoticon in enumerate(filtered_palette, 1):
                 try:
                     self.logger.debug(f"Attempting emoji (ordered, rank {idx}/{len(filtered_palette)}): {emoticon}")
+                    # Rate limit reaction sending
+                    await rate_limiter.wait_if_needed('send_reaction')
                     await self.client(SendReactionRequest(
                         peer=target_chat,
                         msg_id=message.id,
@@ -891,6 +872,8 @@ class Client(object):
             for idx, emoticon in enumerate(shuffled_palette, 1):
                 try:
                     self.logger.debug(f"Attempting emoji (random, attempt {idx}/{len(shuffled_palette)}): {emoticon}")
+                    # Rate limit reaction sending
+                    await rate_limiter.wait_if_needed('send_reaction')
                     await self.client(SendReactionRequest(
                         peer=target_chat,
                         msg_id=message.id,
@@ -927,7 +910,7 @@ class Client(object):
 
         if config.get('delays', {}).get('humanisation_level', 1) >= 1:  # If humanisation level is 1 it should consider reading time
             msg_content = await self.get_message_content(chat_id=target_chat.id if hasattr(target_chat, 'id') else target_chat, message_id=message.id)
-            reading_time = self.estimate_reading_time(msg_content)
+            reading_time = estimate_reading_time(msg_content)
             self.logger.info(f"Estimated reading time: {reading_time} seconds")
             await asyncio.sleep(reading_time)
 
@@ -945,6 +928,8 @@ class Client(object):
 
         await asyncio.sleep(random.uniform(0.5, 2))  # Prevent spam if everything is broken
 
+        # Rate limit message sending
+        await rate_limiter.wait_if_needed('send_message')
         await self.client.send_message(
             entity=discussion_chat,
             message=content,
@@ -961,6 +946,9 @@ class Client(object):
         ))
         
         await asyncio.sleep(random.uniform(0.5, 1))  # Prevent spam if everything is broken
+        
+        # Rate limit reaction removal
+        await rate_limiter.wait_if_needed('send_reaction')
         await self.client(SendReactionRequest(
             peer=target_chat,
             msg_id=message.id,
@@ -1006,7 +994,7 @@ class Client(object):
             # First, try to find a stored Post in DB with the same link. If it exists and
             # is already validated, use its chat_id/message_id and skip network resolution.
             try:
-                from database import get_db
+                from main_logic.database import get_db
                 db = get_db()
 
                 try:
@@ -1060,11 +1048,11 @@ class Client(object):
                 raise ValueError(f"Message part is not numeric: {link}")
             message_id = int(msg)
 
-            # отримуємо entity
+            # отримуємо entity with caching and rate limiting
             await self.ensure_connected()
             # Спроба передати повний URL (Telethon підтримує це)
             try:
-                entity = await self.client.get_entity(username)
+                entity = await self.get_entity_cached(username)
             except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.SessionRevokedError, errors.UserDeactivatedError, errors.UserDeactivatedBanError) as auth_error:
                 # Session is invalid/expired/revoked or account is banned - re-raise for proper handling upstream
                 # Include SessionRevokedError explicitly so it isn't swallowed and can be mapped to account status
@@ -1085,7 +1073,7 @@ class Client(object):
                 for candidate in candidates:
                     tried.append(candidate)
                     try:
-                        entity = await self.client.get_entity(candidate)
+                        entity = await self.get_entity_cached(candidate)
                         break
                     except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.SessionRevokedError, errors.UserDeactivatedError, errors.UserDeactivatedBanError) as auth_error:
                         # Re-raise auth related errors immediately so they can be handled upstream
@@ -1119,7 +1107,10 @@ class Client(object):
         while attempt < retries:
             try:
                 chat_id, message_id = await self.get_message_ids(message_link)
-                entity = await self.client.get_entity(chat_id)
+                # Use cached get_entity with rate limiting
+                entity = await self.get_entity_cached(chat_id)
+                # Rate limit message fetching
+                await rate_limiter.wait_if_needed('get_messages')
                 message = await self.client.get_messages(entity, ids=message_id)
                 await self._undo_reaction(message, entity)
                 self.logger.info("Reaction removed successfully")
@@ -1139,7 +1130,10 @@ class Client(object):
         while attempt < retries:
             try:
                 chat_id, message_id = await self.get_message_ids(message_link)
-                entity = await self.client.get_entity(chat_id)
+                # Use cached get_entity with rate limiting
+                entity = await self.get_entity_cached(chat_id)
+                # Rate limit message fetching
+                await rate_limiter.wait_if_needed('get_messages')
                 message = await self.client.get_messages(entity, ids=message_id)
                 await self._undo_comment(message, entity)
                 self.logger.info(f"Comment {message} deleted successfully!")
@@ -1165,7 +1159,10 @@ class Client(object):
         while attempt < retries:
             try:
                 chat_id, message_id = await self.get_message_ids(message_link)
-                entity = await self.client.get_entity(chat_id)
+                # Use cached get_entity with rate limiting
+                entity = await self.get_entity_cached(chat_id)
+                # Rate limit message fetching
+                await rate_limiter.wait_if_needed('get_messages')
                 message = await self.client.get_messages(entity, ids=message_id)                
                 await self._react(message, entity)                
                 self.logger.info("Reaction added successfully")
@@ -1186,7 +1183,10 @@ class Client(object):
         while attempt < retries:
             try:
                 chat_id, message_id = await self.get_message_ids(message_link)
-                entity = await self.client.get_entity(chat_id)
+                # Use cached get_entity with rate limiting
+                entity = await self.get_entity_cached(chat_id)
+                # Rate limit message fetching
+                await rate_limiter.wait_if_needed('get_messages')
                 message = await self.client.get_messages(entity, ids=message_id)
                 await self._comment(message=message, target_chat=entity, content=content)
                 self.logger.info("Comment added successfully!")
@@ -1199,186 +1199,3 @@ class Client(object):
                 else:
                     raise
 
-
-# ============= LOGIN PROCESS FUNCTIONS =============
-
-async def start_login(
-    phone_number: str, 
-    password: str = None, 
-    login_session_id: str = None,
-    session_name: str = None,
-    notes: str = None
-) -> LoginProcess:
-    """
-    Start the login process for a Telegram account.
-    
-    This function:
-    1. Creates a TelegramClient and connects
-    2. Sends verification code to the phone
-    3. Waits for user to provide the code via Future
-    4. Signs in with the code
-    5. If 2FA required, waits for password via Future
-    6. Saves encrypted session to database
-    
-    Args:
-        phone_number: Phone number with country code
-        password: Encrypted password for 2FA (optional)
-        login_session_id: UUID for this login session (auto-generated if not provided)
-        session_name: Custom session name (optional, defaults to "session_{phone_number}")
-        notes: Account notes (optional)
-    
-    Returns:
-        LoginProcess object with final status
-    """
-    from database import get_db
-    
-    # Generate login session ID if not provided
-    if not login_session_id:
-        login_session_id = str(uuid.uuid4())
-    
-    logger = setup_logger("login", "main.log")
-    logger.info(f"Starting login process for {phone_number} with session ID {login_session_id}")
-    
-    # Create LoginProcess object
-    login_process = LoginProcess(
-        login_session_id=login_session_id,
-        phone_number=phone_number,
-        status=LoginStatus.PROCESSING,
-        code_future=asyncio.Future(),
-        password_future=asyncio.Future() if password else None,
-        created_at=datetime.now(timezone.utc),
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=10)
-    )
-    
-    # Store in global pending_logins
-    pending_logins[login_session_id] = login_process
-    
-    try:
-        # Create TelegramClient
-        client = TelegramClient(StringSession(), api_id, api_hash)
-        login_process.telethon_client = client
-        
-        await client.connect()
-        logger.info(f"Client connected for {phone_number}")
-        
-        # Send verification code
-        await client.send_code_request(phone_number)
-        login_process.status = LoginStatus.WAIT_CODE
-        logger.info(f"Verification code sent to {phone_number}")
-        
-        # Wait for verification code from user (via API endpoint)
-        code = await login_process.code_future
-        logger.info(f"Received verification code for {phone_number}")
-        
-        login_process.status = LoginStatus.PROCESSING
-        
-        try:
-            # Try to sign in with the code
-            me = await client.sign_in(phone_number, code)
-            logger.info(f"Successfully signed in: {me.first_name} {me.last_name}")
-            
-            # Success - save session
-            session_string = client.session.save()
-            encrypted_session = encrypt_secret(session_string, PURPOSE_STRING_SESSION)
-            
-            login_process.status = LoginStatus.DONE
-            login_process.session_string = encrypted_session
-            
-            # Update or create account in database
-            db = get_db()
-            account_data = {
-                'phone_number': phone_number,
-                'account_id': me.id,
-                'session_name': session_name if session_name else f"session_{phone_number}",
-                'session_encrypted': encrypted_session,
-                'twofa': False,
-                'notes': notes if notes else "",
-                'status': AccountStatus.ACTIVE.name,
-                'created_at': datetime.now(timezone.utc),
-                'updated_at': datetime.now(timezone.utc)
-            }
-            
-            existing_account = await db.get_account(phone_number)
-            if existing_account:
-                await db.update_account(phone_number, account_data)
-                logger.info(f"Updated account {phone_number} in database")
-            else:
-                await db.add_account(account_data)
-                logger.info(f"Created new account {phone_number} in database")
-            
-        except errors.SessionPasswordNeededError:
-            # 2FA required
-            logger.info(f"2FA required for {phone_number}")
-            login_process.status = LoginStatus.WAIT_2FA
-            
-            # Wait for password from user
-            if password:
-                # Password already provided - decrypt and use it
-                decrypted_password = decrypt_secret(password, PURPOSE_PASSWORD)
-                password_to_use = decrypted_password
-            else:
-                # Wait for password via Future
-                password_to_use = await login_process.password_future
-                
-            logger.info(f"Received 2FA password for {phone_number}")
-            login_process.status = LoginStatus.PROCESSING
-            
-            # Sign in with password
-            me = await client.sign_in(password=password_to_use)
-            logger.info(f"Successfully signed in with 2FA: {me.first_name} {me.last_name}")
-            
-            # Success - save session
-            session_string = client.session.save()
-            encrypted_session = encrypt_secret(session_string, PURPOSE_STRING_SESSION)
-            
-            login_process.status = LoginStatus.DONE
-            login_process.session_string = encrypted_session
-            
-            # Update or create account in database
-            db = get_db()
-            encrypted_password = encrypt_secret(password_to_use, PURPOSE_PASSWORD) if not password else password
-            account_data = {
-                'phone_number': phone_number,
-                'account_id': me.id,
-                'session_name': session_name if session_name else f"session_{phone_number}",
-                'session_encrypted': encrypted_session,
-                'twofa': True,
-                'password_encrypted': encrypted_password,
-                'notes': notes if notes else "",
-                'status': AccountStatus.ACTIVE.name,
-                'created_at': datetime.now(timezone.utc),
-                'updated_at': datetime.now(timezone.utc)
-            }
-            
-            existing_account = await db.get_account(phone_number)
-            if existing_account:
-                await db.update_account(phone_number, account_data)
-                logger.info(f"Updated account {phone_number} in database with 2FA")
-            else:
-                await db.add_account(account_data)
-                logger.info(f"Created new account {phone_number} in database with 2FA")
-        
-        await client.disconnect()
-        logger.info(f"Login process completed successfully for {phone_number}")
-        
-    except Exception as e:
-        logger.error(f"Login failed for {phone_number}: {str(e)}")
-        login_process.status = LoginStatus.FAILED
-        login_process.error_message = str(e)
-        
-        # Disconnect client if connected
-        if login_process.telethon_client and login_process.telethon_client.is_connected():
-            await login_process.telethon_client.disconnect()
-    
-    return login_process
-
-
-def cleanup_expired_logins():
-    """Remove expired login processes from pending_logins."""
-    now = datetime.now(timezone.utc)
-    expired = [
-        login_id for login_id, process in pending_logins.items()
-        if process.expires_at and process.expires_at < now
-    ]
-    for login_id in expired:
-        del pending_logins[login_id]

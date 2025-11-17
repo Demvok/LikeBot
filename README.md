@@ -4,8 +4,19 @@
 
 - review pauses and retries for flood avoiding
 - add creation of neccessary files if they dont exist
+- add proxy crud endpoints and proxy status
+- add task status `failed`
+
+- add report export as .csv/.xcls
+
+### TO TEST:
+- telegram login process
 
 ## Changelog
+
+### v.1.1.0
+- massive file refactor for better readability (without actual code changes)
+- 
 
 ### v.1.0.6
 - fixed multiple palette import, only on task startup
@@ -16,7 +27,7 @@
 - improved and tested proxies
 
 ### v.1.0.5
-- improved report context handling on crashes
+- improved report context handling on crashes   
 - centralized telethon error handling
 - fixed account error writing (status, last error)
 - fixed post validation (to use only active accounts)

@@ -10,7 +10,7 @@ import os
 import atexit
 import time
 from dotenv import load_dotenv, set_key
-from encryption import generate_jwt_secret_key, hash_password
+from auxilary_logic.encryption import generate_jwt_secret_key, hash_password
 from datetime import datetime, timezone
 
 async def setup_jwt_secret():
@@ -50,7 +50,7 @@ async def create_admin_user():
     print("\n=== Create Admin User ===")
     
     # Import here to ensure .env is loaded
-    from database import get_db
+    from main_logic.database import get_db
     
     # Get admin credentials
     username = input("Enter admin username (3-50 chars, alphanumeric): ").strip()
@@ -151,7 +151,7 @@ async def verify_setup():
         return False
     
     # Check if admin user exists
-    from database import get_db
+    from main_logic.database import get_db
     db = get_db()
     
     # Try to find any admin user
@@ -210,7 +210,7 @@ async def main():
 def cleanup():
     """Cleanup resources before exit."""
     try:
-        from logger import cleanup_logging
+        from utils.logger import cleanup_logging
         cleanup_logging()
         # Give the logging queue listener time to stop gracefully
         time.sleep(0.1)

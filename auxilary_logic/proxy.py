@@ -7,7 +7,7 @@ Provides functions to:
 - Select and validate proxy configurations
 """
 
-from logger import setup_logger
+from utils.logger import setup_logger
 
 logger = setup_logger("proxy", "main.log")
 
@@ -177,7 +177,7 @@ async def get_proxy_config(phone_number, logger_instance=None):
         - proxy_data_dict: Raw proxy data from database
         Returns (None, None) if no proxies available
     """
-    from database import get_db
+    from main_logic.database import get_db
     
     log = logger_instance or logger
     db = get_db()

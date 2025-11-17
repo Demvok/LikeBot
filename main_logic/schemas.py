@@ -6,11 +6,12 @@ across all components. It includes Pydantic models for validation, type hints, a
 
 Usage locations to update when modifying schemas:
 1. agent.py - Account class
-2. taskhandler.py - Post and Task classes  
-3. main.py - Pydantic models for API endpoints
-4. database.py - Storage interface and implementations
-5. reporter.py - Run and Event data structures
-6. API_Documentation.md - Data models section
+2. post.py - Post class
+3. task.py - Task class  
+4. main.py - Pydantic models for API endpoints
+5. database.py - Storage interface and implementations
+6. reporter.py - Run and Event data structures
+7. API_Documentation.md - Data models section
 
 IMPORTANT: When modifying schemas, search for and update ALL usage locations listed above.
 Use global find/replace to ensure consistency across the codebase.
@@ -802,7 +803,7 @@ class SchemaMigration:
             'schemas.py:AccountStatus'
         ],
         'TaskStatus': [
-            'taskhandler.py:Task.TaskStatus', 
+            'task.py:Task.TaskStatus', 
             'schemas.py:TaskStatus'
         ],
         'Account': [
@@ -818,9 +819,9 @@ class SchemaMigration:
             'API_Documentation.md:Account model'
         ],
         'Post': [
-            'taskhandler.py:Post.__init__',
-            'taskhandler.py:Post.to_dict',
-            'taskhandler.py:Post.from_keys',
+            'post.py:Post.__init__',
+            'post.py:Post.to_dict',
+            'post.py:Post.from_keys',
             'database.py:*Storage.add_post',
             'database.py:*Storage.get_post',
             'database.py:*Storage.update_post',
@@ -829,8 +830,8 @@ class SchemaMigration:
             'API_Documentation.md:Post model'
         ],
         'Task': [
-            'taskhandler.py:Task.__init__',
-            'taskhandler.py:Task.to_dict',
+            'task.py:Task.__init__',
+            'task.py:Task.to_dict',
             'database.py:*Storage.add_task',
             'database.py:*Storage.get_task',
             'database.py:*Storage.update_task',
@@ -839,8 +840,8 @@ class SchemaMigration:
             'API_Documentation.md:Task model'
         ],
         'TaskAction': [
-            'taskhandler.py:Task.action',
-            'taskhandler.py:Task.get_action*',
+            'task.py:Task.action',
+            'task.py:Task.get_action*',
             'main.py:TaskCreate.action',
             'main.py:TaskUpdate.action',
             'API_Documentation.md:Action Types'
@@ -849,7 +850,7 @@ class SchemaMigration:
             'reporter.py:RunEventManager',
             'reporter.py:Reporter.new_run',
             'reporter.py:Reporter.event',
-            'taskhandler.py:Task._run'
+            'task.py:Task._run'
         ]
     }
     

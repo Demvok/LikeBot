@@ -1,5 +1,5 @@
 from telethon import errors
-from schemas import AccountStatus
+from main_logic.schemas import AccountStatus
 
 # Defensive attribute access: some Telethon versions may not expose every exception class name.
 # Use fallback dummy classes so isinstance checks don't raise AttributeError during tests.

@@ -13,12 +13,12 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError
 
-from database import get_db
-from encryption import (
+from main_logic.database import get_db
+from auxilary_logic.encryption import (
     hash_password, verify_password, create_access_token, 
     decode_access_token, JWT_ACCESS_TOKEN_EXPIRE_MINUTES
 )
-from schemas import Token, TokenData, UserCreate, UserLogin, UserRole
+from main_logic.schemas import Token, TokenData, UserCreate, UserLogin, UserRole
 
 # OAuth2 scheme for token authentication
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")

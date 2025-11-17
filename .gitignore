@@ -3,6 +3,7 @@
 logs/
 sessions/
 __pycache__
-misc/
+.pytest_cache/
 test.ipynb
-tests/
+_prod_bug/
+/misc/

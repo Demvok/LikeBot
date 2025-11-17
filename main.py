@@ -15,13 +15,14 @@ from datetime import timedelta, datetime as dt, timezone
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Depends, status
 from fastapi.security import OAuth2PasswordRequestForm
 from typing import Optional, List, Dict, Annotated
-from agent import *
-from logger import crash_handler, cleanup_logging, get_log_directory
-from taskhandler import *
-from database import get_db
+from main_logic.agent import *
+from main_logic.post import *
+from main_logic.task import *
+from utils.logger import crash_handler, cleanup_logging, get_log_directory
+from main_logic.database import get_db
 from fastapi.middleware.cors import CORSMiddleware
-from schemas import *
-from auth import (
+from main_logic.schemas import *
+from auxilary_logic.auth import (
     authenticate_user, get_current_user, get_current_verified_user,
     get_current_admin_user, create_user_account, create_user_token, decode_access_token
 )
@@ -36,7 +37,7 @@ atexit.register(cleanup_logging)  # Register cleanup function
 app = FastAPI(
     title="LikeBot API",
     description="Full API for LikeBot automation",
-    version="1.0.6"
+    version="1.1.0"
 )
 
 logger = logging.getLogger("likebot.main")
@@ -326,7 +327,7 @@ async def create_account_without_login(
 ):
     """Create a new account without logging in. Useful for pre-registering accounts. Legacy endpoint. Requires authentication."""
     try:
-        from encryption import encrypt_secret, PURPOSE_PASSWORD
+        from auxilary_logic.encryption import encrypt_secret, PURPOSE_PASSWORD
         
         db = get_db()
         existing_account = await db.get_account(account_data.phone_number)  # Check if account already exists
@@ -365,7 +366,7 @@ async def update_account(
 ):
     """Update an existing account. Requires authentication."""
     try:
-        from encryption import encrypt_secret, PURPOSE_PASSWORD
+        from auxilary_logic.encryption import encrypt_secret, PURPOSE_PASSWORD
         
         db = get_db()
         
@@ -485,7 +486,7 @@ async def get_account_password(
     In production, this should require additional authentication/authorization.
     """
     try:
-        from encryption import decrypt_secret, PURPOSE_PASSWORD
+        from auxilary_logic.encryption import decrypt_secret, PURPOSE_PASSWORD
         
         db = get_db()
         account = await db.get_account(phone_number)
@@ -528,8 +529,8 @@ async def login_start(
     Returns login_session_id and status.
     Frontend should poll /accounts/create/status or proceed to /accounts/create/verify.
     """
-    from agent import start_login, pending_logins
-    from encryption import encrypt_secret, PURPOSE_PASSWORD
+    from auxilary_logic.login import start_login, pending_logins
+    from auxilary_logic.encryption import encrypt_secret, PURPOSE_PASSWORD
     import asyncio
     import uuid
     
@@ -580,7 +581,7 @@ async def login_verify(
     Submit verification code to continue login process. Requires authentication.
     2FA passwords must be provided during /accounts/create/start, not here.
     """
-    from agent import pending_logins
+    from auxilary_logic.login import pending_logins
     
     try:
         # Get login process
@@ -628,7 +629,7 @@ async def login_status(
     Check the status of an ongoing login process. Requires authentication.
     Used for polling by the frontend.
     """
-    from agent import pending_logins, cleanup_expired_logins
+    from auxilary_logic.login import pending_logins, cleanup_expired_logins
     
     try:
         # Cleanup expired sessions
@@ -986,7 +987,7 @@ async def get_task_status(
             raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
         
         status = await task.get_status()
-        from schemas import status_name
+        from main_logic.schemas import status_name
         return {"task_id": task_id, "status": status_name(status)}
     except HTTPException:
         raise
@@ -1068,7 +1069,7 @@ async def get_task_report(
         if not task:
             raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
         
-        from reporter import RunEventManager, create_report
+        from auxilary_logic.reporter import RunEventManager, create_report
         event_manager = RunEventManager()
 
         effective_run_id = run_id
@@ -1128,7 +1129,7 @@ async def get_task_runs(
         if not task:
             raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
         
-        from reporter import RunEventManager
+        from auxilary_logic.reporter import RunEventManager
         from pandas import DataFrame
         import json
 
@@ -1162,7 +1163,7 @@ async def get_run_report(
         if not task:
             raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
         
-        from reporter import RunEventManager, create_report
+        from auxilary_logic.reporter import RunEventManager, create_report
         from pandas import DataFrame
 
         event_manager = RunEventManager()
@@ -1195,7 +1196,7 @@ async def get_run_report(
 async def get_all_runs(current_user: dict = Depends(get_current_user)):
     """Get all execution runs across all tasks. Requires authentication."""
     try:
-        from reporter import RunEventManager
+        from auxilary_logic.reporter import RunEventManager
         eventManager = RunEventManager()
         
         # Get all tasks
@@ -1249,7 +1250,7 @@ async def delete_run(
         if not task:
             raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
         
-        from reporter import RunEventManager
+        from auxilary_logic.reporter import RunEventManager
         eventManager = RunEventManager()
 
         res = await eventManager.delete_run(run_id)
@@ -1280,7 +1281,7 @@ async def delete_all_task_runs(
         if not task:
             raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
         
-        from reporter import RunEventManager
+        from auxilary_logic.reporter import RunEventManager
         eventManager = RunEventManager()
         result = await eventManager.clear_runs(str(task_id))
         
@@ -1342,7 +1343,7 @@ async def create_accounts_bulk(
 ):
     """Create multiple accounts in bulk. Requires authentication."""
     try:
-        from encryption import encrypt_secret, PURPOSE_PASSWORD
+        from auxilary_logic.encryption import encrypt_secret, PURPOSE_PASSWORD
         
         db = get_db()
         results = []
