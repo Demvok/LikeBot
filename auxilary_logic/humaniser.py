@@ -5,6 +5,8 @@ Includes rate limiting and reading time estimation to simulate human behavior.
 
 import asyncio
 import time
+from scipy.stats import skewnorm
+from numpy import arange, random as rnd
 
 
 class TelegramAPIRateLimiter:
@@ -56,8 +58,6 @@ def estimate_reading_time(text: str, wpm=None) -> float:
     Returns:
         Estimated reading time in seconds
     """
-    from scipy.stats import skewnorm
-    from numpy import arange, random as rnd
     
     try:
         words = len(str(text).split())

@@ -4,7 +4,8 @@ import datetime
 
 from telethon import errors
 
-from utils.logger import setup_logger, load_config
+from utils.logger import load_config
+from main_logic.channel import normalize_chat_id
 
 config = load_config()
 
@@ -13,7 +14,7 @@ class Post:
 
     def __init__(self, message_link:str, post_id:int=None, chat_id:int=None, message_id:int=None, created_at=None, updated_at=None):
         self.post_id = post_id
-        self.chat_id = chat_id
+        self.chat_id = normalize_chat_id(chat_id) if chat_id else None
         self.message_id = message_id
         self.message_link = message_link
         self.created_at = created_at or Timestamp.now()
@@ -74,7 +75,7 @@ class Post:
         while attempt < retries:
             try:
                 chat_id, message_id = await client.get_message_ids(self.message_link)
-                self.chat_id = chat_id
+                self.chat_id = normalize_chat_id(chat_id)
                 self.message_id = message_id
                 self.updated_at = Timestamp.now()
                 await db.update_post(self.post_id, {

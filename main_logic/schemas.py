@@ -228,6 +228,7 @@ class AccountBase(BaseModel):
     twofa: bool = Field(False, description="Is 2FA enabled for this account?")
     password_encrypted: Optional[str] = Field(None, description="Encrypted password for 2FA")
     notes: Optional[str] = Field("", description="Account notes")
+    subscribed_to: Optional[List[int]] = Field(default_factory=list, description="List of channel chat_ids the account is subscribed to")
     
     # Status tracking fields
     last_error: Optional[str] = Field(None, description="Last error message encountered")
@@ -259,6 +260,7 @@ class AccountCreate(BaseModel):
     twofa: bool = Field(False, description="Is 2FA enabled for this account?")
     password: Optional[str] = Field(None, description="Plain text password for 2FA (will be encrypted server-side)")
     notes: Optional[str] = Field("", description="Account notes")
+    subscribed_to: Optional[List[int]] = Field(default_factory=list, description="List of channel chat_ids the account is subscribed to")
 
     @field_validator('phone_number')
     def validate_phone_number(cls, v):
@@ -301,6 +303,7 @@ class AccountUpdate(BaseModel):
     password: Optional[str] = Field(None, description="Plain text password for 2FA (will be encrypted server-side)")
     notes: Optional[str] = Field(None, description="Account notes")
     status: Optional[AccountStatus] = Field(None, description="Account status")
+    subscribed_to: Optional[List[int]] = Field(None, description="List of channel chat_ids the account is subscribed to")
 
     class Config:
         use_enum_values = True
@@ -335,6 +338,7 @@ class AccountDict(BaseModel):
     password_encrypted: Optional[str]
     notes: Optional[str]
     status: Optional[AccountStatus]
+    subscribed_to: Optional[List[int]]
     created_at: Optional[Union[str, datetime]]
     updated_at: Optional[Union[str, datetime]]
 
@@ -352,6 +356,7 @@ class AccountDictSecure(BaseModel):
     twofa: bool = Field(False)
     notes: Optional[str]
     status: Optional[AccountStatus]
+    subscribed_to: Optional[List[int]]
     created_at: Optional[Union[str, datetime]]
     updated_at: Optional[Union[str, datetime]]
 
@@ -468,6 +473,77 @@ class ReactionPaletteDict(BaseModel):
     emojis: List[str]
     ordered: bool
     description: Optional[str]
+    created_at: Union[str, datetime]
+    updated_at: Union[str, datetime]
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+# ============= CHANNEL SCHEMAS =============
+
+class ChannelBase(BaseModel):
+    """Base schema for Channel data.
+    
+    Primary Key: chat_id
+    """
+    chat_id: int = Field(..., description="Telegram chat ID (unique identifier, primary key)")
+    is_private: bool = Field(False, description="Is the channel private?")
+    channel_hash: Optional[str] = Field("", description="Channel hash (blank for now)")
+    has_enabled_reactions: bool = Field(True, description="Does the channel have reactions enabled?")
+    reactions_only_for_subscribers: bool = Field(False, description="Are reactions only for subscribers?")
+    discussion_chat_id: Optional[int] = Field(None, description="Discussion group chat ID if exists")
+    channel_name: Optional[str] = Field(None, description="Channel name/title", max_length=255)
+    tags: Optional[List[str]] = Field(default_factory=list, description="Channel tags for categorization")
+
+    @field_validator('tags')
+    def validate_tags(cls, v):
+        if v is None:
+            return []
+        # Remove empty strings and strip whitespace
+        return [tag.strip() for tag in v if tag and tag.strip()]
+
+
+class ChannelCreate(ChannelBase):
+    """Schema for creating new channels."""
+    pass
+
+
+class ChannelUpdate(BaseModel):
+    """Schema for updating existing channels."""
+    is_private: Optional[bool] = Field(None, description="Is the channel private?")
+    channel_hash: Optional[str] = Field(None, description="Channel hash")
+    has_enabled_reactions: Optional[bool] = Field(None, description="Does the channel have reactions enabled?")
+    reactions_only_for_subscribers: Optional[bool] = Field(None, description="Are reactions only for subscribers?")
+    discussion_chat_id: Optional[int] = Field(None, description="Discussion group chat ID if exists")
+    channel_name: Optional[str] = Field(None, description="Channel name/title", max_length=255)
+    tags: Optional[List[str]] = Field(None, description="Channel tags for categorization")
+
+    @field_validator('tags')
+    def validate_tags(cls, v):
+        if v is None:
+            return None
+        # Remove empty strings and strip whitespace
+        return [tag.strip() for tag in v if tag and tag.strip()]
+
+
+class ChannelResponse(ChannelBase, TimestampMixin):
+    """Schema for channel responses (includes all fields)."""
+    
+    class Config:
+        use_enum_values = True
+
+
+class ChannelDict(BaseModel):
+    """Schema for Channel.to_dict() output."""
+    chat_id: int
+    is_private: bool
+    channel_hash: Optional[str]
+    has_enabled_reactions: bool
+    reactions_only_for_subscribers: bool
+    discussion_chat_id: Optional[int]
+    channel_name: Optional[str]
+    tags: List[str]
     created_at: Union[str, datetime]
     updated_at: Union[str, datetime]
 
@@ -851,6 +927,16 @@ class SchemaMigration:
             'reporter.py:Reporter.new_run',
             'reporter.py:Reporter.event',
             'task.py:Task._run'
+        ],
+        'Channel': [
+            'channel.py:Channel.__init__',
+            'channel.py:Channel.to_dict',
+            'database.py:*Storage.add_channel',
+            'database.py:*Storage.get_channel',
+            'database.py:*Storage.update_channel',
+            'main.py:ChannelCreate',
+            'main.py:ChannelUpdate',
+            'API_Documentation.md:Channel model'
         ]
     }
     

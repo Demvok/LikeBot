@@ -22,6 +22,7 @@ from auxilary_logic.encryption import (
 )
 from auxilary_logic.humaniser import rate_limiter, estimate_reading_time
 from collections import OrderedDict
+from main_logic.channel import normalize_chat_id, Channel
 
 load_dotenv()
 api_id = os.getenv('api_id')
@@ -43,6 +44,7 @@ class Account(object):
             self.twofa = account_data.get('twofa', False)
             self.password_encrypted = account_data.get('password_encrypted', None)
             self.notes = account_data.get('notes', "")
+            self.subscribed_to = account_data.get('subscribed_to', [])
             self.status = account_data.get('status', self.AccountStatus.NEW)
             self.created_at = account_data.get('created_at', Timestamp.now())
             self.updated_at = account_data.get('updated_at', Timestamp.now())
@@ -171,6 +173,7 @@ class Account(object):
             'session_encrypted': self.session_encrypted,
             'twofa': self.twofa,
             'notes': self.notes,
+            'subscribed_to': self.subscribed_to if hasattr(self, 'subscribed_to') else [],
             'status': status_name(self.status),
             'created_at': self.created_at,
             'updated_at': self.updated_at,
@@ -216,6 +219,7 @@ class Account(object):
         password_encrypted=None,
         password=None,
         notes=None,
+        subscribed_to=None,
         status=None,
         created_at=None,
         updated_at=None
@@ -229,6 +233,7 @@ class Account(object):
             'twofa': twofa,
             'password_encrypted': password_encrypted if password_encrypted else encrypt_secret(password, PURPOSE_PASSWORD) if password else None,
             'notes': notes if notes is not None else "",
+            'subscribed_to': subscribed_to if subscribed_to is not None else [],
             'status': status if status is not None else cls.AccountStatus.NEW,
             'created_at': created_at or Timestamp.now(),
             'updated_at': updated_at or Timestamp.now()
@@ -319,14 +324,7 @@ class Client(object):
     def is_connected(self):
         return self.client.is_connected()
 
-    async def __aenter__(self):
-        await self.connect()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.client:
-            await self.client.disconnect()
-            self.logger.info(f"Client for {self.phone_number} disconnected.")
+# Connection methods
 
     async def _get_proxy_config(self):
         """
@@ -649,8 +647,120 @@ class Client(object):
         self._cleanup_entity_cache()
         
         return entity
+    
+    async def _get_or_fetch_channel_data(self, chat_id: int, entity=None):
+        """
+        Get channel data from database or fetch from Telegram if not exists.
+        Minimizes API calls by reusing entity if provided.
+        
+        Args:
+            chat_id: Normalized chat ID
+            entity: Optional entity object already fetched (to avoid redundant API calls)
+        
+        Returns:
+            Channel object from database (existing or newly created)
+        """
+        from main_logic.database import get_db
+        from main_logic.channel import Channel
+        from datetime import datetime, timezone
+        
+        db = get_db()
+        
+        # First, check if channel exists in database
+        channel = await db.get_channel(chat_id)
+        if channel:
+            self.logger.debug(f"Channel {chat_id} found in database")
+            return channel
+        
+        # Channel not in DB - fetch from Telegram
+        self.logger.info(f"Channel {chat_id} not in database, fetching from Telegram")
+        
+        await self.ensure_connected()
+        
+        # Use provided entity or fetch it
+        if entity is None:
+            entity = await self.get_entity_cached(chat_id)
+        
+        # Extract channel data from entity (same as in fetch_and_update_subscribed_channels)
+        channel_data = {
+            'chat_id': chat_id,
+            'is_private': not getattr(entity, 'username', None),
+            'channel_name': getattr(entity, 'title', None),
+            'has_enabled_reactions': getattr(entity, 'reactions_enabled', True),
+            'tags': []
+        }
+        
+        # Get channel hash for private channels
+        if hasattr(entity, 'access_hash') and entity.access_hash:
+            channel_data['channel_hash'] = str(entity.access_hash)
+        else:
+            channel_data['channel_hash'] = ""
+        
+        # Try to get full channel info for discussion group and reaction settings
+        try:
+            full_channel = await self.client(functions.channels.GetFullChannelRequest(
+                channel=entity
+            ))
+            
+            # Check for linked discussion group
+            if hasattr(full_channel.full_chat, 'linked_chat_id'):
+                channel_data['discussion_chat_id'] = full_channel.full_chat.linked_chat_id
+            else:
+                channel_data['discussion_chat_id'] = None
+            
+            # Check reaction settings more accurately
+            if hasattr(full_channel.full_chat, 'available_reactions'):
+                reactions = full_channel.full_chat.available_reactions
+                if reactions is None:
+                    channel_data['has_enabled_reactions'] = False
+                elif hasattr(reactions, 'reactions'):
+                    channel_data['has_enabled_reactions'] = len(reactions.reactions) > 0
+            
+            # Check if reactions are only for subscribers
+            channel_data['reactions_only_for_subscribers'] = False
+            
+        except Exception as e:
+            self.logger.warning(f"Could not fetch full channel info for {chat_id}: {e}")
+            channel_data['discussion_chat_id'] = None
+            channel_data['reactions_only_for_subscribers'] = False
+        
+        # Add timestamps
+        channel_data['created_at'] = datetime.now(timezone.utc)
+        channel_data['updated_at'] = datetime.now(timezone.utc)
+        
+        # Save to database
+        try:
+            await db.add_channel(channel_data)
+            self.logger.info(f"Added new channel to database: {channel_data['channel_name']} ({chat_id})")
+        except ValueError:
+            # Channel was added by another process (race condition)
+            self.logger.debug(f"Channel {chat_id} already exists (race condition), fetching from DB")
+            channel = await db.get_channel(chat_id)
+            if channel:
+                return channel
+        
+        return Channel.from_dict(channel_data)
+    
+    async def _check_subscription(self, chat_id: int) -> bool:
+        """
+        Check if account is subscribed to a channel.
+        
+        Args:
+            chat_id: Normalized chat ID to check
+        
+        Returns:
+            True if subscribed, False otherwise
+        """
+        # Check account's subscribed_to list
+        if hasattr(self.account, 'subscribed_to') and self.account.subscribed_to:
+            is_subscribed = chat_id in self.account.subscribed_to
+            self.logger.debug(f"Subscription check for {chat_id}: {is_subscribed}")
+            return is_subscribed
+        
+        self.logger.debug(f"No subscription list available for account, assuming not subscribed to {chat_id}")
+        return False
 
-#
+# Mass methods
 
     @classmethod
     async def connect_clients(cls, accounts: list[Account], logger):
@@ -682,6 +792,131 @@ class Client(object):
             logger.info(f"Disconnected {len(clients)} clients.")
 
         return None  # Return None to indicate all clients are disconnected
+
+# Additional utility methods
+
+    async def get_message_ids(self, link: str):
+        """
+        Extract (chat_id, message_id, entity) from a Telegram link of types:
+        - https://t.me/c/<raw>/<msg>
+        - https://t.me/<username>/<msg>
+        - https://t.me/s/<username>/<msg>
+        - with or without @, with query params
+        
+        Returns:
+            tuple: (chat_id, message_id, entity) where entity is None for /c/ links
+                   and the cached entity object for username-based links
+        """
+        try:
+            link = link.strip()
+            if '://' not in link:
+                link = 'https://' + link
+            
+            # First, try to find a stored Post in DB with the same link. If it exists and
+            # is already validated, use its chat_id/message_id and skip network resolution.
+            try:
+                from main_logic.database import get_db
+                db = get_db()
+
+                try:
+                    post_obj = await db.get_post_by_link(link)
+                    if post_obj and getattr(post_obj, 'is_validated', False):
+                        # Ensure both ids exist and are integers
+                        if post_obj.chat_id is not None and post_obj.message_id is not None:
+                            try:
+                                chat_id_db = int(post_obj.chat_id)
+                                message_id_db = int(post_obj.message_id)
+                                self.logger.debug(f"Found validated post in DB for link {link}: chat_id={chat_id_db}, message_id={message_id_db}")
+                                return chat_id_db, message_id_db, None  # No entity for DB cached posts
+                            except Exception:
+                                self.logger.debug(f"DB post for link {link} had non-integer ids, falling back to resolution")
+                except Exception as _db_err:
+                    # Do not fail on DB errors; fall back to Telethon resolution
+                    self.logger.debug(f"DB lookup by message_link failed for '{link}': {_db_err}")
+            except Exception:
+                pass
+            parsed = urlparse(unquote(link))
+            path = parsed.path.lstrip('/')
+            segments = [seg for seg in path.split('/') if seg != '']
+            if not segments or len(segments) < 2:
+                raise ValueError(f"Link format not recognized: {link}")
+
+            # випадок /c/<raw>/<msg>
+            if segments[0] == 'c':
+                if len(segments) < 3:
+                    raise ValueError(f"Invalid /c/ link: {link}")
+                raw = segments[1]
+                msg = segments[2]
+                if not raw.isdigit() or not msg.isdigit():
+                    raise ValueError(f"Non-numeric in /c/ link: {link}")
+                chat_id = int(f"-100{raw}")
+                message_id = int(msg)
+                return chat_id, message_id, None  # No entity for /c/ links (use chat_id directly)
+
+            # випадок /s/<username>/<msg>
+            if segments[0] == 's':
+                if len(segments) < 3:
+                    raise ValueError(f"Invalid /s/ link: {link}")
+                username = segments[1]
+                msg = segments[2]
+            else:
+                # /<username>/<msg>
+                username = segments[0]
+                msg = segments[1]
+
+            username = username.lstrip('@')
+            if not msg.isdigit():
+                raise ValueError(f"Message part is not numeric: {link}")
+            message_id = int(msg)
+
+            # отримуємо entity with caching and rate limiting
+            await self.ensure_connected()
+            # Спроба передати повний URL (Telethon підтримує це)
+            try:
+                entity = await self.get_entity_cached(username)
+            except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.SessionRevokedError, errors.UserDeactivatedError, errors.UserDeactivatedBanError) as auth_error:
+                # Session is invalid/expired/revoked or account is banned - re-raise for proper handling upstream
+                # Include SessionRevokedError explicitly so it isn't swallowed and can be mapped to account status
+                self.logger.error(f"Session invalid/expired or account deactivated while resolving '{username}': {auth_error}")
+                raise
+            except Exception as e1:
+                # Try several fallbacks: full URL with scheme, http, www variant, and @username.
+                # Some Telethon versions accept a full URL but others don't, so try multiple formats.
+                last_exc = e1
+                tried = []
+                candidates = [
+                    f"https://{parsed.netloc}/{username}",
+                    f"http://{parsed.netloc}/{username}",
+                    f"{parsed.netloc}/{username}",
+                    f"@{username}",
+                ]
+                entity = None
+                for candidate in candidates:
+                    tried.append(candidate)
+                    try:
+                        entity = await self.get_entity_cached(candidate)
+                        break
+                    except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.SessionRevokedError, errors.UserDeactivatedError, errors.UserDeactivatedBanError) as auth_error:
+                        # Re-raise auth related errors immediately so they can be handled upstream
+                        self.logger.error(f"Session invalid/expired or account deactivated while resolving '{username}' using '{candidate}': {auth_error}")
+                        raise
+                    except Exception as e2:
+                        last_exc = e2
+                        self.logger.debug(f"get_entity failed for candidate '{candidate}': {e2}")
+
+                if entity is None:
+                    self.logger.error(f"Failed to resolve username '{username}' from link {link}. Tried: {tried}. Errors: {e1}, last: {last_exc}")
+                    raise ValueError(f"Cannot resolve username '{username}' from link {link}")
+
+            chat_id = normalize_chat_id(entity.id)
+            return chat_id, message_id, entity  # Return entity to avoid redundant get_entity call
+
+        except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.UserDeactivatedError, errors.UserDeactivatedBanError):
+            # Re-raise auth errors without wrapping them
+            raise
+        except Exception as e:
+            self.logger.warning(f"Error extracting IDs from '{link}': {e}")
+            raise
 
     async def get_message_content(self, chat_id=None, message_id=None, message_link=None) -> str | None:
         """
@@ -725,20 +960,183 @@ class Client(object):
             self.logger.error(f"Error updating account_id from Telegram: {e}")
             raise
 
-    # Basic actions
+    async def fetch_and_update_subscribed_channels(self):
+        """
+        Fetch all channels the account is subscribed to from Telegram,
+        update the account's subscribed_to field in database,
+        and upsert channel data to the channels collection.
+        
+        This method minimizes API calls by:
+        - Using a single GetDialogsRequest to fetch all channels
+        - Batch processing channel data
+        - Only fetching full channel details for channels not in DB
+        
+        Returns:
+            List of chat_ids that were added/updated
+        """
+        from main_logic.database import get_db
+        from main_logic.channel import Channel
+        from datetime import datetime, timezone
+        
+        db = get_db()
+        
+        try:
+            await self.ensure_connected()
+            self.logger.info(f"Fetching subscribed channels for {self.phone_number}")
+            
+            # Get all dialogs (chats/channels) with a single API call
+            # This returns channels, groups, and private chats
+            dialogs = await self.client.get_dialogs()
+            
+            # Filter for channels only (not groups or private chats)
+            # Channel types: Channel (broadcast) and Megagroup (discussion-enabled channels)
+            channel_dialogs = [
+                d for d in dialogs 
+                if hasattr(d.entity, 'broadcast') or 
+                   (hasattr(d.entity, 'megagroup') and d.entity.megagroup)
+            ]
+            
+            self.logger.info(f"Found {len(channel_dialogs)} subscribed channels")
+            
+            if not channel_dialogs:
+                self.logger.info("No channels found - account not subscribed to any channels")
+                # Update account with empty list
+                await db.update_account(self.phone_number, {'subscribed_to': []})
+                self.account.subscribed_to = []
+                return []
+            
+            chat_ids = []
+            channels_to_upsert = []
+            
+            for dialog in channel_dialogs:
+                entity = dialog.entity
+                chat_id = normalize_chat_id(entity.id)
+                chat_ids.append(chat_id)
+                
+                # Extract channel data from the entity we already have
+                # No additional API calls needed!
+                channel_data = {
+                    'chat_id': chat_id,
+                    'is_private': not getattr(entity, 'username', None),  # No username = private
+                    'channel_name': getattr(entity, 'title', None),
+                    'has_enabled_reactions': getattr(entity, 'reactions_enabled', True),
+                    'tags': []  # Will be managed manually by user
+                }
+                
+                # Get channel hash for private channels (access_hash)
+                if hasattr(entity, 'access_hash') and entity.access_hash:
+                    channel_data['channel_hash'] = str(entity.access_hash)
+                else:
+                    channel_data['channel_hash'] = ""
+                
+                # Check if channel has linked discussion group
+                # Only fetch if we don't already have this channel in DB
+                existing_channel = await db.get_channel(chat_id)
+                
+                if existing_channel:
+                    # Channel exists - only update basic fields that might have changed
+                    update_data = {
+                        'channel_name': channel_data['channel_name'],
+                        'is_private': channel_data['is_private'],
+                        'has_enabled_reactions': channel_data['has_enabled_reactions']
+                    }
+                    await db.update_channel(chat_id, update_data)
+                    self.logger.debug(f"Updated existing channel: {channel_data['channel_name']} ({chat_id})")
+                else:
+                    # New channel - try to get discussion group info
+                    # This is the only additional API call we make, and only for new channels
+                    try:
+                        full_channel = await self.client(functions.channels.GetFullChannelRequest(
+                            channel=entity
+                        ))
+                        
+                        # Check for linked discussion group
+                        if hasattr(full_channel.full_chat, 'linked_chat_id'):
+                            channel_data['discussion_chat_id'] = full_channel.full_chat.linked_chat_id
+                        else:
+                            channel_data['discussion_chat_id'] = None
+                        
+                        # Check reaction settings more accurately
+                        if hasattr(full_channel.full_chat, 'available_reactions'):
+                            reactions = full_channel.full_chat.available_reactions
+                            if reactions is None:
+                                channel_data['has_enabled_reactions'] = False
+                            elif hasattr(reactions, 'reactions'):
+                                channel_data['has_enabled_reactions'] = len(reactions.reactions) > 0
+                        
+                        # Check if reactions are only for subscribers
+                        if hasattr(full_channel.full_chat, 'reactions_limit'):
+                            # If there's a limit, it might be subscriber-only
+                            # This is a heuristic - Telegram doesn't expose this directly
+                            channel_data['reactions_only_for_subscribers'] = False
+                        else:
+                            channel_data['reactions_only_for_subscribers'] = False
+                            
+                    except Exception as e:
+                        self.logger.warning(f"Could not fetch full channel info for {chat_id}: {e}")
+                        # Use defaults if full channel fetch fails
+                        channel_data['discussion_chat_id'] = None
+                        channel_data['reactions_only_for_subscribers'] = False
+                    
+                    # Add timestamps
+                    channel_data['created_at'] = datetime.now(timezone.utc)
+                    channel_data['updated_at'] = datetime.now(timezone.utc)
+                    
+                    channels_to_upsert.append(channel_data)
+            
+            # Batch insert new channels
+            for channel_data in channels_to_upsert:
+                try:
+                    await db.add_channel(channel_data)
+                    self.logger.debug(f"Added new channel: {channel_data['channel_name']} ({channel_data['chat_id']})")
+                except ValueError as e:
+                    # Channel already exists (race condition) - update instead
+                    self.logger.debug(f"Channel {channel_data['chat_id']} already exists, updating: {e}")
+                    update_data = {k: v for k, v in channel_data.items() if k not in ['chat_id', 'created_at']}
+                    await db.update_channel(channel_data['chat_id'], update_data)
+            
+            # Update account's subscribed_to field
+            await db.update_account(self.phone_number, {'subscribed_to': chat_ids})
+            self.account.subscribed_to = chat_ids
+            
+            self.logger.info(
+                f"Successfully updated subscriptions for {self.phone_number}: "
+                f"{len(chat_ids)} channels, {len(channels_to_upsert)} new channels added"
+            )
+            
+            return chat_ids
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching subscribed channels: {e}")
+            raise
 
-    async def _react(self, message, target_chat):
+
+# Basic actions
+
+    async def _react(self, message, target_chat, channel: Channel = None):
         """
         React to a message with an emoji from the active palette.
         
         Args:
             message: Telethon message object
             target_chat: Target chat entity
+            channel: Optional Channel object with metadata
         
         Raises:
             ValueError: If no valid emojis are available after filtering
         """
         await self.ensure_connected()
+        
+        # Check subscription status and warn if not subscribed
+        chat_id = normalize_chat_id(target_chat.id if hasattr(target_chat, 'id') else target_chat)
+        is_subscribed = await self._check_subscription(chat_id)
+        
+        if not is_subscribed:
+            self.logger.warning(
+                f"⚠️  DANGER: Account {self.phone_number} is NOT subscribed to channel {chat_id}. "
+                f"Reacting to posts from unsubscribed channels significantly increases ban risk. "
+                f"Telegram may flag this as spam behavior."
+            )
         
         await self.client(GetMessagesViewsRequest(
             peer=target_chat,
@@ -750,8 +1148,8 @@ class Client(object):
         # Even at humanisation_level 0, we need basic delays
         humanisation_level = config.get('delays', {}).get('humanisation_level', 1)
         if humanisation_level >= 1:
-            # Full humanization: fetch message content and estimate reading time
-            msg_content = await self.get_message_content(chat_id=target_chat.id if hasattr(target_chat, 'id') else target_chat, message_id=message.id)
+            # Full humanization: use message content from message object (already fetched)
+            msg_content = message.message if hasattr(message, 'message') else None
             if msg_content:
                 reading_time = estimate_reading_time(msg_content)
                 self.logger.debug(f"Estimated reading time: {reading_time} seconds")
@@ -773,19 +1171,15 @@ class Client(object):
             self.logger.error(error_msg)
             raise ValueError(error_msg)
 
-        # Get allowed reactions from message (if explicitly restricted)
+        # Get allowed reactions from message (already fetched - use it directly!)
         allowed_reactions = None
         try:
-            # Fetch full message to get reactions attribute
-            # Rate limit message fetching
-            await rate_limiter.wait_if_needed('get_messages')
-            full_message = await self.client.get_messages(target_chat, ids=message.id)
-            
-            if hasattr(full_message, 'reactions') and full_message.reactions:
+            # Use the message object we already have instead of fetching again
+            if hasattr(message, 'reactions') and message.reactions:
                 # Check available_reactions if it exists (Telegram's list of allowed emojis)
-                if hasattr(full_message.reactions, 'available_reactions'):
+                if hasattr(message.reactions, 'available_reactions'):
                     available_reactions_list = []
-                    for reaction in full_message.reactions.available_reactions:
+                    for reaction in message.reactions.available_reactions:
                         if hasattr(reaction, 'emoticon'):
                             available_reactions_list.append(reaction.emoticon)
                     
@@ -899,8 +1293,49 @@ class Client(object):
                     self.logger.error(error_msg)
                     raise RuntimeError(error_msg)
 
-    async def _comment(self, message, target_chat, content):
+    async def _comment(self, message, target_chat, content, channel: Channel = None):
         await self.ensure_connected()
+        
+        # Check subscription requirements for commenting
+        chat_id = normalize_chat_id(target_chat.id if hasattr(target_chat, 'id') else target_chat)
+        is_subscribed_to_channel = await self._check_subscription(chat_id)
+        
+        # If not subscribed to channel
+        if not is_subscribed_to_channel:
+            # Check if channel is private
+            if channel and channel.is_private:
+                error_msg = (
+                    f"Cannot comment on private channel {chat_id}: "
+                    f"account {self.phone_number} is not subscribed to this channel. "
+                    f"Private channels require subscription to comment."
+                )
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
+            
+            # Channel is public - check discussion group subscription
+            if channel and channel.has_discussion_group:
+                discussion_chat_id = channel.discussion_chat_id
+                is_subscribed_to_discussion = await self._check_subscription(discussion_chat_id)
+                
+                if not is_subscribed_to_discussion:
+                    error_msg = (
+                        f"Cannot comment on channel {chat_id}: "
+                        f"account {self.phone_number} is not subscribed to the discussion group (chat_id: {discussion_chat_id}). "
+                        f"You must subscribe to the discussion group to comment on posts from unsubscribed channels."
+                    )
+                    self.logger.error(error_msg)
+                    raise ValueError(error_msg)
+                
+                self.logger.info(
+                    f"Account {self.phone_number} is not subscribed to channel {chat_id}, "
+                    f"but is subscribed to discussion group {discussion_chat_id}. Proceeding with comment."
+                )
+            else:
+                # No discussion group info - warn but proceed
+                self.logger.warning(
+                    f"Account {self.phone_number} is not subscribed to channel {chat_id}. "
+                    f"No discussion group info available. Attempting to comment anyway."
+                )
 
         await self.client(GetMessagesViewsRequest(
             peer=target_chat,
@@ -978,127 +1413,7 @@ class Client(object):
         async for msg in self.client.iter_messages(discussion_chat, reply_to=discussion.messages[0].id, from_user='me'):
             await msg.delete()
 
-    async def get_message_ids(self, link: str):
-        """
-        Extract (chat_id, message_id) from a Telegram link of types:
-        - https://t.me/c/<raw>/<msg>
-        - https://t.me/<username>/<msg>
-        - https://t.me/s/<username>/<msg>
-        - with or without @, with query params
-        """
-        try:
-            link = link.strip()
-            if '://' not in link:
-                link = 'https://' + link
-            
-            # First, try to find a stored Post in DB with the same link. If it exists and
-            # is already validated, use its chat_id/message_id and skip network resolution.
-            try:
-                from main_logic.database import get_db
-                db = get_db()
-
-                try:
-                    post_obj = await db.get_post_by_link(link)
-                    if post_obj and getattr(post_obj, 'is_validated', False):
-                        # Ensure both ids exist and are integers
-                        if post_obj.chat_id is not None and post_obj.message_id is not None:
-                            try:
-                                chat_id_db = int(post_obj.chat_id)
-                                message_id_db = int(post_obj.message_id)
-                                self.logger.debug(f"Found validated post in DB for link {link}: chat_id={chat_id_db}, message_id={message_id_db}")
-                                return chat_id_db, message_id_db
-                            except Exception:
-                                self.logger.debug(f"DB post for link {link} had non-integer ids, falling back to resolution")
-                except Exception as _db_err:
-                    # Do not fail on DB errors; fall back to Telethon resolution
-                    self.logger.debug(f"DB lookup by message_link failed for '{link}': {_db_err}")
-            except Exception:
-                pass
-            parsed = urlparse(unquote(link))
-            path = parsed.path.lstrip('/')
-            segments = [seg for seg in path.split('/') if seg != '']
-            if not segments or len(segments) < 2:
-                raise ValueError(f"Link format not recognized: {link}")
-
-            # випадок /c/<raw>/<msg>
-            if segments[0] == 'c':
-                if len(segments) < 3:
-                    raise ValueError(f"Invalid /c/ link: {link}")
-                raw = segments[1]
-                msg = segments[2]
-                if not raw.isdigit() or not msg.isdigit():
-                    raise ValueError(f"Non-numeric in /c/ link: {link}")
-                chat_id = int(f"-100{raw}")
-                message_id = int(msg)
-                return chat_id, message_id
-
-            # випадок /s/<username>/<msg>
-            if segments[0] == 's':
-                if len(segments) < 3:
-                    raise ValueError(f"Invalid /s/ link: {link}")
-                username = segments[1]
-                msg = segments[2]
-            else:
-                # /<username>/<msg>
-                username = segments[0]
-                msg = segments[1]
-
-            username = username.lstrip('@')
-            if not msg.isdigit():
-                raise ValueError(f"Message part is not numeric: {link}")
-            message_id = int(msg)
-
-            # отримуємо entity with caching and rate limiting
-            await self.ensure_connected()
-            # Спроба передати повний URL (Telethon підтримує це)
-            try:
-                entity = await self.get_entity_cached(username)
-            except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.SessionRevokedError, errors.UserDeactivatedError, errors.UserDeactivatedBanError) as auth_error:
-                # Session is invalid/expired/revoked or account is banned - re-raise for proper handling upstream
-                # Include SessionRevokedError explicitly so it isn't swallowed and can be mapped to account status
-                self.logger.error(f"Session invalid/expired or account deactivated while resolving '{username}': {auth_error}")
-                raise
-            except Exception as e1:
-                # Try several fallbacks: full URL with scheme, http, www variant, and @username.
-                # Some Telethon versions accept a full URL but others don't, so try multiple formats.
-                last_exc = e1
-                tried = []
-                candidates = [
-                    f"https://{parsed.netloc}/{username}",
-                    f"http://{parsed.netloc}/{username}",
-                    f"{parsed.netloc}/{username}",
-                    f"@{username}",
-                ]
-                entity = None
-                for candidate in candidates:
-                    tried.append(candidate)
-                    try:
-                        entity = await self.get_entity_cached(candidate)
-                        break
-                    except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.SessionRevokedError, errors.UserDeactivatedError, errors.UserDeactivatedBanError) as auth_error:
-                        # Re-raise auth related errors immediately so they can be handled upstream
-                        self.logger.error(f"Session invalid/expired or account deactivated while resolving '{username}' using '{candidate}': {auth_error}")
-                        raise
-                    except Exception as e2:
-                        last_exc = e2
-                        self.logger.debug(f"get_entity failed for candidate '{candidate}': {e2}")
-
-                if entity is None:
-                    self.logger.error(f"Failed to resolve username '{username}' from link {link}. Tried: {tried}. Errors: {e1}, last: {last_exc}")
-                    raise ValueError(f"Cannot resolve username '{username}' from link {link}")
-
-            chat_id = entity.id
-            return chat_id, message_id
-
-        except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.UserDeactivatedError, errors.UserDeactivatedBanError):
-            # Re-raise auth errors without wrapping them
-            raise
-        except Exception as e:
-            self.logger.warning(f"Error extracting IDs from '{link}': {e}")
-            raise
-
-
-    # Actions
+# Actions
 
     async def undo_reaction(self, message_link:str=None):
         retries = config.get('delays', {}).get('action_retries', 3)
@@ -1106,9 +1421,14 @@ class Client(object):
         attempt = 0
         while attempt < retries:
             try:
-                chat_id, message_id = await self.get_message_ids(message_link)
-                # Use cached get_entity with rate limiting
-                entity = await self.get_entity_cached(chat_id)
+                chat_id, message_id, entity = await self.get_message_ids(message_link)
+                # Use entity from get_message_ids if available, otherwise fetch it
+                if entity is None:
+                    entity = await self.get_entity_cached(chat_id)
+                
+                # Get or fetch channel data (for consistency, though not strictly needed for undo)
+                channel = await self._get_or_fetch_channel_data(chat_id, entity=entity)
+                
                 # Rate limit message fetching
                 await rate_limiter.wait_if_needed('get_messages')
                 message = await self.client.get_messages(entity, ids=message_id)
@@ -1129,9 +1449,14 @@ class Client(object):
         attempt = 0
         while attempt < retries:
             try:
-                chat_id, message_id = await self.get_message_ids(message_link)
-                # Use cached get_entity with rate limiting
-                entity = await self.get_entity_cached(chat_id)
+                chat_id, message_id, entity = await self.get_message_ids(message_link)
+                # Use entity from get_message_ids if available, otherwise fetch it
+                if entity is None:
+                    entity = await self.get_entity_cached(chat_id)
+                
+                # Get or fetch channel data (for consistency)
+                channel = await self._get_or_fetch_channel_data(chat_id, entity=entity)
+                
                 # Rate limit message fetching
                 await rate_limiter.wait_if_needed('get_messages')
                 message = await self.client.get_messages(entity, ids=message_id)
@@ -1158,13 +1483,18 @@ class Client(object):
         attempt = 0
         while attempt < retries:
             try:
-                chat_id, message_id = await self.get_message_ids(message_link)
-                # Use cached get_entity with rate limiting
-                entity = await self.get_entity_cached(chat_id)
+                chat_id, message_id, entity = await self.get_message_ids(message_link)
+                # Use entity from get_message_ids if available, otherwise fetch it
+                if entity is None:
+                    entity = await self.get_entity_cached(chat_id)
+                
+                # Get or fetch channel data (minimizes API calls by reusing entity)
+                channel = await self._get_or_fetch_channel_data(chat_id, entity=entity)
+                
                 # Rate limit message fetching
                 await rate_limiter.wait_if_needed('get_messages')
                 message = await self.client.get_messages(entity, ids=message_id)                
-                await self._react(message, entity)                
+                await self._react(message, entity, channel=channel)                
                 self.logger.info("Reaction added successfully")
                 return
             except Exception as e:
@@ -1182,13 +1512,18 @@ class Client(object):
         attempt = 0
         while attempt < retries:
             try:
-                chat_id, message_id = await self.get_message_ids(message_link)
-                # Use cached get_entity with rate limiting
-                entity = await self.get_entity_cached(chat_id)
+                chat_id, message_id, entity = await self.get_message_ids(message_link)
+                # Use entity from get_message_ids if available, otherwise fetch it
+                if entity is None:
+                    entity = await self.get_entity_cached(chat_id)
+                
+                # Get or fetch channel data (minimizes API calls by reusing entity)
+                channel = await self._get_or_fetch_channel_data(chat_id, entity=entity)
+                
                 # Rate limit message fetching
                 await rate_limiter.wait_if_needed('get_messages')
                 message = await self.client.get_messages(entity, ids=message_id)
-                await self._comment(message=message, target_chat=entity, content=content)
+                await self._comment(message=message, target_chat=entity, content=content, channel=channel)
                 self.logger.info("Comment added successfully!")
                 return
             except Exception as e:

@@ -4,19 +4,26 @@
 
 - review pauses and retries for flood avoiding
 - add creation of neccessary files if they dont exist
-- add proxy crud endpoints and proxy status
 - add task status `failed`
+- review counter collection in db
+- add report export as .csv/.xlsx
 
-- add report export as .csv/.xcls
+- add proxy crud endpoints and proxy status
+- add user register endpoints
+- add full channel logic endpoints
 
-### TO TEST:
+#### TO TEST:
 - telegram login process
+- actions in channels - subscribed or not * public or private (8 cases, but actually 4 (see miro))
+- 
 
 ## Changelog
 
 ### v.1.1.0
 - massive file refactor for better readability (without actual code changes)
-- 
+- added channel tracking and viewing
+- added helper functions for channel, post and account relation viewing
+- added precondition check for client's action (WIP)
 
 ### v.1.0.6
 - fixed multiple palette import, only on task startup

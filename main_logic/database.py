@@ -3,7 +3,7 @@ Async MongoDB storage for LikeBot.
 
 Provides MongoStorage (get_db()) using motor.AsyncIOMotorClient:
 - Lazy client/collection init, idempotent index creation (asyncio.Lock)
-- CRUD for accounts, posts, tasks, users, runs, and events
+- CRUD for accounts, posts, tasks, users, runs, events, channels, proxies, and palettes
 - Accepts domain objects or dicts, strips MongoDB _id on return
 - ensure_async decorator wraps sync helpers for async use
 - Centralized database logic for all collections including reporter events/runs
@@ -15,6 +15,10 @@ Collections:
 - users: API user authentication
 - runs: Task execution runs (reporter)
 - events: Task execution events (reporter)
+- channels: Telegram channel metadata
+- proxies: Proxy configuration
+- palettes: Reaction emoji palettes
+- counters: Atomic ID generation
 
 Environment:
 - db_url (required), db_name (default "LikeBot"), db_timeout_ms (default 5000)
@@ -31,6 +35,8 @@ from utils.logger import setup_logger, load_config
 from main_logic.agent import Account
 from main_logic.post import Post
 from main_logic.task import Task
+from main_logic.channel import Channel
+from main_logic.channel import normalize_chat_id
 
 config = load_config()
 logger = setup_logger("DB", "main.log")
@@ -63,6 +69,7 @@ class MongoStorage():
     _proxies = None
     _palettes = None
     _counters = None
+    _channels = None
     _client: Optional[AsyncIOMotorClient] = None
     _indexes_initialized = False
     _index_lock: Optional[asyncio.Lock] = None
@@ -91,6 +98,7 @@ class MongoStorage():
         cls._proxies = cls._db["proxies"]
         cls._palettes = cls._db["reaction_palettes"]
         cls._counters = cls._db["counters"]
+        cls._channels = cls._db["channels"]
         
         # Reporter collections with write concerns
         from pymongo.write_concern import WriteConcern
@@ -211,6 +219,7 @@ class MongoStorage():
                 await create_unique_index_safe(cls._tasks, "task_id", "ux_tasks_task_id")
                 await create_unique_index_safe(cls._users, "username", "ux_users_username")
                 await create_unique_index_safe(cls._proxies, "proxy_name", "ux_proxies_proxy_name")
+                await create_unique_index_safe(cls._channels, "chat_id", "ux_channels_chat_id")
 
                 # Ensure counters collection has an index on _id for fast lookups
                 try:
@@ -221,6 +230,8 @@ class MongoStorage():
                 
                 # Non-unique indexes (can be created normally)
                 await cls._proxies.create_index([("active", ASCENDING), ("connected_accounts", ASCENDING)], name="ix_proxies_active_usage")
+                await cls._channels.create_index([("tags", ASCENDING)], name="ix_channels_tags")
+                await cls._channels.create_index([("channel_name", ASCENDING)], name="ix_channels_name")
                 
                 # Reporter collection indexes
                 await create_unique_index_safe(cls._runs, [("run_id", ASCENDING)], "ux_runs_run_id")
@@ -358,6 +369,28 @@ class MongoStorage():
 
     @classmethod
     @ensure_async
+    async def get_all_posts(cls):
+        """
+        Get all posts from the database.
+        
+        Returns:
+            List of Post objects
+        """
+        await cls._ensure_ready()
+        logger.info("Getting all posts from MongoDB")
+        
+        cursor = cls._posts.find()
+        posts = []
+        async for post in cursor:
+            post.pop('_id', None)
+            post.pop('is_validated', None)
+            posts.append(Post(**post))
+        
+        logger.debug(f"Found {len(posts)} posts")
+        return posts
+
+    @classmethod
+    @ensure_async
     async def add_post(cls, post):
         await cls._ensure_ready()
         if hasattr(post, 'to_dict'):
@@ -473,6 +506,38 @@ class MongoStorage():
 
         logger.debug(f"No post found in MongoDB for link: {message_link}")
         return None
+
+    @classmethod
+    @ensure_async
+    async def get_posts_by_chat_id(cls, chat_id: int):
+        """
+        Get all Post objects with the given chat_id.
+        Accepts both normalized (2723750105) and -100 prefixed (-1002723750105) forms.
+        Searches for both forms in database to handle existing records.
+        
+        Args:
+            chat_id: Telegram chat ID to filter by (with or without -100 prefix)
+            
+        Returns:
+            List of Post objects matching the chat_id
+        """
+        await cls._ensure_ready()
+        # Normalize chat_id to handle -100 prefix
+        normalized_id = normalize_chat_id(chat_id)
+        # Also compute the -100 prefixed form
+        prefixed_id = int(f"-100{normalized_id}")
+        
+        logger.info(f"Getting posts for chat_id: {chat_id} (searching for {normalized_id} or {prefixed_id})")
+        
+        # Search for either normalized OR -100 prefixed form
+        cursor = cls._posts.find({"chat_id": {"$in": [normalized_id, prefixed_id]}})
+        posts = []
+        async for post in cursor:
+            post.pop('_id', None)
+            posts.append(Post(**post))
+        
+        logger.debug(f"Found {len(posts)} posts for chat_id {chat_id}")
+        return posts
 
     @classmethod
     @ensure_async
@@ -1672,6 +1737,307 @@ class MongoStorage():
         
         logger.debug(f"Ensured {created_count} default palettes")
         return created_count
+
+    # --- Channel methods ---
+    @classmethod
+    @ensure_async
+    async def add_channel(cls, channel_data: dict):
+        """
+        Add a new channel to the database.
+        
+        Args:
+            channel_data: Dictionary or Channel object with channel data
+            
+        Returns:
+            True if successful
+            
+        Raises:
+            ValueError: If channel already exists
+        """
+        await cls._ensure_ready()
+        
+        if hasattr(channel_data, 'to_dict'):
+            channel_data = channel_data.to_dict()
+        
+        chat_id = channel_data.get('chat_id')
+        logger.info(f"Adding channel to MongoDB: chat_id={chat_id}, name={channel_data.get('channel_name')}")
+        
+        # Check if channel already exists
+        existing_channel = await cls.get_channel(chat_id)
+        if existing_channel:
+            logger.warning(f"Channel with chat_id {chat_id} already exists")
+            raise ValueError(f"Channel with chat_id {chat_id} already exists")
+        
+        # Ensure timestamps
+        from datetime import datetime, timezone
+        if 'created_at' not in channel_data:
+            channel_data['created_at'] = datetime.now(timezone.utc)
+        if 'updated_at' not in channel_data:
+            channel_data['updated_at'] = datetime.now(timezone.utc)
+        
+        # Ensure tags is a list
+        if 'tags' not in channel_data:
+            channel_data['tags'] = []
+        
+        channel_data.pop('_id', None)
+        await cls._channels.insert_one(channel_data)
+        logger.debug(f"Channel with chat_id {chat_id} added to MongoDB")
+        return True
+
+    @classmethod
+    @ensure_async
+    async def get_channel(cls, chat_id: int):
+        """
+        Get a channel by chat_id.
+        Accepts both normalized (2723750105) and -100 prefixed (-1002723750105) forms.
+        Searches for both forms in database to handle existing records.
+        
+        Args:
+            chat_id: Telegram chat ID (with or without -100 prefix)
+            
+        Returns:
+            Channel object if found, None otherwise
+        """
+        await cls._ensure_ready()
+        # Normalize chat_id to handle -100 prefix
+        normalized_id = normalize_chat_id(chat_id)
+        # Also compute the -100 prefixed form
+        prefixed_id = int(f"-100{normalized_id}")
+        
+        logger.info(f"Getting channel from MongoDB with chat_id: {chat_id} (searching for {normalized_id} or {prefixed_id})")
+        
+        # Search for either normalized OR -100 prefixed form
+        channel = await cls._channels.find_one({"chat_id": {"$in": [normalized_id, prefixed_id]}})
+        if channel and '_id' in channel:
+            channel.pop('_id')
+        
+        if channel:
+            logger.debug(f"Found channel with chat_id {channel.get('chat_id')} in MongoDB")
+        
+        return Channel(**channel) if channel else None
+
+    @classmethod
+    @ensure_async
+    async def get_all_channels(cls):
+        """
+        Get all channels from the database.
+        
+        Returns:
+            List of Channel objects
+        """
+        await cls._ensure_ready()
+        logger.info("Loading all channels from MongoDB")
+        
+        cursor = cls._channels.find()
+        channels = []
+        async for channel in cursor:
+            channel.pop('_id', None)
+            channels.append(Channel(**channel))
+        
+        logger.debug(f"Loaded {len(channels)} channels from MongoDB")
+        return channels
+
+    @classmethod
+    @ensure_async
+    async def get_channels_by_tag(cls, tag: str):
+        """
+        Get all channels with a specific tag.
+        
+        Args:
+            tag: Tag to filter by
+            
+        Returns:
+            List of Channel objects
+        """
+        await cls._ensure_ready()
+        logger.info(f"Getting channels with tag: {tag}")
+        
+        cursor = cls._channels.find({"tags": tag})
+        channels = []
+        async for channel in cursor:
+            channel.pop('_id', None)
+            channels.append(Channel(**channel))
+        
+        logger.debug(f"Found {len(channels)} channels with tag '{tag}'")
+        return channels
+
+    @classmethod
+    @ensure_async
+    async def search_channels_by_name(cls, name_query: str):
+        """
+        Search for channels by name using case-insensitive regex matching.
+        
+        Args:
+            name_query: Search string to match against channel names
+            
+        Returns:
+            List of Channel objects matching the search query
+        """
+        await cls._ensure_ready()
+        logger.info(f"Searching channels by name: {name_query}")
+        
+        # Use regex for case-insensitive partial matching
+        import re
+        pattern = re.compile(re.escape(name_query), re.IGNORECASE)
+        
+        cursor = cls._channels.find({"channel_name": {"$regex": pattern}})
+        channels = []
+        async for channel in cursor:
+            channel.pop('_id', None)
+            channels.append(Channel(**channel))
+        
+        logger.debug(f"Found {len(channels)} channels matching '{name_query}'")
+        return channels
+
+    @classmethod
+    @ensure_async
+    async def get_subscribed_channels(cls, phone_number: str):
+        """
+        Get all Channel objects that an account is subscribed to.
+        
+        Args:
+            phone_number: Phone number of the account
+            
+        Returns:
+            List of Channel objects the account is subscribed to
+        """
+        await cls._ensure_ready()
+        logger.info(f"Getting subscribed channels for account: {phone_number}")
+        
+        # Get account and its subscribed_to list
+        account = await cls.get_account(phone_number)
+        if not account:
+            logger.warning(f"Account {phone_number} not found")
+            return []
+        
+        subscribed_to = account.subscribed_to if hasattr(account, 'subscribed_to') else []
+        if not subscribed_to:
+            logger.debug(f"Account {phone_number} has no subscriptions")
+            return []
+        
+        # Get all channels where chat_id is in subscribed_to list
+        cursor = cls._channels.find({"chat_id": {"$in": subscribed_to}})
+        channels = []
+        async for channel in cursor:
+            channel.pop('_id', None)
+            channels.append(Channel(**channel))
+        
+        logger.debug(f"Found {len(channels)} subscribed channels for account {phone_number}")
+        return channels
+
+    @classmethod
+    @ensure_async
+    async def update_channel(cls, chat_id: int, update_data: dict):
+        """
+        Update a channel's data.
+        Accepts both normalized (2723750105) and -100 prefixed (-1002723750105) forms.
+        Searches for both forms in database to handle existing records.
+        
+        Args:
+            chat_id: Telegram chat ID (with or without -100 prefix)
+            update_data: Dictionary of fields to update
+            
+        Returns:
+            True if updated successfully, False otherwise
+        """
+        await cls._ensure_ready()
+        # Normalize chat_id to handle -100 prefix
+        normalized_id = normalize_chat_id(chat_id)
+        # Also compute the -100 prefixed form
+        prefixed_id = int(f"-100{normalized_id}")
+        
+        logger.info(f"Updating channel {chat_id} (searching for {normalized_id} or {prefixed_id}) with data: {update_data.keys()}")
+        
+        if not isinstance(update_data, dict):
+            update_data = update_data.to_dict()
+        
+        update_data.pop('_id', None)
+        update_data.pop('chat_id', None)  # Don't allow changing chat_id
+        
+        # Update the modification timestamp
+        from datetime import datetime, timezone
+        update_data['updated_at'] = datetime.now(timezone.utc)
+        
+        # Update whichever form exists in the database
+        result = await cls._channels.update_one(
+            {"chat_id": {"$in": [normalized_id, prefixed_id]}},
+            {"$set": update_data}
+        )
+        
+        logger.debug(f"Channel update result: modified={result.modified_count}")
+        return result.modified_count > 0
+
+    @classmethod
+    @ensure_async
+    async def delete_channel(cls, chat_id: int):
+        """
+        Delete a channel from the database.
+        Accepts both normalized (2723750105) and -100 prefixed (-1002723750105) forms.
+        Searches for both forms in database to handle existing records.
+        
+        Args:
+            chat_id: Telegram chat ID (with or without -100 prefix)
+            
+        Returns:
+            True if deleted successfully, False otherwise
+        """
+        await cls._ensure_ready()
+        # Normalize chat_id to handle -100 prefix
+        normalized_id = normalize_chat_id(chat_id)
+        # Also compute the -100 prefixed form
+        prefixed_id = int(f"-100{normalized_id}")
+        
+        logger.info(f"Deleting channel from MongoDB with chat_id: {chat_id} (searching for {normalized_id} or {prefixed_id})")
+        
+        # Delete whichever form exists in the database
+        result = await cls._channels.delete_one({"chat_id": {"$in": [normalized_id, prefixed_id]}})
+        logger.debug(f"Channel delete result: {result.deleted_count}")
+        return result.deleted_count > 0
+
+    @classmethod
+    @ensure_async
+    async def get_channels_with_post_counts(cls):
+        """
+        Get all channels with their post counts from the posts collection.
+        
+        Returns:
+            List of dicts with channel data and post_count field:
+            [
+                {
+                    'chat_id': 123,
+                    'channel_name': 'Example Channel',
+                    'is_private': False,
+                    'tags': ['news'],
+                    ...,
+                    'post_count': 42
+                },
+                ...
+            ]
+        """
+        await cls._ensure_ready()
+        logger.info("Getting channels with post counts")
+        
+        # Aggregate post counts by chat_id
+        pipeline = [
+            {"$group": {"_id": "$chat_id", "post_count": {"$sum": 1}}}
+        ]
+        cursor = cls._posts.aggregate(pipeline)
+        post_counts = {}
+        async for result in cursor:
+            if result.get('_id') is not None:
+                post_counts[result['_id']] = result['post_count']
+        
+        # Get all channels
+        channels_cursor = cls._channels.find()
+        channels_with_counts = []
+        async for channel in channels_cursor:
+            channel.pop('_id', None)
+            chat_id = channel.get('chat_id')
+            channel['post_count'] = post_counts.get(chat_id, 0)
+            channels_with_counts.append(channel)
+        
+        logger.debug(f"Found {len(channels_with_counts)} channels with post counts")
+        return channels_with_counts
 
 
 def get_db() -> MongoStorage:
