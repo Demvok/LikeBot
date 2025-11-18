@@ -5,7 +5,6 @@ Provides MongoStorage (get_db()) using motor.AsyncIOMotorClient:
 - Lazy client/collection init, idempotent index creation (asyncio.Lock)
 - CRUD for accounts, posts, tasks, users, runs, events, channels, proxies, and palettes
 - Accepts domain objects or dicts, strips MongoDB _id on return
-- ensure_async decorator wraps sync helpers for async use
 - Centralized database logic for all collections including reporter events/runs
 
 Collections:
@@ -23,11 +22,10 @@ Collections:
 Environment:
 - db_url (required), db_name (default "LikeBot"), db_timeout_ms (default 5000)
 """
-import os, inspect, asyncio
+import os, asyncio
 from typing import Optional
 from pandas import Timestamp
 from datetime import datetime, timezone
-from functools import wraps
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import PyMongoError, ServerSelectionTimeoutError
@@ -46,16 +44,6 @@ db_url = os.getenv('db_url')
 db_name = os.getenv('db_name', 'LikeBot')
 mongo_timeout_ms = int(os.getenv('db_timeout_ms', '5000'))
 
-def ensure_async(func):
-    if inspect.iscoroutinefunction(func):
-        return func
-
-    @wraps(func)
-    async def wrapper(*args, **kwargs):
-        # Run potentially blocking sync helpers in a thread to avoid blocking the event loop
-        return await asyncio.to_thread(func, *args, **kwargs)
-
-    return wrapper
 
 class MongoStorage():
     _accounts = None
@@ -273,8 +261,8 @@ class MongoStorage():
 
             cls._indexes_initialized = True
 
+# --- Account methods ---
     @classmethod
-    @ensure_async
     async def load_all_accounts(cls):
         await cls._ensure_ready()
         logger.info("Loading all accounts from MongoDB.")
@@ -287,7 +275,6 @@ class MongoStorage():
         return accounts
 
     @classmethod
-    @ensure_async
     async def add_account(cls, account_data):
         await cls._ensure_ready()
 
@@ -311,7 +298,6 @@ class MongoStorage():
         return True
 
     @classmethod
-    @ensure_async
     async def get_account(cls, phone_number):
         await cls._ensure_ready()
         logger.info(f"Getting account from MongoDB with phone number: {phone_number}")
@@ -329,7 +315,6 @@ class MongoStorage():
         return Account(acc) if acc else None
 
     @classmethod
-    @ensure_async
     async def update_account(cls, phone_number, update_data):
         await cls._ensure_ready()
         logger.info(f"Upserting account {phone_number} in MongoDB with data: {update_data.keys()}")
@@ -342,7 +327,6 @@ class MongoStorage():
         return result.modified_count > 0 or result.upserted_id is not None
 
     @classmethod
-    @ensure_async
     async def delete_account(cls, phone_number):
         await cls._ensure_ready()
         logger.info(f"Deleting account from MongoDB with phone number: {phone_number}")
@@ -352,9 +336,8 @@ class MongoStorage():
         logger.debug(f"Account {phone_number} delete result: {result.deleted_count}")
         return result.deleted_count > 0
 
-    # --- Post methods ---
+# --- Post methods ---
     @classmethod
-    @ensure_async
     async def load_all_posts(cls):
         await cls._ensure_ready()
         logger.info("Loading all posts from MongoDB.")
@@ -368,7 +351,6 @@ class MongoStorage():
         return posts
 
     @classmethod
-    @ensure_async
     async def get_all_posts(cls):
         """
         Get all posts from the database.
@@ -390,7 +372,6 @@ class MongoStorage():
         return posts
 
     @classmethod
-    @ensure_async
     async def add_post(cls, post):
         await cls._ensure_ready()
         if hasattr(post, 'to_dict'):
@@ -460,7 +441,6 @@ class MongoStorage():
         raise RuntimeError("Failed to insert post after several attempts due to ID conflicts")
 
     @classmethod
-    @ensure_async
     async def get_post(cls, post_id):
         await cls._ensure_ready()
         logger.info(f"Getting post from MongoDB with post_id: {post_id}")
@@ -472,7 +452,6 @@ class MongoStorage():
         return Post(**post) if post else None
 
     @classmethod
-    @ensure_async
     async def get_post_by_link(cls, message_link: str):
         """
         Find a post document by its exact message_link.
@@ -508,7 +487,6 @@ class MongoStorage():
         return None
 
     @classmethod
-    @ensure_async
     async def get_posts_by_chat_id(cls, chat_id: int):
         """
         Get all Post objects with the given chat_id.
@@ -540,7 +518,6 @@ class MongoStorage():
         return posts
 
     @classmethod
-    @ensure_async
     async def update_post(cls, post_id, update_data):
         await cls._ensure_ready()
         logger.info(f"Upserting post {post_id} in MongoDB with data: {update_data.keys()}")
@@ -554,7 +531,6 @@ class MongoStorage():
         return result.modified_count > 0 or result.upserted_id is not None
 
     @classmethod
-    @ensure_async
     async def delete_post(cls, post_id):
         await cls._ensure_ready()
         logger.info(f"Deleting post from MongoDB with post_id: {post_id}")
@@ -564,9 +540,8 @@ class MongoStorage():
         logger.debug(f"Post {post_id} delete result: {result.deleted_count}")
         return result.deleted_count > 0
 
-    # --- Task methods ---
+# --- Task methods ---
     @classmethod
-    @ensure_async
     async def load_all_tasks(cls):
         await cls._ensure_ready()
         logger.info("Loading all tasks from MongoDB.")
@@ -602,7 +577,6 @@ class MongoStorage():
         return tasks
 
     @classmethod
-    @ensure_async
     async def add_task(cls, task):
         await cls._ensure_ready()
         if hasattr(task, 'to_dict'):
@@ -672,7 +646,6 @@ class MongoStorage():
         raise RuntimeError("Failed to insert task after several attempts due to ID conflicts")
 
     @classmethod
-    @ensure_async
     async def get_task(cls, task_id):
         await cls._ensure_ready()
         logger.info(f"Getting task from MongoDB with task_id: {task_id}")
@@ -701,7 +674,6 @@ class MongoStorage():
         return Task(**task) if task else None
 
     @classmethod
-    @ensure_async
     async def update_task(cls, task_id, update_data):
         await cls._ensure_ready()
         logger.info(f"Upserting task {task_id} in MongoDB with data: {update_data.keys()}")
@@ -718,7 +690,6 @@ class MongoStorage():
         return result.modified_count > 0 or result.upserted_id is not None
 
     @classmethod
-    @ensure_async
     async def delete_task(cls, task_id):
         await cls._ensure_ready()
         logger.info(f"Deleting task from MongoDB with task_id: {task_id}")
@@ -736,9 +707,8 @@ class MongoStorage():
         logger.debug(f"Task {task_id} delete result: {result.deleted_count}")
         return result.deleted_count > 0
 
-    # --- User methods ---
+# --- User methods ---
     @classmethod
-    @ensure_async
     async def create_user(cls, user_data: dict):
         """
         Create a new user in the database.
@@ -764,7 +734,6 @@ class MongoStorage():
         return True
 
     @classmethod
-    @ensure_async
     async def get_user(cls, username: str):
         """
         Get a user by username.
@@ -785,7 +754,6 @@ class MongoStorage():
         return user
 
     @classmethod
-    @ensure_async
     async def verify_user_credentials(cls, username: str, password: str) -> tuple[bool, dict | None]:
         """
         Verify user credentials.
@@ -821,7 +789,26 @@ class MongoStorage():
         return True, user
 
     @classmethod
-    @ensure_async
+    async def get_all_users(cls):
+        """
+        Get all users from the database.
+        
+        Returns:
+            List of user dictionaries (without password_hash for security)
+        """
+        await cls._ensure_ready()
+        logger.info("Getting all users from MongoDB")
+        
+        cursor = cls._users.find()
+        users = []
+        async for user in cursor:
+            user.pop('_id', None)
+            users.append(user)
+        
+        logger.debug(f"Found {len(users)} users")
+        return users
+
+    @classmethod
     async def update_user(cls, username: str, update_data: dict):
         """
         Update user data.
@@ -846,9 +833,26 @@ class MongoStorage():
         logger.debug(f"User {username} update result: modified={result.modified_count}")
         return result.modified_count > 0
 
-    # --- Reporter/Events/Runs methods ---
     @classmethod
-    @ensure_async
+    async def delete_user(cls, username: str):
+        """
+        Delete a user from the database.
+        
+        Args:
+            username: Username to delete
+            
+        Returns:
+            True if deleted successfully, False otherwise
+        """
+        await cls._ensure_ready()
+        logger.info(f"Deleting user from MongoDB: {username}")
+        
+        result = await cls._users.delete_one({"username": username.lower()})
+        logger.debug(f"User {username} delete result: {result.deleted_count}")
+        return result.deleted_count > 0
+
+# --- Reporter/Events/Runs methods ---
+    @classmethod
     async def create_run(cls, run_id: str, task_id: str, meta: dict = None):
         """
         Create a new run record.
@@ -878,7 +882,6 @@ class MongoStorage():
         return run_id
 
     @classmethod
-    @ensure_async
     async def end_run(cls, run_id: str, status: str = "success", meta_patch: dict = None):
         """
         Mark a run as completed.
@@ -904,7 +907,6 @@ class MongoStorage():
         return result.modified_count > 0
 
     @classmethod
-    @ensure_async
     async def create_event(cls, event_data: dict):
         """
         Create a single event record.
@@ -923,7 +925,6 @@ class MongoStorage():
         return True
 
     @classmethod
-    @ensure_async
     async def create_events_batch(cls, events: list):
         """
         Create multiple event records in batch (optimized for performance).
@@ -960,7 +961,6 @@ class MongoStorage():
             return inserted
 
     @classmethod
-    @ensure_async
     async def get_runs_by_task(cls, task_id: str):
         """
         Get all runs for a given task, ordered by started_at descending.
@@ -985,7 +985,6 @@ class MongoStorage():
         return runs
 
     @classmethod
-    @ensure_async
     async def get_run(cls, run_id: str):
         """
         Get a single run by run_id.
@@ -1006,7 +1005,6 @@ class MongoStorage():
         return run
 
     @classmethod
-    @ensure_async
     async def get_events_by_run(cls, run_id: str):
         """
         Get all events for a given run, ordered by timestamp.
@@ -1027,7 +1025,6 @@ class MongoStorage():
         return events
 
     @classmethod
-    @ensure_async
     async def delete_run(cls, run_id: str):
         """
         Delete a run and all its associated events.
@@ -1052,7 +1049,6 @@ class MongoStorage():
         return result
 
     @classmethod
-    @ensure_async
     async def clear_runs_by_task(cls, task_id: str):
         """
         Delete all runs for a task and all associated events.
@@ -1088,7 +1084,6 @@ class MongoStorage():
         return result
 
     @classmethod
-    @ensure_async
     async def get_all_task_summaries(cls):
         """
         Get summary of all tasks with run counts.
@@ -1110,7 +1105,6 @@ class MongoStorage():
         return results
 
     @classmethod
-    @ensure_async
     async def get_event_counts_for_runs(cls, run_ids: list):
         """
         Get event counts for multiple runs.
@@ -1134,7 +1128,6 @@ class MongoStorage():
         return {r["_id"]: r["event_count"] for r in results}
 
     @classmethod
-    @ensure_async
     async def get_all_runs(cls):
         """
         Get all runs from the database.
@@ -1156,7 +1149,6 @@ class MongoStorage():
         return runs
 
     @classmethod
-    @ensure_async
     async def get_all_events(cls):
         """
         Get all events from the database.
@@ -1174,7 +1166,6 @@ class MongoStorage():
         return events
 
     @classmethod
-    @ensure_async
     async def get_event_by_id(cls, event_id):
         """
         Get a single event by its MongoDB ObjectId.
@@ -1196,7 +1187,6 @@ class MongoStorage():
         return event
 
     @classmethod
-    @ensure_async
     async def delete_event_by_id(cls, event_id):
         """
         Delete a single event by its MongoDB ObjectId.
@@ -1216,7 +1206,6 @@ class MongoStorage():
         return result.deleted_count
 
     @classmethod
-    @ensure_async
     async def count_admin_users(cls):
         """
         Count verified admin users in the database.
@@ -1231,9 +1220,8 @@ class MongoStorage():
         logger.debug(f"Found {count} verified admin users")
         return count
 
-    # --- Proxy methods ---
+# --- Proxy methods ---
     @classmethod
-    @ensure_async
     async def add_proxy(cls, proxy_data: dict):
         """
         Add a new proxy configuration to the database.
@@ -1291,7 +1279,6 @@ class MongoStorage():
         return True
 
     @classmethod
-    @ensure_async
     async def get_proxy(cls, proxy_name: str):
         """
         Get a proxy by name and decrypt password if present.
@@ -1322,7 +1309,6 @@ class MongoStorage():
         return proxy
 
     @classmethod
-    @ensure_async
     async def get_all_proxies(cls):
         """
         Get all proxies from the database with decrypted passwords.
@@ -1352,7 +1338,6 @@ class MongoStorage():
         return proxies
 
     @classmethod
-    @ensure_async
     async def get_active_proxies(cls):
         """
         Get all active proxies from the database with decrypted passwords.
@@ -1382,7 +1367,6 @@ class MongoStorage():
         return proxies
 
     @classmethod
-    @ensure_async
     async def get_least_used_proxy(cls):
         """
         Get the active proxy with the least number of connected accounts (with decrypted password).
@@ -1418,7 +1402,6 @@ class MongoStorage():
         return None
 
     @classmethod
-    @ensure_async
     async def update_proxy(cls, proxy_name: str, update_data: dict):
         """
         Update proxy configuration. Encrypts password if provided.
@@ -1451,7 +1434,6 @@ class MongoStorage():
         return result.modified_count > 0
 
     @classmethod
-    @ensure_async
     async def increment_proxy_usage(cls, proxy_name: str):
         """
         Increment the connected_accounts counter for a proxy.
@@ -1472,7 +1454,6 @@ class MongoStorage():
         return result.modified_count > 0
 
     @classmethod
-    @ensure_async
     async def decrement_proxy_usage(cls, proxy_name: str):
         """
         Decrement the connected_accounts counter for a proxy.
@@ -1493,7 +1474,6 @@ class MongoStorage():
         return result.modified_count > 0
 
     @classmethod
-    @ensure_async
     async def delete_proxy(cls, proxy_name: str):
         """
         Delete a proxy from the database.
@@ -1512,7 +1492,6 @@ class MongoStorage():
         return result.deleted_count > 0
 
     @classmethod
-    @ensure_async
     async def set_proxy_error(cls, proxy_name: str, error_message: str):
         """
         Set error status on a proxy when connection fails.
@@ -1539,7 +1518,6 @@ class MongoStorage():
         return result.modified_count > 0
 
     @classmethod
-    @ensure_async
     async def clear_proxy_error(cls, proxy_name: str):
         """
         Clear error status on a proxy after successful connection.
@@ -1562,9 +1540,8 @@ class MongoStorage():
         )
         return result.modified_count > 0
 
-    # --- Reaction Palette methods ---
+# --- Reaction Palette methods ---
     @classmethod
-    @ensure_async
     async def add_palette(cls, palette_data: dict):
         """
         Add a new reaction palette to the database.
@@ -1603,7 +1580,6 @@ class MongoStorage():
         return True
 
     @classmethod
-    @ensure_async
     async def get_palette(cls, palette_name: str):
         """
         Get a reaction palette by name.
@@ -1624,7 +1600,6 @@ class MongoStorage():
         return palette
 
     @classmethod
-    @ensure_async
     async def get_all_palettes(cls):
         """
         Get all reaction palettes.
@@ -1646,7 +1621,6 @@ class MongoStorage():
         return palettes
 
     @classmethod
-    @ensure_async
     async def update_palette(cls, palette_name: str, update_data: dict):
         """
         Update a reaction palette.
@@ -1677,7 +1651,6 @@ class MongoStorage():
         return result.modified_count > 0
 
     @classmethod
-    @ensure_async
     async def delete_palette(cls, palette_name: str):
         """
         Delete a reaction palette.
@@ -1696,7 +1669,6 @@ class MongoStorage():
         return result.deleted_count > 0
 
     @classmethod
-    @ensure_async
     async def ensure_default_palettes(cls, palettes_data: dict = None):
         """
         Ensure default reaction palettes exist in the database.
@@ -1738,9 +1710,8 @@ class MongoStorage():
         logger.debug(f"Ensured {created_count} default palettes")
         return created_count
 
-    # --- Channel methods ---
+# --- Channel methods ---
     @classmethod
-    @ensure_async
     async def add_channel(cls, channel_data: dict):
         """
         Add a new channel to the database.
@@ -1785,7 +1756,6 @@ class MongoStorage():
         return True
 
     @classmethod
-    @ensure_async
     async def get_channel(cls, chat_id: int):
         """
         Get a channel by chat_id.
@@ -1817,7 +1787,6 @@ class MongoStorage():
         return Channel(**channel) if channel else None
 
     @classmethod
-    @ensure_async
     async def get_all_channels(cls):
         """
         Get all channels from the database.
@@ -1838,7 +1807,6 @@ class MongoStorage():
         return channels
 
     @classmethod
-    @ensure_async
     async def get_channels_by_tag(cls, tag: str):
         """
         Get all channels with a specific tag.
@@ -1862,7 +1830,6 @@ class MongoStorage():
         return channels
 
     @classmethod
-    @ensure_async
     async def search_channels_by_name(cls, name_query: str):
         """
         Search for channels by name using case-insensitive regex matching.
@@ -1890,7 +1857,6 @@ class MongoStorage():
         return channels
 
     @classmethod
-    @ensure_async
     async def get_subscribed_channels(cls, phone_number: str):
         """
         Get all Channel objects that an account is subscribed to.
@@ -1926,7 +1892,6 @@ class MongoStorage():
         return channels
 
     @classmethod
-    @ensure_async
     async def update_channel(cls, chat_id: int, update_data: dict):
         """
         Update a channel's data.
@@ -1968,7 +1933,6 @@ class MongoStorage():
         return result.modified_count > 0
 
     @classmethod
-    @ensure_async
     async def delete_channel(cls, chat_id: int):
         """
         Delete a channel from the database.
@@ -1995,7 +1959,6 @@ class MongoStorage():
         return result.deleted_count > 0
 
     @classmethod
-    @ensure_async
     async def get_channels_with_post_counts(cls):
         """
         Get all channels with their post counts from the posts collection.

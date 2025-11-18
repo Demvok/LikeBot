@@ -9,6 +9,7 @@ typically run with uvicorn.
 """
 
 import asyncio, atexit, os, logging
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from collections import deque
 from datetime import timedelta, datetime as dt, timezone
@@ -34,10 +35,22 @@ frontend_http = os.getenv("frontend_http", None)
 
 atexit.register(cleanup_logging)  # Register cleanup function
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events."""
+    # Startup
+    await validate_environment()
+    yield
+    # Shutdown (if needed in the future)
+    # Add cleanup code here
+
+
 app = FastAPI(
     title="LikeBot API",
     description="Full API for LikeBot automation",
-    version="1.1.0"
+    version="1.1.0",
+    lifespan=lifespan
 )
 
 logger = logging.getLogger("likebot.main")
@@ -63,7 +76,6 @@ def _resolve_log_path(log_file: str) -> Optional[str]:
     return candidate
 
 
-@app.on_event("startup")
 async def validate_environment() -> None:
     """Ensure critical environment configuration and database connectivity are available."""
     required_vars = ("KEK", "JWT_SECRET_KEY", "db_url")
@@ -177,6 +189,138 @@ async def get_me(current_user: Annotated[dict, Depends(get_current_user)]):
     # Remove password hash from response
     response_dict = {k: v for k, v in current_user.items() if k != 'password_hash'}
     return response_dict
+
+
+# ============= USER MANAGEMENT ENDPOINTS (Admin Only) =============
+
+@app.get("/users", summary="Get all users", response_model=List[Dict], tags=["User Management"])
+@crash_handler
+async def get_all_users(current_user: dict = Depends(get_current_admin_user)):
+    """
+    Get all users in the system. Admin only.
+    
+    Returns list of users with their roles, verification status, and creation timestamps.
+    Password hashes are excluded for security.
+    """
+    db = get_db()
+    users = await db.get_all_users()
+    
+    # Remove password hashes for security
+    secure_users = []
+    for user in users:
+        user_copy = user.copy()
+        user_copy.pop('password_hash', None)
+        secure_users.append(user_copy)
+    
+    return secure_users
+
+
+@app.put("/users/{username}/role", summary="Update user role", tags=["User Management"])
+@crash_handler
+async def update_user_role(
+    username: str,
+    role: UserRole = Query(..., description="New role to assign"),
+    current_user: dict = Depends(get_current_admin_user)
+):
+    """
+    Update a user's role. Admin only.
+    
+    Allowed roles: admin, user, guest
+    """
+    db = get_db()
+    
+    # Check if user exists
+    user = await db.get_user(username)
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User {username} not found")
+    
+    # Prevent demoting yourself
+    if username.lower() == current_user.get('username', '').lower():
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot change your own role. Ask another admin."
+        )
+    
+    # Update role
+    success = await db.update_user(username, {"role": role.value})
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to update user role")
+    
+    return {"message": f"User {username} role updated to {role.value}", "username": username, "new_role": role.value}
+
+
+@app.put("/users/{username}/verify", summary="Update user verification status", tags=["User Management"])
+@crash_handler
+async def update_user_verification(
+    username: str,
+    is_verified: bool = Query(..., description="Verification status"),
+    current_user: dict = Depends(get_current_admin_user)
+):
+    """
+    Update a user's verification status. Admin only.
+    
+    Verified users can access the API, unverified users are blocked after login.
+    """
+    db = get_db()
+    
+    # Check if user exists
+    user = await db.get_user(username)
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User {username} not found")
+    
+    # Update verification status
+    success = await db.update_user(username, {"is_verified": is_verified})
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to update verification status")
+    
+    return {
+        "message": f"User {username} verification status updated",
+        "username": username,
+        "is_verified": is_verified
+    }
+
+
+@app.delete("/users/{username}", summary="Delete user", tags=["User Management"])
+@crash_handler
+async def delete_user(
+    username: str,
+    current_user: dict = Depends(get_current_admin_user)
+):
+    """
+    Delete a user from the system. Admin only.
+    
+    Cannot delete yourself or the last admin user.
+    """
+    db = get_db()
+    
+    # Check if user exists
+    user = await db.get_user(username)
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User {username} not found")
+    
+    # Prevent deleting yourself
+    if username.lower() == current_user.get('username', '').lower():
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete your own account. Ask another admin."
+        )
+    
+    # Prevent deleting last admin
+    if user.get('role') == 'admin' and user.get('is_verified'):
+        admin_count = await db.count_admin_users()
+        if admin_count <= 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot delete the last verified admin user"
+            )
+    
+    # Delete user
+    success = await db.delete_user(username)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to delete user")
+    
+    return {"message": f"User {username} deleted successfully", "username": username}
+
 
 # ============= LOG STREAMING =============
 
@@ -685,17 +829,19 @@ async def get_posts(
     """Get all posts with optional filtering. Requires authentication."""
     try:
         db = get_db()
-        posts = await db.load_all_posts()
+        
+        # Optimize: use database query for chat_id filtering
+        if chat_id is not None:
+            posts = await db.get_posts_by_chat_id(chat_id)
+        else:
+            posts = await db.load_all_posts()
         
         # Convert to dict format for JSON response
         posts_data = [post.to_dict() for post in posts]
         
-        # Apply filtering
+        # Apply additional filtering
         if post_id is not None:
             posts_data = [post for post in posts_data if post.get('post_id') == post_id]
-        
-        if chat_id is not None:
-            posts_data = [post for post in posts_data if post.get('chat_id') == chat_id]
         
         if validated_only is not None:
             if validated_only:
@@ -1624,6 +1770,303 @@ async def validate_post(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to validate post: {str(e)}")
+
+
+# ============= PROXY MANAGEMENT ENDPOINTS =============
+
+@app.get('/proxies', summary="Get all proxies", response_model=List[Dict], tags=["Proxies"])
+@crash_handler
+async def get_proxies(
+    proxy_name: Optional[str] = Query(None, description="Filter by proxy name"),
+    active_only: Optional[bool] = Query(None, description="Filter by active status"),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get all proxies with optional filtering.
+    
+    Returns proxy configurations with decrypted passwords (for authenticated users).
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        
+        # Get specific proxy
+        if proxy_name:
+            proxy = await db.get_proxy(proxy_name)
+            if not proxy:
+                raise HTTPException(status_code=404, detail=f"Proxy '{proxy_name}' not found")
+            return [proxy]
+        
+        # Get all proxies or only active ones
+        if active_only:
+            proxies = await db.get_active_proxies()
+        else:
+            proxies = await db.get_all_proxies()
+        
+        return proxies
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get proxies: {str(e)}")
+
+
+@app.get('/proxies/{proxy_name}', summary="Get proxy by name", tags=["Proxies"])
+@crash_handler
+async def get_proxy(
+    proxy_name: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get a specific proxy by name with decrypted password.
+    
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        proxy = await db.get_proxy(proxy_name)
+        
+        if not proxy:
+            raise HTTPException(status_code=404, detail=f"Proxy '{proxy_name}' not found")
+        
+        return proxy
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get proxy: {str(e)}")
+
+
+@app.post('/proxies', summary="Create new proxy", status_code=201, tags=["Proxies"])
+@crash_handler
+async def create_proxy(
+    proxy_name: str = Query(..., description="Unique proxy name/identifier"),
+    host: str = Query(..., description="Proxy hostname or IP address"),
+    port: int = Query(..., description="Proxy port", ge=1, le=65535),
+    proxy_type: str = Query("socks5", description="Proxy type (socks5, socks4, http)"),
+    username: Optional[str] = Query(None, description="Proxy authentication username"),
+    password: Optional[str] = Query(None, description="Proxy authentication password (will be encrypted)"),
+    rdns: bool = Query(True, description="Resolve DNS remotely"),
+    active: bool = Query(True, description="Is proxy active?"),
+    notes: Optional[str] = Query(None, description="Optional notes about the proxy"),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Create a new proxy configuration.
+    
+    Password is automatically encrypted before storage.
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        
+        # Validate proxy type
+        proxy_type_lower = proxy_type.lower()
+        if proxy_type_lower not in ['socks5', 'socks4', 'http']:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid proxy type '{proxy_type}'. Must be one of: socks5, socks4, http"
+            )
+        
+        # Build proxy data
+        from datetime import datetime, timezone as tz
+        proxy_data = {
+            'proxy_name': proxy_name,
+            'host': host,
+            'port': port,
+            'type': proxy_type_lower,
+            'rdns': rdns,
+            'active': active,
+            'connected_accounts': 0,
+            'created_at': datetime.now(tz.utc),
+            'updated_at': datetime.now(tz.utc)
+        }
+        
+        if username:
+            proxy_data['username'] = username
+        if password:
+            proxy_data['password'] = password  # Will be encrypted by add_proxy
+        if notes:
+            proxy_data['notes'] = notes
+        
+        success = await db.add_proxy(proxy_data)
+        if not success:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Proxy '{proxy_name}' already exists or failed to create"
+            )
+        
+        # Return created proxy (without password for security in response)
+        created_proxy = await db.get_proxy(proxy_name)
+        created_proxy.pop('password', None)
+        created_proxy.pop('password_encrypted', None)
+        
+        return created_proxy
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create proxy: {str(e)}")
+
+
+@app.put('/proxies/{proxy_name}', summary="Update proxy", tags=["Proxies"])
+@crash_handler
+async def update_proxy(
+    proxy_name: str,
+    host: Optional[str] = Query(None, description="Proxy hostname or IP address"),
+    port: Optional[int] = Query(None, description="Proxy port", ge=1, le=65535),
+    proxy_type: Optional[str] = Query(None, description="Proxy type (socks5, socks4, http)"),
+    username: Optional[str] = Query(None, description="Proxy authentication username"),
+    password: Optional[str] = Query(None, description="Proxy authentication password (will be encrypted)"),
+    rdns: Optional[bool] = Query(None, description="Resolve DNS remotely"),
+    active: Optional[bool] = Query(None, description="Is proxy active?"),
+    notes: Optional[str] = Query(None, description="Optional notes about the proxy"),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Update an existing proxy configuration.
+    
+    Only provided fields will be updated. Password is automatically encrypted.
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        
+        # Check if proxy exists
+        existing_proxy = await db.get_proxy(proxy_name)
+        if not existing_proxy:
+            raise HTTPException(status_code=404, detail=f"Proxy '{proxy_name}' not found")
+        
+        # Build update data with only provided fields
+        update_data = {}
+        if host is not None:
+            update_data['host'] = host
+        if port is not None:
+            update_data['port'] = port
+        if proxy_type is not None:
+            proxy_type_lower = proxy_type.lower()
+            if proxy_type_lower not in ['socks5', 'socks4', 'http']:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid proxy type '{proxy_type}'. Must be one of: socks5, socks4, http"
+                )
+            update_data['type'] = proxy_type_lower
+        if username is not None:
+            update_data['username'] = username
+        if password is not None:
+            update_data['password'] = password  # Will be encrypted by update_proxy
+        if rdns is not None:
+            update_data['rdns'] = rdns
+        if active is not None:
+            update_data['active'] = active
+        if notes is not None:
+            update_data['notes'] = notes
+        
+        if not update_data:
+            raise HTTPException(status_code=400, detail="No fields provided for update")
+        
+        from datetime import datetime, timezone as tz
+        update_data['updated_at'] = datetime.now(tz.utc)
+        
+        success = await db.update_proxy(proxy_name, update_data)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to update proxy")
+        
+        # Return updated proxy (without password for security)
+        updated_proxy = await db.get_proxy(proxy_name)
+        updated_proxy.pop('password', None)
+        updated_proxy.pop('password_encrypted', None)
+        
+        return updated_proxy
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update proxy: {str(e)}")
+
+
+@app.delete('/proxies/{proxy_name}', summary="Delete proxy", tags=["Proxies"])
+@crash_handler
+async def delete_proxy(
+    proxy_name: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Delete a proxy configuration.
+    
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        
+        # Check if proxy exists
+        proxy = await db.get_proxy(proxy_name)
+        if not proxy:
+            raise HTTPException(status_code=404, detail=f"Proxy '{proxy_name}' not found")
+        
+        # Check if proxy is in use
+        connected_accounts = proxy.get('connected_accounts', 0)
+        if connected_accounts > 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot delete proxy '{proxy_name}': currently connected to {connected_accounts} account(s)"
+            )
+        
+        success = await db.delete_proxy(proxy_name)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to delete proxy")
+        
+        return {"message": f"Proxy '{proxy_name}' deleted successfully", "proxy_name": proxy_name}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete proxy: {str(e)}")
+
+
+@app.get('/proxies/stats/summary', summary="Get proxy statistics", tags=["Proxies"])
+@crash_handler
+async def get_proxy_stats(current_user: dict = Depends(get_current_user)):
+    """
+    Get statistics about proxies in the system.
+    
+    Returns:
+    - Total proxy count
+    - Active proxy count
+    - Total connected accounts across all proxies
+    - Least used proxy
+    - Most used proxy
+    
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        
+        all_proxies = await db.get_all_proxies()
+        active_proxies = [p for p in all_proxies if p.get('active', False)]
+        
+        total_connections = sum(p.get('connected_accounts', 0) for p in all_proxies)
+        
+        # Find least and most used
+        least_used = None
+        most_used = None
+        if all_proxies:
+            least_used = min(all_proxies, key=lambda p: p.get('connected_accounts', 0))
+            most_used = max(all_proxies, key=lambda p: p.get('connected_accounts', 0))
+        
+        stats = {
+            'total_proxies': len(all_proxies),
+            'active_proxies': len(active_proxies),
+            'inactive_proxies': len(all_proxies) - len(active_proxies),
+            'total_connected_accounts': total_connections,
+            'least_used_proxy': {
+                'proxy_name': least_used.get('proxy_name'),
+                'connected_accounts': least_used.get('connected_accounts', 0)
+            } if least_used else None,
+            'most_used_proxy': {
+                'proxy_name': most_used.get('proxy_name'),
+                'connected_accounts': most_used.get('connected_accounts', 0)
+            } if most_used else None
+        }
+        
+        return stats
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get proxy stats: {str(e)}")
     
 
 # ============= REACTION PALETTES CRUD =============
@@ -1838,6 +2281,333 @@ async def delete_palette(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete palette: {str(e)}")
+
+
+# ============= CHANNEL MANAGEMENT ENDPOINTS =============
+
+@app.get('/channels', summary="Get all channels", response_model=List[Dict], tags=["Channels"])
+@crash_handler
+async def get_channels(
+    chat_id: Optional[int] = Query(None, description="Filter by chat_id"),
+    tag: Optional[str] = Query(None, description="Filter by tag"),
+    name: Optional[str] = Query(None, description="Search by channel name"),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get all channels with optional filtering.
+    
+    Supports filtering by:
+    - chat_id: Exact match on Telegram chat ID
+    - tag: Channels with specific tag
+    - name: Partial match on channel name (case-insensitive)
+    
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        
+        # Filter by specific channel
+        if chat_id is not None:
+            channel = await db.get_channel(chat_id)
+            if not channel:
+                raise HTTPException(status_code=404, detail=f"Channel with chat_id {chat_id} not found")
+            return [convert_to_serializable(channel.to_dict())]
+        
+        # Filter by tag
+        if tag:
+            channels = await db.get_channels_by_tag(tag)
+            return [convert_to_serializable(c.to_dict()) for c in channels]
+        
+        # Search by name
+        if name:
+            channels = await db.search_channels_by_name(name)
+            return [convert_to_serializable(c.to_dict()) for c in channels]
+        
+        # Get all channels
+        channels = await db.get_all_channels()
+        return [convert_to_serializable(c.to_dict()) for c in channels]
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get channels: {str(e)}")
+
+
+@app.get('/channels/{chat_id}', summary="Get channel by chat_id", tags=["Channels"])
+@crash_handler
+async def get_channel(
+    chat_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get a specific channel by chat_id.
+    
+    Accepts both normalized and -100 prefixed chat IDs.
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        channel = await db.get_channel(chat_id)
+        
+        if not channel:
+            raise HTTPException(status_code=404, detail=f"Channel with chat_id {chat_id} not found")
+        
+        return convert_to_serializable(channel.to_dict())
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get channel: {str(e)}")
+
+
+@app.post('/channels', summary="Create new channel", status_code=201, tags=["Channels"])
+@crash_handler
+async def create_channel(
+    chat_id: int = Query(..., description="Telegram chat ID (unique identifier)"),
+    channel_name: Optional[str] = Query(None, description="Channel name/title"),
+    is_private: bool = Query(False, description="Is the channel private?"),
+    has_enabled_reactions: bool = Query(True, description="Does the channel have reactions enabled?"),
+    reactions_only_for_subscribers: bool = Query(False, description="Are reactions only for subscribers?"),
+    discussion_chat_id: Optional[int] = Query(None, description="Discussion group chat ID if exists"),
+    tags: Optional[str] = Query(None, description="Comma-separated list of tags"),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Create a new channel entry.
+    
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        from main_logic.channel import Channel
+        from datetime import datetime, timezone as tz
+        
+        # Parse tags
+        tag_list = []
+        if tags:
+            tag_list = [t.strip() for t in tags.split(',') if t.strip()]
+        
+        # Create channel data
+        channel_data = {
+            'chat_id': chat_id,
+            'channel_name': channel_name,
+            'is_private': is_private,
+            'has_enabled_reactions': has_enabled_reactions,
+            'reactions_only_for_subscribers': reactions_only_for_subscribers,
+            'discussion_chat_id': discussion_chat_id,
+            'tags': tag_list,
+            'channel_hash': '',
+            'created_at': datetime.now(tz.utc),
+            'updated_at': datetime.now(tz.utc)
+        }
+        
+        # Create channel
+        success = await db.add_channel(channel_data)
+        if not success:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Channel with chat_id {chat_id} already exists or failed to create"
+            )
+        
+        # Return created channel
+        created_channel = await db.get_channel(chat_id)
+        return convert_to_serializable(created_channel.to_dict())
+        
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create channel: {str(e)}")
+
+
+@app.put('/channels/{chat_id}', summary="Update channel", tags=["Channels"])
+@crash_handler
+async def update_channel(
+    chat_id: int,
+    channel_name: Optional[str] = Query(None, description="Channel name/title"),
+    is_private: Optional[bool] = Query(None, description="Is the channel private?"),
+    has_enabled_reactions: Optional[bool] = Query(None, description="Does the channel have reactions enabled?"),
+    reactions_only_for_subscribers: Optional[bool] = Query(None, description="Are reactions only for subscribers?"),
+    discussion_chat_id: Optional[int] = Query(None, description="Discussion group chat ID if exists"),
+    tags: Optional[str] = Query(None, description="Comma-separated list of tags"),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Update an existing channel.
+    
+    Only provided fields will be updated.
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        
+        # Check if channel exists
+        existing_channel = await db.get_channel(chat_id)
+        if not existing_channel:
+            raise HTTPException(status_code=404, detail=f"Channel with chat_id {chat_id} not found")
+        
+        # Build update data with only provided fields
+        update_data = {}
+        if channel_name is not None:
+            update_data['channel_name'] = channel_name
+        if is_private is not None:
+            update_data['is_private'] = is_private
+        if has_enabled_reactions is not None:
+            update_data['has_enabled_reactions'] = has_enabled_reactions
+        if reactions_only_for_subscribers is not None:
+            update_data['reactions_only_for_subscribers'] = reactions_only_for_subscribers
+        if discussion_chat_id is not None:
+            update_data['discussion_chat_id'] = discussion_chat_id
+        if tags is not None:
+            tag_list = [t.strip() for t in tags.split(',') if t.strip()]
+            update_data['tags'] = tag_list
+        
+        if not update_data:
+            raise HTTPException(status_code=400, detail="No fields provided for update")
+        
+        from datetime import datetime, timezone as tz
+        update_data['updated_at'] = datetime.now(tz.utc)
+        
+        success = await db.update_channel(chat_id, update_data)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to update channel")
+        
+        # Return updated channel
+        updated_channel = await db.get_channel(chat_id)
+        return convert_to_serializable(updated_channel.to_dict())
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update channel: {str(e)}")
+
+
+@app.delete('/channels/{chat_id}', summary="Delete channel", tags=["Channels"])
+@crash_handler
+async def delete_channel(
+    chat_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Delete a channel from the database.
+    
+    Note: This does not delete the actual Telegram channel, only the local database entry.
+    Associated posts will remain in the database.
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        
+        # Check if channel exists
+        channel = await db.get_channel(chat_id)
+        if not channel:
+            raise HTTPException(status_code=404, detail=f"Channel with chat_id {chat_id} not found")
+        
+        success = await db.delete_channel(chat_id)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to delete channel")
+        
+        return {"message": f"Channel with chat_id {chat_id} deleted successfully", "chat_id": chat_id}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete channel: {str(e)}")
+
+
+@app.get('/channels/stats/summary', summary="Get channel statistics", tags=["Channels"])
+@crash_handler
+async def get_channel_stats(current_user: dict = Depends(get_current_user)):
+    """
+    Get statistics about channels in the system.
+    
+    Returns:
+    - Total channel count
+    - Private vs public channel breakdown
+    - Channels with reactions enabled
+    - Channel distribution by tags
+    
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        
+        all_channels = await db.get_all_channels()
+        
+        total_channels = len(all_channels)
+        private_channels = sum(1 for c in all_channels if c.is_private)
+        public_channels = total_channels - private_channels
+        reactions_enabled = sum(1 for c in all_channels if c.has_enabled_reactions)
+        
+        # Tag distribution
+        tag_distribution = {}
+        for channel in all_channels:
+            for tag in channel.tags:
+                tag_distribution[tag] = tag_distribution.get(tag, 0) + 1
+        
+        stats = {
+            'total_channels': total_channels,
+            'private_channels': private_channels,
+            'public_channels': public_channels,
+            'channels_with_reactions': reactions_enabled,
+            'tag_distribution': tag_distribution
+        }
+        
+        return stats
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get channel stats: {str(e)}")
+
+
+@app.get('/channels/with-post-counts', summary="Get channels with post counts", tags=["Channels"])
+@crash_handler
+async def get_channels_with_post_counts(current_user: dict = Depends(get_current_user)):
+    """
+    Get all channels with their post counts.
+    
+    Returns a list of channels with an additional 'post_count' field indicating
+    how many posts exist for each channel.
+    
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        
+        channels_with_counts = await db.get_channels_with_post_counts()
+        return convert_to_serializable(channels_with_counts)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get channels with post counts: {str(e)}")
+
+
+@app.get('/accounts/{phone_number}/channels', summary="Get account's subscribed channels", tags=["Accounts"])
+@crash_handler
+async def get_account_subscribed_channels(
+    phone_number: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get all channels that an account is subscribed to.
+    
+    Returns list of Channel objects based on the account's subscribed_to list.
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        
+        # Check if account exists
+        account = await db.get_account(phone_number)
+        if not account:
+            raise HTTPException(status_code=404, detail=f"Account with phone number {phone_number} not found")
+        
+        # Get subscribed channels
+        channels = await db.get_subscribed_channels(phone_number)
+        return [convert_to_serializable(c.to_dict()) for c in channels]
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get subscribed channels: {str(e)}")
 
 
 if __name__ == "__main__":

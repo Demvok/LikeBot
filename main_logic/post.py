@@ -74,7 +74,7 @@ class Post:
         attempt = 0
         while attempt < retries:
             try:
-                chat_id, message_id = await client.get_message_ids(self.message_link)
+                chat_id, message_id, _ = await client.get_message_ids(self.message_link)
                 self.chat_id = normalize_chat_id(chat_id)
                 self.message_id = message_id
                 self.updated_at = Timestamp.now()

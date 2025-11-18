@@ -11,12 +11,16 @@ This document describes the full CRUD API for the LikeBot automation system.
 5. [API Endpoints](#api-endpoints)
    - [Health Check](#health-check)
    - [Authentication Endpoints](#authentication-endpoints)
+   - [User Management](#user-management)
    - [Log Streaming](#log-streaming)
    - [Accounts CRUD](#accounts-crud)
    - [Login Process](#login-process)
    - [Posts CRUD](#posts-crud)
    - [Tasks CRUD](#tasks-crud)
    - [Task Actions](#task-actions)
+   - [Proxy Management](#proxy-management)
+   - [Reaction Palettes](#reaction-palettes)
+   - [Channel Management](#channel-management)
    - [Bulk Operations](#bulk-operations)
    - [Utility Endpoints](#utility-endpoints)
 6. [Error Responses](#error-responses)
@@ -26,11 +30,18 @@ This document describes the full CRUD API for the LikeBot automation system.
 
 The following notes summarize important changes in the codebase since the previous documented version (1.0.2):
 
-- Bumped API version to **1.0.6** (see health-check response below).
+- Bumped API version to **1.1.0** (see health-check response below).
 - Added CORS support that can be configured via the `frontend_http` environment variable (used by the API to allow frontend origins).
 - Startup now enforces critical environment variables at launch (e.g., `KEK`, `JWT_SECRET_KEY`, `db_url`) and will fail fast if they are missing.
 - The application registers a cleanup handler on process exit to ensure logging/resources are cleaned up (clean shutdown behavior).
 - WebSocket `/ws/logs` accepts a `tail` query parameter (0-1000, default 200) and will send token-expiry warnings when an access token is nearing expiry.
+
+**New Endpoints Added:**
+- **User Management** (Admin only): GET /users, PUT /users/{username}/role, PUT /users/{username}/verify, DELETE /users/{username}
+- **Proxy Management**: Full CRUD for proxy configurations (GET, POST, PUT, DELETE /proxies, GET /proxies/stats/summary)
+- **Channel Management**: Full CRUD for Telegram channels (GET, POST, PUT, DELETE /channels, GET /channels/stats/summary, GET /channels/with-post-counts)
+- **Account-Channel Subscriptions**: GET /accounts/{phone_number}/channels
+- **Reaction Palettes**: Full CRUD for emoji reaction palettes (GET, POST, PUT, DELETE /palettes)
 
 Notes: these changes are reflected in the `main.py` implementation. The rest of this document describes the current API surface.
 
@@ -206,6 +217,58 @@ curl -X GET http://localhost:8080/accounts \
 }
 ```
 
+### Proxy
+```json
+{
+  "proxy_name": "string (unique identifier)",
+  "proxy_type": "string (http|https|socks4|socks5)",
+  "host": "string (IP or hostname)",
+  "port": "integer (1-65535)",
+  "username": "string (optional)",
+  "password_encrypted": "string (optional, encrypted)",
+  "is_active": "boolean",
+  "current_usage": "integer (number of accounts using this proxy)",
+  "max_usage": "integer (maximum concurrent accounts, optional)",
+  "last_error": "string (optional)",
+  "last_error_time": "string (ISO timestamp, optional)",
+  "created_at": "string (ISO timestamp)",
+  "updated_at": "string (ISO timestamp)"
+}
+```
+
+**Note**: Proxy passwords are encrypted using AES-256-GCM and are never returned in API responses.
+
+### Channel
+```json
+{
+  "chat_id": "integer (Telegram chat ID, unique identifier)",
+  "channel_name": "string (channel title/name)",
+  "is_private": "boolean",
+  "has_enabled_reactions": "boolean",
+  "reactions_only_for_subscribers": "boolean",
+  "discussion_chat_id": "integer (optional, linked discussion group)",
+  "tags": ["array of strings"],
+  "created_at": "string (ISO timestamp)",
+  "updated_at": "string (ISO timestamp)"
+}
+```
+
+**Note**: Chat IDs are automatically normalized to handle both -100 prefixed and non-prefixed forms.
+
+### Reaction Palette
+```json
+{
+  "palette_name": "string (unique identifier, lowercase)",
+  "emojis": ["array of emoji strings"],
+  "ordered": "boolean (true=sequential, false=random)",
+  "description": "string (optional)",
+  "created_at": "string (ISO timestamp)",
+  "updated_at": "string (ISO timestamp)"
+}
+```
+
+**Note**: If `ordered` is true, reactions are applied sequentially from the emoji list. If false, emojis are chosen randomly.
+
 ## API Endpoints
 
 ### Health Check
@@ -219,7 +282,7 @@ Get server status.
 ```json
 {
   "message": "LikeBot API Server is running",
-  "version": "1.0.6"
+  "version": "1.1.0"
 }
 ```
 
@@ -317,6 +380,150 @@ Authorization: Bearer <your_access_token>
 **Error Responses:**
 - `401`: Invalid or missing token
 - `403`: User is not verified
+
+---
+
+## User Management
+
+All user management endpoints require **admin privileges**.
+
+### GET /users
+Get all users in the system.
+
+**Authentication**: Required (Admin only)
+
+**Headers:**
+```
+Authorization: Bearer <your_admin_access_token>
+```
+
+**Response:**
+```json
+[
+  {
+    "username": "john_doe",
+    "is_verified": true,
+    "role": "user",
+    "created_at": "2025-01-01T00:00:00Z",
+    "updated_at": "2025-01-01T00:00:00Z"
+  }
+]
+```
+
+**Notes:**
+- Password hashes are excluded from the response for security
+- Only accessible by admin users
+
+**Error Responses:**
+- `401`: Invalid or missing token
+- `403`: User is not admin
+
+---
+
+### PUT /users/{username}/role
+Update a user's role.
+
+**Authentication**: Required (Admin only)
+
+**Headers:**
+```
+Authorization: Bearer <your_admin_access_token>
+```
+
+**Query Parameters:**
+- `role` (required): New role to assign (admin, user, guest)
+
+**Example:**
+```
+PUT /users/john_doe/role?role=admin
+```
+
+**Response:**
+```json
+{
+  "message": "User john_doe role updated to admin",
+  "username": "john_doe",
+  "new_role": "admin"
+}
+```
+
+**Notes:**
+- Cannot change your own role (ask another admin)
+- Valid roles: admin, user, guest
+
+**Error Responses:**
+- `401`: Invalid or missing token
+- `403`: User is not admin
+- `404`: User not found
+- `400`: Attempting to change your own role
+
+---
+
+### PUT /users/{username}/verify
+Update a user's verification status.
+
+**Authentication**: Required (Admin only)
+
+**Headers:**
+```
+Authorization: Bearer <your_admin_access_token>
+```
+
+**Query Parameters:**
+- `is_verified` (required): Verification status (true/false)
+
+**Example:**
+```
+PUT /users/john_doe/verify?is_verified=true
+```
+
+**Response:**
+```json
+{
+  "message": "User john_doe verification status updated",
+  "username": "john_doe",
+  "is_verified": true
+}
+```
+
+**Notes:**
+- Verified users can access the API
+- Unverified users are blocked after login
+
+**Error Responses:**
+- `401`: Invalid or missing token
+- `403`: User is not admin
+- `404`: User not found
+
+---
+
+### DELETE /users/{username}
+Delete a user from the system.
+
+**Authentication**: Required (Admin only)
+
+**Headers:**
+```
+Authorization: Bearer <your_admin_access_token>
+```
+
+**Response:**
+```json
+{
+  "message": "User john_doe deleted successfully",
+  "username": "john_doe"
+}
+```
+
+**Notes:**
+- Cannot delete yourself (ask another admin)
+- Cannot delete the last verified admin user
+
+**Error Responses:**
+- `401`: Invalid or missing token
+- `403`: User is not admin
+- `404`: User not found
+- `400`: Cannot delete yourself or last admin
 
 ---
 
@@ -1438,6 +1645,219 @@ Available emoji palettes:
 
 ---
 
+## Proxy Management
+
+Manage proxy configurations for Telegram accounts. Proxies can be assigned to accounts to route their connections through specific servers.
+
+### GET /proxies
+Get all proxies with optional filtering.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Query Parameters:**
+- `proxy_name` (optional): Filter by proxy name
+- `is_active` (optional): Filter by active status (true/false)
+
+**Response:**
+```json
+[
+  {
+    "proxy_name": "proxy1",
+    "proxy_type": "socks5",
+    "host": "192.168.1.100",
+    "port": 1080,
+    "username": "proxyuser",
+    "is_active": true,
+    "current_usage": 3,
+    "max_usage": 10,
+    "last_error": null,
+    "last_error_time": null,
+    "created_at": "2025-01-01T00:00:00Z",
+    "updated_at": "2025-01-01T00:00:00Z"
+  }
+]
+```
+
+**Notes:**
+- Passwords are never returned in responses for security
+
+---
+
+### GET /proxies/{proxy_name}
+Get a specific proxy by name.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Response:**
+```json
+{
+  "proxy_name": "proxy1",
+  "proxy_type": "socks5",
+  "host": "192.168.1.100",
+  "port": 1080,
+  "username": "proxyuser",
+  "is_active": true,
+  "current_usage": 3,
+  "max_usage": 10,
+  "created_at": "2025-01-01T00:00:00Z",
+  "updated_at": "2025-01-01T00:00:00Z"
+}
+```
+
+**Error Responses:**
+- `404`: Proxy not found
+
+---
+
+### POST /proxies
+Create a new proxy configuration.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Query Parameters:**
+- `proxy_name` (required): Unique name for the proxy
+- `proxy_type` (required): Type of proxy (http, https, socks4, socks5)
+- `host` (required): Proxy server IP or hostname
+- `port` (required): Proxy server port (1-65535)
+- `username` (optional): Proxy authentication username
+- `password` (optional): Proxy authentication password (will be encrypted)
+- `is_active` (optional, default=true): Whether proxy is active
+- `max_usage` (optional): Maximum concurrent accounts allowed
+
+**Example:**
+```
+POST /proxies?proxy_name=proxy1&proxy_type=socks5&host=192.168.1.100&port=1080&username=user&password=pass
+```
+
+**Response:**
+```json
+{
+  "message": "Proxy 'proxy1' created successfully",
+  "proxy_name": "proxy1"
+}
+```
+
+**Notes:**
+- Password is encrypted server-side before storage
+- Proxy name must be unique
+
+**Error Responses:**
+- `400`: Invalid parameters or validation error
+- `409`: Proxy name already exists
+
+---
+
+### PUT /proxies/{proxy_name}
+Update an existing proxy configuration.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Query Parameters (all optional):**
+- `proxy_type`: Type of proxy (http, https, socks4, socks5)
+- `host`: Proxy server IP or hostname
+- `port`: Proxy server port (1-65535)
+- `username`: Proxy authentication username
+- `password`: Proxy authentication password (will be encrypted)
+- `is_active`: Whether proxy is active (true/false)
+- `max_usage`: Maximum concurrent accounts allowed
+
+**Example:**
+```
+PUT /proxies/proxy1?host=192.168.1.101&port=1081
+```
+
+**Response:**
+```json
+{
+  "message": "Proxy 'proxy1' updated successfully"
+}
+```
+
+**Notes:**
+- Only provided fields will be updated
+- Setting password to empty string clears it
+
+**Error Responses:**
+- `404`: Proxy not found
+- `400`: No fields provided or validation error
+
+---
+
+### DELETE /proxies/{proxy_name}
+Delete a proxy configuration.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Response:**
+```json
+{
+  "message": "Proxy 'proxy1' deleted successfully",
+  "proxy_name": "proxy1"
+}
+```
+
+**Error Responses:**
+- `404`: Proxy not found
+
+---
+
+### GET /proxies/stats/summary
+Get proxy usage statistics.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Response:**
+```json
+{
+  "total_proxies": 5,
+  "active_proxies": 3,
+  "inactive_proxies": 2,
+  "total_usage": 15,
+  "proxies_with_errors": 1,
+  "proxies": [
+    {
+      "proxy_name": "proxy1",
+      "current_usage": 5,
+      "max_usage": 10,
+      "is_active": true,
+      "has_error": false
+    }
+  ]
+}
+```
+
+---
+
 ## Reaction Palettes CRUD
 
 Reaction palettes let you define named emoji sets that tasks can reference when performing react actions. The API provides CRUD endpoints to manage palettes.
@@ -1543,6 +1963,272 @@ Response (200):
 
 Warning: Tasks that reference a deleted palette will fail to execute until the palette is recreated or tasks are updated to use an existing palette.
 
+---
+
+## Channel Management
+
+Manage Telegram channel metadata and subscriptions. Channels represent Telegram channels/groups that accounts are subscribed to.
+
+### GET /channels
+Get all channels with optional filtering.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Query Parameters:**
+- `chat_id` (optional): Filter by chat ID
+- `tag` (optional): Filter by tag
+- `name` (optional): Search by channel name (partial match)
+
+**Response:**
+```json
+[
+  {
+    "chat_id": -1001234567890,
+    "channel_name": "My Channel",
+    "is_private": false,
+    "has_enabled_reactions": true,
+    "reactions_only_for_subscribers": false,
+    "discussion_chat_id": -1009876543210,
+    "tags": ["crypto", "news"],
+    "created_at": "2025-01-01T00:00:00Z",
+    "updated_at": "2025-01-01T00:00:00Z"
+  }
+]
+```
+
+---
+
+### GET /channels/{chat_id}
+Get a specific channel by chat ID.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Response:**
+```json
+{
+  "chat_id": -1001234567890,
+  "channel_name": "My Channel",
+  "is_private": false,
+  "has_enabled_reactions": true,
+  "reactions_only_for_subscribers": false,
+  "discussion_chat_id": -1009876543210,
+  "tags": ["crypto", "news"],
+  "created_at": "2025-01-01T00:00:00Z",
+  "updated_at": "2025-01-01T00:00:00Z"
+}
+```
+
+**Error Responses:**
+- `404`: Channel not found
+
+---
+
+### POST /channels
+Create a new channel entry.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Query Parameters:**
+- `chat_id` (required): Telegram chat ID (with or without -100 prefix)
+- `channel_name` (required): Channel name/title
+- `is_private` (optional, default=false): Is the channel private?
+- `has_enabled_reactions` (optional, default=true): Does channel have reactions enabled?
+- `reactions_only_for_subscribers` (optional, default=false): Are reactions only for subscribers?
+- `discussion_chat_id` (optional): Linked discussion group chat ID
+- `tags` (optional): Comma-separated list of tags
+
+**Example:**
+```
+POST /channels?chat_id=-1001234567890&channel_name=MyChannel&tags=crypto,news
+```
+
+**Response:**
+```json
+{
+  "chat_id": -1001234567890,
+  "channel_name": "MyChannel",
+  "is_private": false,
+  "has_enabled_reactions": true,
+  "tags": ["crypto", "news"],
+  "created_at": "2025-01-01T00:00:00Z",
+  "updated_at": "2025-01-01T00:00:00Z"
+}
+```
+
+**Notes:**
+- Chat IDs are automatically normalized (handles both -100 prefixed and non-prefixed forms)
+- Tags are trimmed and empty tags are removed
+
+**Error Responses:**
+- `400`: Chat ID already exists or validation error
+
+---
+
+### PUT /channels/{chat_id}
+Update an existing channel.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Query Parameters (all optional):**
+- `channel_name`: Channel name/title
+- `is_private`: Is the channel private? (true/false)
+- `has_enabled_reactions`: Does channel have reactions enabled? (true/false)
+- `reactions_only_for_subscribers`: Are reactions only for subscribers? (true/false)
+- `discussion_chat_id`: Linked discussion group chat ID
+- `tags`: Comma-separated list of tags
+
+**Example:**
+```
+PUT /channels/-1001234567890?channel_name=Updated+Name&tags=crypto,tech
+```
+
+**Response:**
+```json
+{
+  "chat_id": -1001234567890,
+  "channel_name": "Updated Name",
+  "tags": ["crypto", "tech"],
+  "updated_at": "2025-01-01T12:00:00Z"
+}
+```
+
+**Error Responses:**
+- `404`: Channel not found
+- `400`: No fields provided for update
+
+---
+
+### DELETE /channels/{chat_id}
+Delete a channel from the database.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Response:**
+```json
+{
+  "message": "Channel with chat_id -1001234567890 deleted successfully",
+  "chat_id": -1001234567890
+}
+```
+
+**Notes:**
+- This does NOT delete the actual Telegram channel, only the local database entry
+- Associated posts will remain in the database
+
+**Error Responses:**
+- `404`: Channel not found
+
+---
+
+### GET /channels/stats/summary
+Get channel statistics.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Response:**
+```json
+{
+  "total_channels": 10,
+  "private_channels": 3,
+  "public_channels": 7,
+  "channels_with_reactions": 8,
+  "tag_distribution": {
+    "crypto": 5,
+    "news": 3,
+    "tech": 4
+  }
+}
+```
+
+---
+
+### GET /channels/with-post-counts
+Get all channels with their post counts.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Response:**
+```json
+[
+  {
+    "chat_id": -1001234567890,
+    "channel_name": "My Channel",
+    "post_count": 15,
+    "tags": ["crypto", "news"],
+    "created_at": "2025-01-01T00:00:00Z"
+  }
+]
+```
+
+**Notes:**
+- Returns all channels with an additional `post_count` field
+- Post count indicates how many posts exist for each channel
+
+---
+
+### GET /accounts/{phone_number}/channels
+Get all channels that an account is subscribed to.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Response:**
+```json
+[
+  {
+    "chat_id": -1001234567890,
+    "channel_name": "Subscribed Channel",
+    "is_private": false,
+    "tags": ["crypto"]
+  }
+]
+```
+
+**Notes:**
+- Returns Channel objects based on the account's `subscribed_to` list
+- Only returns channels that exist in the database
+
+**Error Responses:**
+- `404`: Account not found
 
 ---
 

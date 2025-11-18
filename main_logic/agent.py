@@ -795,6 +795,52 @@ class Client(object):
 
 # Additional utility methods
 
+    def _extract_identifier_from_link(self, link: str):
+        """
+        Extract username or chat_id from a Telegram message link.
+        Used when we need to fetch an entity from a link.
+        
+        Args:
+            link: Telegram message link
+            
+        Returns:
+            str or int: Username (for public channels) or chat_id (for /c/ links)
+        """
+        try:
+            link = link.strip()
+            if '://' not in link:
+                link = 'https://' + link
+            
+            parsed = urlparse(unquote(link))
+            path = parsed.path.lstrip('/')
+            segments = [seg for seg in path.split('/') if seg != '']
+            
+            if not segments or len(segments) < 2:
+                raise ValueError(f"Link format not recognized: {link}")
+            
+            # /c/<raw>/<msg> format - return chat_id
+            if segments[0] == 'c':
+                if len(segments) < 3:
+                    raise ValueError(f"Invalid /c/ link: {link}")
+                raw = segments[1]
+                if not raw.isdigit():
+                    raise ValueError(f"Non-numeric in /c/ link: {link}")
+                return int(f"-100{raw}")
+            
+            # /s/<username>/<msg> or /<username>/<msg> format - return username
+            if segments[0] == 's':
+                if len(segments) < 3:
+                    raise ValueError(f"Invalid /s/ link: {link}")
+                username = segments[1]
+            else:
+                username = segments[0]
+            
+            return username.lstrip('@')
+            
+        except Exception as e:
+            self.logger.warning(f"Error extracting identifier from '{link}': {e}")
+            raise
+    
     async def get_message_ids(self, link: str):
         """
         Extract (chat_id, message_id, entity) from a Telegram link of types:
@@ -835,60 +881,48 @@ class Client(object):
                     self.logger.debug(f"DB lookup by message_link failed for '{link}': {_db_err}")
             except Exception:
                 pass
+            
+            # Parse link to extract message_id
             parsed = urlparse(unquote(link))
             path = parsed.path.lstrip('/')
             segments = [seg for seg in path.split('/') if seg != '']
             if not segments or len(segments) < 2:
                 raise ValueError(f"Link format not recognized: {link}")
 
-            # випадок /c/<raw>/<msg>
-            if segments[0] == 'c':
-                if len(segments) < 3:
-                    raise ValueError(f"Invalid /c/ link: {link}")
-                raw = segments[1]
-                msg = segments[2]
-                if not raw.isdigit() or not msg.isdigit():
-                    raise ValueError(f"Non-numeric in /c/ link: {link}")
-                chat_id = int(f"-100{raw}")
-                message_id = int(msg)
-                return chat_id, message_id, None  # No entity for /c/ links (use chat_id directly)
-
-            # випадок /s/<username>/<msg>
-            if segments[0] == 's':
-                if len(segments) < 3:
-                    raise ValueError(f"Invalid /s/ link: {link}")
-                username = segments[1]
-                msg = segments[2]
-            else:
-                # /<username>/<msg>
-                username = segments[0]
-                msg = segments[1]
-
-            username = username.lstrip('@')
+            # Extract message_id from the last segment
+            # For /c/<raw>/<msg>, /s/<username>/<msg>, /<username>/<msg>
+            msg = segments[-1]
             if not msg.isdigit():
                 raise ValueError(f"Message part is not numeric: {link}")
             message_id = int(msg)
-
-            # отримуємо entity with caching and rate limiting
+            
+            # Use _extract_identifier_from_link to get the identifier (username or chat_id)
+            # This handles all link formats: /c/, /s/, and direct username
+            identifier = self._extract_identifier_from_link(link)
+            
+            # If identifier is an int (from /c/ links), return immediately without entity
+            if isinstance(identifier, int):
+                # /c/ link - identifier is already the chat_id
+                return identifier, message_id, None
+            
+            # Identifier is a username - fetch entity with caching and rate limiting
             await self.ensure_connected()
-            # Спроба передати повний URL (Telethon підтримує це)
+            
             try:
-                entity = await self.get_entity_cached(username)
+                entity = await self.get_entity_cached(identifier)
             except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.SessionRevokedError, errors.UserDeactivatedError, errors.UserDeactivatedBanError) as auth_error:
                 # Session is invalid/expired/revoked or account is banned - re-raise for proper handling upstream
-                # Include SessionRevokedError explicitly so it isn't swallowed and can be mapped to account status
-                self.logger.error(f"Session invalid/expired or account deactivated while resolving '{username}': {auth_error}")
+                self.logger.error(f"Session invalid/expired or account deactivated while resolving '{identifier}': {auth_error}")
                 raise
             except Exception as e1:
                 # Try several fallbacks: full URL with scheme, http, www variant, and @username.
-                # Some Telethon versions accept a full URL but others don't, so try multiple formats.
                 last_exc = e1
                 tried = []
                 candidates = [
-                    f"https://{parsed.netloc}/{username}",
-                    f"http://{parsed.netloc}/{username}",
-                    f"{parsed.netloc}/{username}",
-                    f"@{username}",
+                    f"https://{parsed.netloc}/{identifier}",
+                    f"http://{parsed.netloc}/{identifier}",
+                    f"{parsed.netloc}/{identifier}",
+                    f"@{identifier}",
                 ]
                 entity = None
                 for candidate in candidates:
@@ -898,15 +932,15 @@ class Client(object):
                         break
                     except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.SessionRevokedError, errors.UserDeactivatedError, errors.UserDeactivatedBanError) as auth_error:
                         # Re-raise auth related errors immediately so they can be handled upstream
-                        self.logger.error(f"Session invalid/expired or account deactivated while resolving '{username}' using '{candidate}': {auth_error}")
+                        self.logger.error(f"Session invalid/expired or account deactivated while resolving '{identifier}' using '{candidate}': {auth_error}")
                         raise
                     except Exception as e2:
                         last_exc = e2
                         self.logger.debug(f"get_entity failed for candidate '{candidate}': {e2}")
 
                 if entity is None:
-                    self.logger.error(f"Failed to resolve username '{username}' from link {link}. Tried: {tried}. Errors: {e1}, last: {last_exc}")
-                    raise ValueError(f"Cannot resolve username '{username}' from link {link}")
+                    self.logger.error(f"Failed to resolve username '{identifier}' from link {link}. Tried: {tried}. Errors: {e1}, last: {last_exc}")
+                    raise ValueError(f"Cannot resolve username '{identifier}' from link {link}")
 
             chat_id = normalize_chat_id(entity.id)
             return chat_id, message_id, entity  # Return entity to avoid redundant get_entity call
@@ -1127,6 +1161,9 @@ class Client(object):
         """
         await self.ensure_connected()
         
+        # Convert entity to InputPeer to avoid "Could not find input entity" errors
+        input_peer = await self.client.get_input_entity(target_chat)
+        
         # Check subscription status and warn if not subscribed
         chat_id = normalize_chat_id(target_chat.id if hasattr(target_chat, 'id') else target_chat)
         is_subscribed = await self._check_subscription(chat_id)
@@ -1139,7 +1176,7 @@ class Client(object):
             )
         
         await self.client(GetMessagesViewsRequest(
-            peer=target_chat,
+            peer=input_peer,
             id=[message.id],
             increment=True
         ))
@@ -1233,7 +1270,7 @@ class Client(object):
                     # Rate limit reaction sending
                     await rate_limiter.wait_if_needed('send_reaction')
                     await self.client(SendReactionRequest(
-                        peer=target_chat,
+                        peer=input_peer,
                         msg_id=message.id,
                         reaction=[types.ReactionEmoji(emoticon=emoticon)],
                         add_to_recent=True
@@ -1269,7 +1306,7 @@ class Client(object):
                     # Rate limit reaction sending
                     await rate_limiter.wait_if_needed('send_reaction')
                     await self.client(SendReactionRequest(
-                        peer=target_chat,
+                        peer=input_peer,
                         msg_id=message.id,
                         reaction=[types.ReactionEmoji(emoticon=emoticon)],
                         add_to_recent=True
@@ -1295,6 +1332,9 @@ class Client(object):
 
     async def _comment(self, message, target_chat, content, channel: Channel = None):
         await self.ensure_connected()
+        
+        # Convert entity to InputPeer to avoid "Could not find input entity" errors
+        input_peer = await self.client.get_input_entity(target_chat)
         
         # Check subscription requirements for commenting
         chat_id = normalize_chat_id(target_chat.id if hasattr(target_chat, 'id') else target_chat)
@@ -1338,7 +1378,7 @@ class Client(object):
                 )
 
         await self.client(GetMessagesViewsRequest(
-            peer=target_chat,
+            peer=input_peer,
             id=[message.id],
             increment=True
         ))
@@ -1374,8 +1414,11 @@ class Client(object):
     async def _undo_reaction(self, message, target_chat):
         await self.ensure_connected()
         
+        # Convert entity to InputPeer to avoid "Could not find input entity" errors
+        input_peer = await self.client.get_input_entity(target_chat)
+        
         await self.client(GetMessagesViewsRequest(
-            peer=target_chat,
+            peer=input_peer,
             id=[message.id],
             increment=True
         ))
@@ -1385,7 +1428,7 @@ class Client(object):
         # Rate limit reaction removal
         await rate_limiter.wait_if_needed('send_reaction')
         await self.client(SendReactionRequest(
-            peer=target_chat,
+            peer=input_peer,
             msg_id=message.id,
             reaction=[],  # Empty list removes reaction
             add_to_recent=False
@@ -1397,15 +1440,18 @@ class Client(object):
         """
         await self.ensure_connected()
 
+        # Convert entity to InputPeer to avoid "Could not find input entity" errors
+        input_peer = await self.client.get_input_entity(target_chat)
+
         await self.client(GetMessagesViewsRequest(
-            peer=target_chat,
+            peer=input_peer,
             id=[message.id],
             increment=True
         ))
 
         await asyncio.sleep(random.uniform(0.5, 1))  # Prevent spam if everything is broken
         discussion = await self.client(functions.messages.GetDiscussionMessageRequest(
-            peer=target_chat,
+            peer=input_peer,
             msg_id=message.id
         ))
         discussion_chat = discussion.chats[0]
@@ -1424,7 +1470,9 @@ class Client(object):
                 chat_id, message_id, entity = await self.get_message_ids(message_link)
                 # Use entity from get_message_ids if available, otherwise fetch it
                 if entity is None:
-                    entity = await self.get_entity_cached(chat_id)
+                    # Extract username/identifier from link and use that to fetch entity
+                    identifier = self._extract_identifier_from_link(message_link)
+                    entity = await self.get_entity_cached(identifier)
                 
                 # Get or fetch channel data (for consistency, though not strictly needed for undo)
                 channel = await self._get_or_fetch_channel_data(chat_id, entity=entity)
@@ -1452,7 +1500,9 @@ class Client(object):
                 chat_id, message_id, entity = await self.get_message_ids(message_link)
                 # Use entity from get_message_ids if available, otherwise fetch it
                 if entity is None:
-                    entity = await self.get_entity_cached(chat_id)
+                    # Extract username/identifier from link and use that to fetch entity
+                    identifier = self._extract_identifier_from_link(message_link)
+                    entity = await self.get_entity_cached(identifier)
                 
                 # Get or fetch channel data (for consistency)
                 channel = await self._get_or_fetch_channel_data(chat_id, entity=entity)
@@ -1486,7 +1536,10 @@ class Client(object):
                 chat_id, message_id, entity = await self.get_message_ids(message_link)
                 # Use entity from get_message_ids if available, otherwise fetch it
                 if entity is None:
-                    entity = await self.get_entity_cached(chat_id)
+                    # Extract username/identifier from link and use that to fetch entity
+                    # (using raw chat_id doesn't work for channels without access_hash)
+                    identifier = self._extract_identifier_from_link(message_link)
+                    entity = await self.get_entity_cached(identifier)
                 
                 # Get or fetch channel data (minimizes API calls by reusing entity)
                 channel = await self._get_or_fetch_channel_data(chat_id, entity=entity)
@@ -1515,7 +1568,9 @@ class Client(object):
                 chat_id, message_id, entity = await self.get_message_ids(message_link)
                 # Use entity from get_message_ids if available, otherwise fetch it
                 if entity is None:
-                    entity = await self.get_entity_cached(chat_id)
+                    # Extract username/identifier from link and use that to fetch entity
+                    identifier = self._extract_identifier_from_link(message_link)
+                    entity = await self.get_entity_cached(identifier)
                 
                 # Get or fetch channel data (minimizes API calls by reusing entity)
                 channel = await self._get_or_fetch_channel_data(chat_id, entity=entity)
