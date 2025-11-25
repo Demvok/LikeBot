@@ -1,5 +1,7 @@
 from pandas import Timestamp
 import asyncio, random
+from dataclasses import dataclass
+from typing import Optional
 
 from telethon import errors
 from pymongo import errors as mg_errors
@@ -13,6 +15,22 @@ from main_logic.schemas import TaskStatus, status_name
 from auxilary_logic.telethon_error_handler import map_telethon_exception, reporter_payload_from_mapping
 
 config = load_config()
+
+
+@dataclass
+class WorkerResult:
+    """Result of a client worker execution.
+    
+    Attributes:
+        success: True if worker completed its work successfully
+        phone_number: Phone number of the account used by this worker
+        failure_reason: Reason for failure if success is False (e.g., 'account_issue', 'error')
+        error: Optional exception if worker failed due to error
+    """
+    success: bool
+    phone_number: str
+    failure_reason: Optional[str] = None  # 'account_issue', 'error', etc.
+    error: Optional[Exception] = None
 
 
 def _status_name(status) -> str:
@@ -41,8 +59,8 @@ class Task:
         self.task_id = task_id
         self.name = name
         self.description = description
-        self.post_ids = sorted(post_ids)
-        self.accounts = accounts
+        self.post_ids = sorted(post_ids) if post_ids is not None else []
+        self.accounts = accounts if accounts is not None else []
         self.action = action
         self.status = status or Task.TaskStatus.PENDING
         self.created_at = created_at or Timestamp.now()
@@ -269,7 +287,7 @@ class Task:
                 self.logger.info(f"Using {len(accounts)} usable accounts out of {total_accounts} total accounts")
 
                 await self._check_pause(reporter, run_id)
-                self._clients = await Client.connect_clients(accounts, self.logger)
+                self._clients = await Client.connect_clients(accounts, self.logger, task_id=self.task_id)
                 await reporter.event(run_id, self.task_id, "INFO", "info.connecting.client_connect", f"Connected {len(self._clients)} clients.")
 
                 await self._check_pause(reporter, run_id)
@@ -358,10 +376,57 @@ class Task:
                     results = await asyncio.gather(*workers, return_exceptions=True)
                     self.logger.info(f"All workers for task {self.task_id} have finished executing.")
                     await reporter.event(run_id, self.task_id, "INFO", "info.action.workers_finished", "All workers have finished executing.")
-                    for result in results:
+                    
+                    # Analyze worker results to determine task status
+                    successful_workers = 0
+                    account_failure_workers = 0
+                    exception_workers = 0
+                    
+                    for idx, result in enumerate(results):
                         if isinstance(result, Exception):
-                            self.logger.error(f"Error in worker for client {self._clients[results.index(result)].account_id}: {result}")
-                            await reporter.event(run_id, self.task_id, "WARNING", "error.worker_exception", f"Worker for client {self._clients[results.index(result)].account_id} raised an exception: {result}")
+                            # Worker raised an unhandled exception
+                            exception_workers += 1
+                            client_info = self._clients[idx].account_id if idx < len(self._clients) else "unknown"
+                            self.logger.error(f"Error in worker for client {client_info}: {result}")
+                            await reporter.event(run_id, self.task_id, "WARNING", "error.worker_exception", 
+                                               f"Worker for client {client_info} raised an exception: {result}")
+                        elif isinstance(result, WorkerResult):
+                            # Worker returned a result object
+                            if result.success:
+                                successful_workers += 1
+                            elif result.failure_reason == 'account_issue':
+                                account_failure_workers += 1
+                            else:
+                                exception_workers += 1
+                        else:
+                            # Legacy: worker returned without explicit result (assume success)
+                            successful_workers += 1
+                    
+                    total_workers = len(results)
+                    self.logger.info(f"Worker results for task {self.task_id}: {successful_workers} successful, "
+                                   f"{account_failure_workers} account failures, {exception_workers} exceptions "
+                                   f"(total: {total_workers})")
+                    await reporter.event(run_id, self.task_id, "INFO", "info.action.worker_summary",
+                                       f"Worker summary: {successful_workers} successful, {account_failure_workers} account failures, {exception_workers} exceptions",
+                                       {"successful": successful_workers, "account_failures": account_failure_workers, 
+                                        "exceptions": exception_workers, "total": total_workers})
+                    
+                    # Determine final status based on results:
+                    # - If any worker succeeded -> FINISHED
+                    # - If all workers failed due to account issues (no exceptions) -> FAILED
+                    # - If there were exceptions -> CRASHED (handled by done callbacks)
+                    if successful_workers > 0:
+                        self._final_status = Task.TaskStatus.FINISHED
+                    elif account_failure_workers > 0 and exception_workers == 0:
+                        # All failures were due to account issues, task itself ran correctly
+                        self._final_status = Task.TaskStatus.FAILED
+                        self.logger.warning(f"Task {self.task_id} failed: all {account_failure_workers} workers failed due to account issues")
+                        await reporter.event(run_id, self.task_id, "WARNING", "warn.task_failed",
+                                           f"Task failed: all {account_failure_workers} workers failed due to account issues")
+                    else:
+                        # Exception workers present -> will be marked CRASHED by handlers
+                        self._final_status = Task.TaskStatus.CRASHED
+                    
                     workers.clear()
                 
             except asyncio.CancelledError:
@@ -380,17 +445,26 @@ class Task:
                 await self._update_status()
                 raise e
             finally:
-                self._clients = await Client.disconnect_clients(self._clients, self.logger)
+                self._clients = await Client.disconnect_clients(self._clients, self.logger, task_id=self.task_id)
                 self._clients = None
                 self.updated_at = Timestamp.now()
                 self._task = None  # Mark task as finished
             
             await reporter.event(run_id, self.task_id, "INFO", "info.run_end", "Run has ended.")
-            # If you got here - run ended. Only mark FINISHED if not already marked CRASHED
+            # Determine final status based on worker results
+            # Use _final_status if set by worker analysis, otherwise fall back to FINISHED
+            final_status = getattr(self, '_final_status', Task.TaskStatus.FINISHED)
+            
+            # Only update if not already marked CRASHED by exception handlers
             if self.status != Task.TaskStatus.CRASHED:
-                self.status = Task.TaskStatus.FINISHED
+                self.status = final_status
                 await self._update_status()
-                self.logger.info(f"Task {self.task_id} completed successfully.")
+                if self.status == Task.TaskStatus.FINISHED:
+                    self.logger.info(f"Task {self.task_id} completed successfully.")
+                elif self.status == Task.TaskStatus.FAILED:
+                    self.logger.warning(f"Task {self.task_id} failed due to account issues (all workers failed).")
+                else:
+                    self.logger.info(f"Task {self.task_id} ended with status {status_name(self.status)}.")
             else:
                 # status already persisted as CRASHED by callbacks/handlers
                 try:
@@ -401,7 +475,12 @@ class Task:
         await reporter.stop()  # stop reporter and flush            
 
     @crash_handler
-    async def client_worker(self, client: Client, posts: list[Post], reporter: Reporter, run_id):
+    async def client_worker(self, client: Client, posts: list[Post], reporter: Reporter, run_id) -> WorkerResult:
+        """Execute work for a single client across all posts.
+        
+        Returns:
+            WorkerResult indicating success or failure with reason.
+        """
         # CRITICAL: Stagger worker starts to prevent all accounts hitting API simultaneously
         worker_delay_min = config.get('delays', {}).get('worker_start_delay_min', 2)
         worker_delay_max = config.get('delays', {}).get('worker_start_delay_max', 10)
@@ -452,13 +531,13 @@ class Task:
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.2fa_required", 
                                                  f"Client {client.phone_number} requires 2FA password to proceed. Stopping worker.",
                                                  {"client": client.phone_number})
-                            return
+                            return WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue')
                         except (errors.PhoneCodeInvalidError, errors.PhoneCodeExpiredError):  # To move to auth codeblock
                             self.logger.error(f"Client {client.account_id} has invalid or expired phone code. Stopping worker.")
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.phone_code_invalid", 
                                                  f"Client {client.phone_number} has invalid or expired phone code. Stopping worker.",
                                                  {"client": client.phone_number})
-                            return
+                            return WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue')
                         except errors.UserNotParticipantError:
                             self.logger.error(f"Client {client.account_id} is not a participant of the chat for post {post.post_id}. Cannot react. Skipping post.")
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.not_participant", 
@@ -491,7 +570,7 @@ class Task:
                                     self.logger.info(f"Marked account {client.phone_number} as {mapping['status']}")
                             except Exception as update_error:
                                 self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
-                            return
+                            return WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue', error=e)
                         except errors.UserDeactivatedBanError as e:
                             self.logger.error(f"Client {client.account_id} account is deactivated/banned. Stopping worker.")
                             mapping = map_telethon_exception(e)
@@ -506,7 +585,7 @@ class Task:
                                     self.logger.info(f"Marked account {client.phone_number} as {mapping['status']}")
                             except Exception as update_error:
                                 self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
-                            return
+                            return WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue', error=e)
                         except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.SessionRevokedError) as e:
                             self.logger.error(f"Client {client.account_id} has invalid/expired session. Stopping worker.")
                             mapping = map_telethon_exception(e)
@@ -521,7 +600,7 @@ class Task:
                                     self.logger.info(f"Marked account {client.phone_number} as {mapping['status']} due to invalid session")
                             except Exception as update_error:
                                 self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
-                            return
+                            return WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue', error=e)
                         except ConnectionError as e:
                             attempt += 1
                             self.logger.error(f"Client {client.account_id} encountered ConnectionError on post {post.post_id}: {e}. Attempt {attempt}/{retries}")
@@ -589,14 +668,14 @@ class Task:
                                     await client.account.update_status(mapping['status'], error=e)
                                 except Exception as update_error:
                                     self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
-                                return
+                                return WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue', error=e)
                             else:
                                 # Fallback: mark account as ERROR and stop
                                 try:
                                     await client.account.update_status(Account.AccountStatus.ERROR, error=e)
                                 except Exception as update_error:
                                     self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
-                                return
+                                return WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue', error=e)
                     if attempt == retries:   # Optionally, log/report if all retries failed
                         self.logger.error(f"Client {client.account_id} failed to react to post {post.post_id} after {retries} attempts due to repeated FloodWaitError.")
                         await reporter.event(run_id, self.task_id, "ERROR", "error.worker.react.max_retries", f"Client {client.phone_number} failed to react to post {post.post_id} after {retries} FloodWaitError retries.", {"client": client.phone_number, "post_id": post.post_id, "retries": retries})
@@ -615,6 +694,7 @@ class Task:
             pass
 
         await reporter.event(run_id, self.task_id, "INFO", "info.worker", f"Worker finished for client {client.phone_number}")
+        return WorkerResult(success=True, phone_number=client.phone_number)
 
     @crash_handler
     async def _check_pause(self, reporter, run_id):
@@ -636,7 +716,7 @@ class Task:
             self.logger.info(f"Task {self.task_id} resumed. Reconnecting clients...")
             await reporter.event(run_id, self.task_id, "INFO", "info.status", f"Task {self.task_id} is resumed.")
             accounts = await self.get_accounts()
-            self._clients = await Client.connect_clients(accounts, self.logger)
+            self._clients = await Client.connect_clients(accounts, self.logger, task_id=self.task_id)
             await reporter.event(run_id, self.task_id, "INFO", "info.status", f"Successfully reconnected {len(self._clients)} clients.")
 
     @crash_handler
@@ -655,7 +735,7 @@ class Task:
             await self._pause_event.wait()
             await reporter.event(run_id, self.task_id, "DEBUG", "info.worker", f"Worker resumed for client {client.phone_number}.")
             try:
-                await client.connect()
+                await client.connect(task_id=self.task_id)
             except Exception as e:
                 self.logger.warning(f"Error reconnecting client {client.account_id}: {e}")
                 await reporter.event(run_id, self.task_id, "WARNING", "error.worker", f"Worker failed to reconnect for client {client.phone_number}: {e}")

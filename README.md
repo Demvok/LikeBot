@@ -2,18 +2,45 @@
 
 ### TO DO:
 
-- review pauses and retries for flood avoiding
+##### Account health system - stage 1
+- review pauses and retries for flood avoiding - minimize retries?
+- !!!!! Try to cache entity object
+- !!! Rework chaching to be on task scope
+- Map chat_id to chat username and include this to channel parser
+- Add chat "opening" before reacting?
+- fix proxy load balancing
+
+##### Account health system - stage 2
+- review proxy assigning - should be assigning depending on load, but every account has to have list of favourites
+- add .xlsx proxy import
+- add "warming-up" and "cooling" stage for account connect, that should help
+- Review telegram API calls (especially in url parser), e.g. extracting post content and saving it. - triple check it to work with accounts in parallel
+
+##### Account health system - stage 3
+- add special logging of account's action with markers
+- Add health monitor system that catches ban factors and applies limits
+- provide account managing tools - freezing, status check from SpamBot
+
+##### Account health system - stage 4
+- rework task assigning for each account - try to make it more "individualistic"
+- change general task-account linkage - it should be dynamic
+
+
+##### Misc
 - add creation of neccessary files if they dont exist
-- add task status `failed`
 - add report export as .csv/.xlsx
 
-
-#### TO TEST:
-- telegram login process
-- actions in channels - subscribed or not * public or private (8 cases, but actually 4 (see miro))
-- newly added endpoints
+// #### TO TEST:
 
 ## Changelog
+
+### v.1.1.1
+- fixed malformed task object creation on low RAM (cleanup and safe loading)
+- added endpoint and account meta to index channels
+- added endpoint and db method to get all channel's subscribers
+- added bulk get for channels (to view details of account's subscriptions)
+- added account lock on connect attempt when it is already used (may be bugged)
+- added task status `failed` for cases when task failed to finish due to account issues.
 
 ### v.1.1.0
 - massive file refactor for better readability (without actual code changes)

@@ -14,6 +14,7 @@ This document describes the full CRUD API for the LikeBot automation system.
    - [User Management](#user-management)
    - [Log Streaming](#log-streaming)
    - [Accounts CRUD](#accounts-crud)
+   - [Account Locks](#account-locks)
    - [Login Process](#login-process)
    - [Posts CRUD](#posts-crud)
    - [Tasks CRUD](#tasks-crud)
@@ -30,7 +31,7 @@ This document describes the full CRUD API for the LikeBot automation system.
 
 The following notes summarize important changes in the codebase since the previous documented version (1.0.2):
 
-- Bumped API version to **1.1.0** (see health-check response below).
+- Bumped API version to **1.1.1** (see health-check response below).
 - Added CORS support that can be configured via the `frontend_http` environment variable (used by the API to allow frontend origins).
 - Startup now enforces critical environment variables at launch (e.g., `KEK`, `JWT_SECRET_KEY`, `db_url`) and will fail fast if they are missing.
 - The application registers a cleanup handler on process exit to ensure logging/resources are cleaned up (clean shutdown behavior).
@@ -39,9 +40,10 @@ The following notes summarize important changes in the codebase since the previo
 **New Endpoints Added:**
 - **User Management** (Admin only): GET /users, PUT /users/{username}/role, PUT /users/{username}/verify, DELETE /users/{username}
 - **Proxy Management**: Full CRUD for proxy configurations (GET, POST, PUT, DELETE /proxies, GET /proxies/stats/summary)
-- **Channel Management**: Full CRUD for Telegram channels (GET, POST, PUT, DELETE /channels, GET /channels/stats/summary, GET /channels/with-post-counts)
-- **Account-Channel Subscriptions**: GET /accounts/{phone_number}/channels
+- **Channel Management**: Full CRUD for Telegram channels (GET, POST, PUT, DELETE /channels, POST /channels/bulk, GET /channels/{chat_id}/subscribers, GET /channels/stats/summary, GET /channels/with-post-counts)
+- **Account-Channel Subscriptions**: GET /accounts/{phone_number}/channels, POST /accounts/{phone_number}/channels/sync
 - **Reaction Palettes**: Full CRUD for emoji reaction palettes (GET, POST, PUT, DELETE /palettes)
+- **Account Locks**: GET /accounts/locks, GET /accounts/{phone_number}/lock, DELETE /accounts/{phone_number}/lock, DELETE /tasks/{task_id}/locks
 
 Notes: these changes are reflected in the `main.py` implementation. The rest of this document describes the current API surface.
 
@@ -178,11 +180,29 @@ curl -X GET http://localhost:8080/accounts \
   "session_encrypted": "string (optional)",
   "twofa": false,
   "notes": "string (optional)",
-  "status": "NEW|ACTIVE|LOGGED_IN|BANNED|ERROR (optional)",
+  "status": "NEW|ACTIVE|AUTH_KEY_INVALID|BANNED|DEACTIVATED|RESTRICTED|ERROR (optional)",
+  "subscribed_to": ["array of channel chat_ids (optional)"],
+  "last_error": "string (optional, last error message)",
+  "last_error_type": "string (optional, error class name)",
+  "last_error_time": "string (ISO timestamp, optional)",
+  "last_success_time": "string (ISO timestamp, optional)",
+  "last_checked": "string (ISO timestamp, optional)",
+  "flood_wait_until": "string (ISO timestamp, optional)",
+  "last_channel_sync_at": "string (ISO timestamp, optional)",
+  "last_channel_sync_count": "integer (optional)",
   "created_at": "string (ISO timestamp, optional)",
   "updated_at": "string (ISO timestamp, optional)"
 }
 ```
+
+**Account Status Values:**
+- `NEW` - Account created but not logged in
+- `ACTIVE` - Account is healthy and ready to use
+- `AUTH_KEY_INVALID` - Session invalid, needs re-login
+- `BANNED` - Account banned by Telegram
+- `DEACTIVATED` - Account deactivated by Telegram
+- `RESTRICTED` - Account has restrictions
+- `ERROR` - Generic error state
 
 **Note**: For security reasons, password information is not included in account responses. Use the secure password endpoint `/accounts/{phone_number}/password` to retrieve password information when needed.
 
@@ -193,6 +213,7 @@ curl -X GET http://localhost:8080/accounts \
   "message_link": "string",
   "chat_id": "integer (optional)",
   "message_id": "integer (optional)",
+  "is_validated": "boolean (default: false)",
   "created_at": "string (ISO timestamp)",
   "updated_at": "string (ISO timestamp)"
 }
@@ -207,30 +228,36 @@ curl -X GET http://localhost:8080/accounts \
   "post_ids": ["array of integers"],
   "accounts": ["array of phone numbers"],
   "action": {
-    "type": "string (react|comment)",
-    "palette": "string (positive|negative) - for react actions",
-    "content": "string - for comment actions"
+    "type": "string (react|comment|undo_reaction|undo_comment)",
+    "palette": "string (palette name from /palettes) - for react actions",
+    "content": "string (1-4096 chars) - for comment actions"
   },
-  "status": "string (PENDING|RUNNING|PAUSED|FINISHED|CRASHED)",
+  "status": "string (PENDING|RUNNING|PAUSED|FINISHED|FAILED|CRASHED)",
   "created_at": "string (ISO timestamp)",
   "updated_at": "string (ISO timestamp)"
 }
 ```
 
+**Task Status Values:**
+- `PENDING` - Task created but not yet started
+- `RUNNING` - Task is currently executing
+- `PAUSED` - Task execution is paused
+- `FINISHED` - Task completed successfully (at least one worker succeeded)
+- `FAILED` - Task ran correctly but all workers failed due to account issues (banned, session expired, etc.)
+- `CRASHED` - Task encountered infrastructure/system-level errors
+
 ### Proxy
 ```json
 {
   "proxy_name": "string (unique identifier)",
-  "proxy_type": "string (http|https|socks4|socks5)",
+  "type": "string (http|socks4|socks5)",
   "host": "string (IP or hostname)",
   "port": "integer (1-65535)",
   "username": "string (optional)",
-  "password_encrypted": "string (optional, encrypted)",
-  "is_active": "boolean",
-  "current_usage": "integer (number of accounts using this proxy)",
-  "max_usage": "integer (maximum concurrent accounts, optional)",
-  "last_error": "string (optional)",
-  "last_error_time": "string (ISO timestamp, optional)",
+  "rdns": "boolean (resolve DNS remotely, default: true)",
+  "active": "boolean",
+  "connected_accounts": "integer (number of accounts using this proxy)",
+  "notes": "string (optional)",
   "created_at": "string (ISO timestamp)",
   "updated_at": "string (ISO timestamp)"
 }
@@ -282,7 +309,7 @@ Get server status.
 ```json
 {
   "message": "LikeBot API Server is running",
-  "version": "1.1.0"
+  "version": "1.1.1"
 }
 ```
 
@@ -767,6 +794,116 @@ Authorization: Bearer <your_admin_access_token>
 - `403`: User is not admin
 - `404`: Account not found
 - `500`: Failed to decrypt password
+
+---
+
+## Account Locks
+
+Account locking prevents multiple tasks from using the same Telegram account simultaneously. When a task starts, it acquires locks on all accounts it uses. These locks are automatically released when the task completes or is stopped.
+
+### GET /accounts/locks
+Get all currently locked accounts and which tasks hold them.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Response:**
+```json
+{
+  "count": 2,
+  "locks": [
+    {
+      "phone_number": "+1234567890",
+      "task_id": 1,
+      "locked_at": "2025-01-15T10:30:00Z"
+    },
+    {
+      "phone_number": "+0987654321",
+      "task_id": 1,
+      "locked_at": "2025-01-15T10:30:01Z"
+    }
+  ]
+}
+```
+
+### GET /accounts/{phone_number}/lock
+Check if a specific account is currently locked.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Response (locked):**
+```json
+{
+  "phone_number": "+1234567890",
+  "is_locked": true,
+  "task_id": 1,
+  "locked_at": "2025-01-15T10:30:00Z"
+}
+```
+
+**Response (not locked):**
+```json
+{
+  "phone_number": "+1234567890",
+  "is_locked": false,
+  "task_id": null,
+  "locked_at": null
+}
+```
+
+### DELETE /accounts/{phone_number}/lock
+Force release a lock on an account. Use with caution - this may cause issues if a task is actively using the account.
+
+**Authentication**: Required (Admin only)
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Response:**
+```json
+{
+  "message": "Lock on account +1234567890 released successfully",
+  "previous_task_id": 1
+}
+```
+
+**Error Responses:**
+- `401`: Invalid or missing token
+- `403`: User is not admin
+- `404`: Account is not locked
+
+### DELETE /tasks/{task_id}/locks
+Release all account locks held by a specific task. Useful for cleanup after a task crashes or is forcefully stopped.
+
+**Authentication**: Required (Admin only)
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Response:**
+```json
+{
+  "message": "Released 3 locks for task 1",
+  "released_count": 3
+}
+```
+
+**Error Responses:**
+- `401`: Invalid or missing token
+- `403`: User is not admin
 
 ---
 
@@ -1623,24 +1760,43 @@ Error response format:
 
 ## Action Types
 
+Task actions define what operation to perform on posts. Actions are specified in the `action` field when creating or updating tasks.
+
 ### React Action
 ```json
 {
   "type": "react",
-  "palette": "positive"  // or "negative"
+  "palette": "palette_name"
 }
 ```
 
-Available emoji palettes:
-- **positive**: 👍, ❤️, 🔥
-- **negative**: 👎, 😡, 🤬, 🤮, 💩, 🤡
+**Note**: Palettes are dynamically managed via the `/palettes` endpoints. Use `GET /palettes` to see available palettes.
 
 ### Comment Action
 ```json
 {
   "type": "comment",
-  "content": "Your comment text here"
+  "content": "Your comment text here (1-4096 characters)"
 }
+```
+
+### Undo Reaction Action
+```json
+{
+  "type": "undo_reaction"
+}
+```
+
+Removes any reaction previously added by the account.
+
+### Undo Comment Action
+```json
+{
+  "type": "undo_comment"
+}
+```
+
+Deletes any comment previously posted by the account.
 ```
 
 ---
@@ -1661,22 +1817,21 @@ Authorization: Bearer <your_access_token>
 
 **Query Parameters:**
 - `proxy_name` (optional): Filter by proxy name
-- `is_active` (optional): Filter by active status (true/false)
+- `active_only` (optional): Filter by active status (true/false)
 
 **Response:**
 ```json
 [
   {
     "proxy_name": "proxy1",
-    "proxy_type": "socks5",
+    "type": "socks5",
     "host": "192.168.1.100",
     "port": 1080,
     "username": "proxyuser",
-    "is_active": true,
-    "current_usage": 3,
-    "max_usage": 10,
-    "last_error": null,
-    "last_error_time": null,
+    "rdns": true,
+    "active": true,
+    "connected_accounts": 3,
+    "notes": "Primary proxy",
     "created_at": "2025-01-01T00:00:00Z",
     "updated_at": "2025-01-01T00:00:00Z"
   }
@@ -1702,13 +1857,14 @@ Authorization: Bearer <your_access_token>
 ```json
 {
   "proxy_name": "proxy1",
-  "proxy_type": "socks5",
+  "type": "socks5",
   "host": "192.168.1.100",
   "port": 1080,
   "username": "proxyuser",
-  "is_active": true,
-  "current_usage": 3,
-  "max_usage": 10,
+  "rdns": true,
+  "active": true,
+  "connected_accounts": 3,
+  "notes": "Primary proxy",
   "created_at": "2025-01-01T00:00:00Z",
   "updated_at": "2025-01-01T00:00:00Z"
 }
@@ -1731,34 +1887,43 @@ Authorization: Bearer <your_access_token>
 
 **Query Parameters:**
 - `proxy_name` (required): Unique name for the proxy
-- `proxy_type` (required): Type of proxy (http, https, socks4, socks5)
 - `host` (required): Proxy server IP or hostname
 - `port` (required): Proxy server port (1-65535)
+- `proxy_type` (optional, default="socks5"): Type of proxy (http, socks4, socks5)
 - `username` (optional): Proxy authentication username
 - `password` (optional): Proxy authentication password (will be encrypted)
-- `is_active` (optional, default=true): Whether proxy is active
-- `max_usage` (optional): Maximum concurrent accounts allowed
+- `rdns` (optional, default=true): Resolve DNS remotely
+- `active` (optional, default=true): Whether proxy is active
+- `notes` (optional): Optional notes about the proxy
 
 **Example:**
 ```
-POST /proxies?proxy_name=proxy1&proxy_type=socks5&host=192.168.1.100&port=1080&username=user&password=pass
+POST /proxies?proxy_name=proxy1&host=192.168.1.100&port=1080&proxy_type=socks5&username=user&password=pass
 ```
 
-**Response:**
+**Response (201):**
 ```json
 {
-  "message": "Proxy 'proxy1' created successfully",
-  "proxy_name": "proxy1"
+  "proxy_name": "proxy1",
+  "type": "socks5",
+  "host": "192.168.1.100",
+  "port": 1080,
+  "username": "user",
+  "rdns": true,
+  "active": true,
+  "connected_accounts": 0,
+  "created_at": "2025-01-01T00:00:00Z",
+  "updated_at": "2025-01-01T00:00:00Z"
 }
 ```
 
 **Notes:**
 - Password is encrypted server-side before storage
+- Password is never returned in response
 - Proxy name must be unique
 
 **Error Responses:**
-- `400`: Invalid parameters or validation error
-- `409`: Proxy name already exists
+- `400`: Invalid parameters, validation error, or proxy already exists
 
 ---
 
@@ -1773,13 +1938,14 @@ Authorization: Bearer <your_access_token>
 ```
 
 **Query Parameters (all optional):**
-- `proxy_type`: Type of proxy (http, https, socks4, socks5)
 - `host`: Proxy server IP or hostname
 - `port`: Proxy server port (1-65535)
+- `proxy_type`: Type of proxy (http, socks4, socks5)
 - `username`: Proxy authentication username
 - `password`: Proxy authentication password (will be encrypted)
-- `is_active`: Whether proxy is active (true/false)
-- `max_usage`: Maximum concurrent accounts allowed
+- `rdns`: Resolve DNS remotely (true/false)
+- `active`: Whether proxy is active (true/false)
+- `notes`: Notes about the proxy
 
 **Example:**
 ```
@@ -1789,13 +1955,21 @@ PUT /proxies/proxy1?host=192.168.1.101&port=1081
 **Response:**
 ```json
 {
-  "message": "Proxy 'proxy1' updated successfully"
+  "proxy_name": "proxy1",
+  "type": "socks5",
+  "host": "192.168.1.101",
+  "port": 1081,
+  "username": "user",
+  "rdns": true,
+  "active": true,
+  "connected_accounts": 3,
+  "updated_at": "2025-01-01T12:00:00Z"
 }
 ```
 
 **Notes:**
 - Only provided fields will be updated
-- Setting password to empty string clears it
+- Password is never returned in response
 
 **Error Responses:**
 - `404`: Proxy not found
@@ -1822,6 +1996,7 @@ Authorization: Bearer <your_access_token>
 ```
 
 **Error Responses:**
+- `400`: Proxy is in use (has connected accounts)
 - `404`: Proxy not found
 
 ---
@@ -1842,18 +2017,17 @@ Authorization: Bearer <your_access_token>
   "total_proxies": 5,
   "active_proxies": 3,
   "inactive_proxies": 2,
-  "total_usage": 15,
-  "proxies_with_errors": 1,
-  "proxies": [
-    {
-      "proxy_name": "proxy1",
-      "current_usage": 5,
-      "max_usage": 10,
-      "is_active": true,
-      "has_error": false
-    }
-  ]
+  "total_connected_accounts": 15,
+  "least_used_proxy": {
+    "proxy_name": "proxy2",
+    "connected_accounts": 1
+  },
+  "most_used_proxy": {
+    "proxy_name": "proxy1",
+    "connected_accounts": 8
+  }
 }
+```
 ```
 
 ---
@@ -2033,6 +2207,48 @@ Authorization: Bearer <your_access_token>
 
 ---
 
+### POST /channels/bulk
+Get multiple channels by their chat IDs in a single request.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Request Body:**
+```json
+[-1001234567890, 123456789, -1009876543210]
+```
+
+**Response:**
+```json
+[
+  {
+    "chat_id": -1001234567890,
+    "channel_name": "Channel 1",
+    "is_private": false,
+    "tags": ["crypto"],
+    "created_at": "2025-01-01T00:00:00Z"
+  },
+  {
+    "chat_id": -1009876543210,
+    "channel_name": "Channel 2",
+    "is_private": true,
+    "tags": [],
+    "created_at": "2025-01-02T00:00:00Z"
+  }
+]
+```
+
+**Notes:**
+- Accepts both normalized and -100 prefixed chat IDs
+- Returns only channels that exist (may be fewer than requested)
+- Missing channels are silently omitted from response
+
+---
+
 ### POST /channels
 Create a new channel entry.
 
@@ -2201,6 +2417,36 @@ Authorization: Bearer <your_access_token>
 
 ---
 
+### GET /channels/{chat_id}/subscribers
+Get all accounts that are subscribed to a specific channel.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Response:**
+```json
+[
+  {
+    "phone_number": "+1234567890",
+    "account_id": 123456789,
+    "session_name": "user1_session",
+    "status": "ACTIVE",
+    "subscribed_to": [-1001234567890, -1009876543210],
+    "created_at": "2025-01-01T00:00:00Z"
+  }
+]
+```
+
+**Notes:**
+- Accepts both normalized and -100 prefixed chat IDs
+- Returns accounts in secure format (without passwords)
+
+---
+
 ### GET /accounts/{phone_number}/channels
 Get all channels that an account is subscribed to.
 
@@ -2232,10 +2478,49 @@ Authorization: Bearer <your_access_token>
 
 ---
 
+### POST /accounts/{phone_number}/channels/sync
+Sync account's subscribed channels from Telegram.
+
+**Authentication**: Required
+
+**Headers:**
+```
+Authorization: Bearer <your_access_token>
+```
+
+**Description:**
+Connects to Telegram, fetches all channels the account is subscribed to, updates the account's `subscribed_to` field, and upserts channel data to the channels collection.
+
+**Response:**
+```json
+{
+  "message": "Successfully synced 15 channels for account +1234567890",
+  "phone_number": "+1234567890",
+  "channels_count": 15,
+  "chat_ids": [-1001234567890, -1009876543210],
+  "synced_at": "2025-01-01T12:00:00Z"
+}
+```
+
+**Notes:**
+- Requires account to have a valid session (must be logged in first)
+- Updates `last_channel_sync_at` and `last_channel_sync_count` metadata on the account
+- Automatically creates channel entries for newly discovered channels
+
+**Error Responses:**
+- `400`: Account has no valid session
+- `404`: Account not found
+- `500`: Failed to connect to Telegram or sync error
+
+---
+
 ## Notes
 
 1. **Phone Numbers**: Should include country code (e.g., "+1234567890")
 2. **Post Validation**: Posts need to be validated to extract chat_id and message_id from Telegram links
 3. **Task Dependencies**: Tasks require existing accounts and posts
 4. **Async Operations**: Task execution is asynchronous; use status endpoints to monitor progress
-5. **Database Storage**: Supports both file-based storage (JSON/CSV) and MongoDB based on configuration
+5. **Database Storage**: Uses MongoDB with Motor (async driver) for all persistence
+6. **Chat ID Normalization**: Chat IDs are automatically normalized to handle both -100 prefixed and non-prefixed forms
+7. **Account Status Tracking**: Accounts track detailed error information including last_error, last_error_type, and flood_wait_until
+8. **Channel Sync**: Use `/accounts/{phone_number}/channels/sync` to fetch subscribed channels from Telegram
