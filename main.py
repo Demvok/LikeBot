@@ -49,7 +49,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="LikeBot API",
     description="Full API for LikeBot automation",
-    version="1.1.0",
+    version="1.1.1",
     lifespan=lifespan
 )
 
@@ -656,6 +656,114 @@ async def get_account_password(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get account password: {str(e)}")
+
+# ============= ACCOUNT LOCK ENDPOINTS =============
+
+@app.get('/accounts/locks', summary="Get all account locks", tags=["Account Locks"])
+@crash_handler
+async def get_all_account_locks(
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get all currently locked accounts and which tasks hold them.
+    Requires authentication.
+    """
+    lock_manager = get_account_lock_manager()
+    locks = lock_manager.get_all_locks()
+    
+    # Format for API response
+    result = []
+    for phone_number, info in locks.items():
+        result.append({
+            "phone_number": phone_number,
+            "task_id": info.get("task_id"),
+            "locked_at": info.get("locked_at").isoformat() if info.get("locked_at") else None
+        })
+    
+    return {
+        "count": len(result),
+        "locks": result
+    }
+
+
+@app.get('/accounts/{phone_number}/lock', summary="Get account lock status", tags=["Account Locks"])
+@crash_handler
+async def get_account_lock_status(
+    phone_number: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Check if a specific account is currently locked.
+    Requires authentication.
+    """
+    lock_manager = get_account_lock_manager()
+    
+    is_locked = lock_manager.is_locked(phone_number)
+    lock_info = lock_manager.get_lock_info(phone_number)
+    
+    if is_locked and lock_info:
+        return {
+            "phone_number": phone_number,
+            "is_locked": True,
+            "task_id": lock_info.get("task_id"),
+            "locked_at": lock_info.get("locked_at").isoformat() if lock_info.get("locked_at") else None
+        }
+    else:
+        return {
+            "phone_number": phone_number,
+            "is_locked": False,
+            "task_id": None,
+            "locked_at": None
+        }
+
+
+@app.delete('/accounts/{phone_number}/lock', summary="Force release account lock", tags=["Account Locks"])
+@crash_handler
+async def force_release_account_lock(
+    phone_number: str,
+    current_user: dict = Depends(get_current_admin_user)
+):
+    """
+    Force release a lock on an account. Use with caution - this may cause issues 
+    if a task is actively using the account.
+    Requires admin privileges.
+    """
+    lock_manager = get_account_lock_manager()
+    
+    if not lock_manager.is_locked(phone_number):
+        raise HTTPException(status_code=404, detail=f"Account {phone_number} is not locked")
+    
+    lock_info = lock_manager.get_lock_info(phone_number)
+    released = await lock_manager.release(phone_number)
+    
+    if released:
+        return {
+            "message": f"Lock on account {phone_number} released successfully",
+            "previous_task_id": lock_info.get("task_id") if lock_info else None
+        }
+    else:
+        raise HTTPException(status_code=500, detail="Failed to release lock")
+
+
+@app.delete('/tasks/{task_id}/locks', summary="Release all locks for a task", tags=["Account Locks"])
+@crash_handler
+async def release_task_locks(
+    task_id: int,
+    current_user: dict = Depends(get_current_admin_user)
+):
+    """
+    Release all account locks held by a specific task.
+    Useful for cleanup after a task crashes or is forcefully stopped.
+    Requires admin privileges.
+    """
+    lock_manager = get_account_lock_manager()
+    released_count = await lock_manager.release_all_for_task(task_id)
+    
+    return {
+        "message": f"Released {released_count} locks for task {task_id}",
+        "released_count": released_count
+    }
+
 
 # ============= LOGIN PROCESS ENDPOINTS =============
 
@@ -2359,6 +2467,36 @@ async def get_channel(
         raise HTTPException(status_code=500, detail=f"Failed to get channel: {str(e)}")
 
 
+@app.post('/channels/bulk', summary="Get multiple channels by chat_ids", tags=["Channels"])
+@crash_handler
+async def get_channels_bulk(
+    chat_ids: List[int],
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get multiple channels by their chat_ids in a single request.
+    
+    Accepts both normalized and -100 prefixed chat IDs.
+    Returns list of found channels (may be fewer than requested if some don't exist).
+    
+    Request body: List of chat_ids as JSON array
+    Example: [123456789, -1001234567890, 987654321]
+    
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        
+        if not chat_ids:
+            return []
+        
+        channels = await db.get_channels_bulk(chat_ids)
+        return [convert_to_serializable(c.to_dict()) for c in channels]
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get channels: {str(e)}")
+
+
 @app.post('/channels', summary="Create new channel", status_code=201, tags=["Channels"])
 @crash_handler
 async def create_channel(
@@ -2580,6 +2718,33 @@ async def get_channels_with_post_counts(current_user: dict = Depends(get_current
         raise HTTPException(status_code=500, detail=f"Failed to get channels with post counts: {str(e)}")
 
 
+@app.get('/channels/{chat_id}/subscribers', summary="Get accounts subscribed to a channel", tags=["Channels"])
+@crash_handler
+async def get_channel_subscribers(
+    chat_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get all accounts that are subscribed to a specific channel.
+    
+    Accepts both normalized and -100 prefixed chat IDs.
+    Returns list of Account objects (secure format, without passwords).
+    
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        
+        # Get subscribers using native MongoDB query
+        subscribers = await db.get_channel_subscribers(chat_id)
+        
+        # Convert to secure dict format (excludes passwords)
+        return [account.to_dict(secure=True) for account in subscribers]
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get channel subscribers: {str(e)}")
+
+
 @app.get('/accounts/{phone_number}/channels', summary="Get account's subscribed channels", tags=["Accounts"])
 @crash_handler
 async def get_account_subscribed_channels(
@@ -2608,6 +2773,67 @@ async def get_account_subscribed_channels(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get subscribed channels: {str(e)}")
+
+
+@app.post('/accounts/{phone_number}/channels/sync', summary="Sync account's subscribed channels from Telegram", tags=["Accounts"])
+@crash_handler
+async def sync_account_subscribed_channels(
+    phone_number: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Fetch and update all channels that an account is subscribed to from Telegram.
+    
+    This connects to Telegram, fetches all subscribed channels, updates the account's
+    subscribed_to field, and upserts channel data to the channels collection.
+    
+    Returns list of chat_ids that were synced.
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        
+        # Check if account exists
+        account_data = await db.get_account(phone_number)
+        if not account_data:
+            raise HTTPException(status_code=404, detail=f"Account with phone number {phone_number} not found")
+        
+        # Create Account object and Client
+        account = Account.from_dict(account_data)
+        client = Client(account)
+        
+        try:
+            # Connect and fetch subscribed channels
+            await client.connect()
+            chat_ids = await client.fetch_and_update_subscribed_channels()
+            
+            # Record sync metadata in database
+            from datetime import datetime, timezone
+            sync_metadata = {
+                'last_channel_sync_at': datetime.now(timezone.utc),
+                'last_channel_sync_count': len(chat_ids),
+                'updated_at': datetime.now(timezone.utc)
+            }
+            await db.update_account(phone_number, sync_metadata)
+            
+            return {
+                "message": f"Successfully synced {len(chat_ids)} channels for account {phone_number}",
+                "phone_number": phone_number,
+                "channels_count": len(chat_ids),
+                "chat_ids": chat_ids,
+                "synced_at": sync_metadata['last_channel_sync_at'].isoformat()
+            }
+        finally:
+            # Always disconnect client
+            await client.disconnect()
+        
+    except HTTPException:
+        raise
+    except ValueError as e:
+        # No session available - user needs to login first
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to sync subscribed channels: {str(e)}")
 
 
 if __name__ == "__main__":

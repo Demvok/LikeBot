@@ -268,10 +268,25 @@ class MongoStorage():
         logger.info("Loading all accounts from MongoDB.")
         cursor = cls._accounts.find()
         accounts = []
+        skipped_count = 0
         async for acc in cursor:
             acc.pop('_id', None)
-            accounts.append(Account(acc))
-        logger.debug(f"Loaded {len(accounts)} accounts from MongoDB.")
+            # Defensive: wrap Account instantiation to skip malformed records
+            try:
+                accounts.append(Account(acc))
+            except Exception as e:
+                skipped_count += 1
+                logger.error(
+                    f"Skipping malformed account record (phone_number={acc.get('phone_number')}, account_id={acc.get('account_id')}): {e}. "
+                    f"Record data: {acc}"
+                )
+                # Continue loading other accounts instead of crashing
+                continue
+        
+        if skipped_count > 0:
+            logger.warning(f"Loaded {len(accounts)} accounts from MongoDB, skipped {skipped_count} malformed records.")
+        else:
+            logger.debug(f"Loaded {len(accounts)} accounts from MongoDB.")
         return accounts
 
     @classmethod
@@ -343,11 +358,26 @@ class MongoStorage():
         logger.info("Loading all posts from MongoDB.")
         cursor = cls._posts.find()
         posts = []
+        skipped_count = 0
         async for post in cursor:
             post.pop('_id', None)
             post.pop('is_validated', None)
-            posts.append(Post(**post))
-        logger.debug(f"Loaded {len(posts)} posts from MongoDB.")
+            # Defensive: wrap Post instantiation to skip malformed records
+            try:
+                posts.append(Post(**post))
+            except Exception as e:
+                skipped_count += 1
+                logger.error(
+                    f"Skipping malformed post record (post_id={post.get('post_id')}, message_link={post.get('message_link')}): {e}. "
+                    f"Record data: {post}"
+                )
+                # Continue loading other posts instead of crashing
+                continue
+        
+        if skipped_count > 0:
+            logger.warning(f"Loaded {len(posts)} posts from MongoDB, skipped {skipped_count} malformed records.")
+        else:
+            logger.debug(f"Loaded {len(posts)} posts from MongoDB.")
         return posts
 
     @classmethod
@@ -363,12 +393,26 @@ class MongoStorage():
         
         cursor = cls._posts.find()
         posts = []
+        skipped_count = 0
         async for post in cursor:
             post.pop('_id', None)
             post.pop('is_validated', None)
-            posts.append(Post(**post))
+            # Defensive: wrap Post instantiation to skip malformed records
+            try:
+                posts.append(Post(**post))
+            except Exception as e:
+                skipped_count += 1
+                logger.error(
+                    f"Skipping malformed post record (post_id={post.get('post_id')}, message_link={post.get('message_link')}): {e}. "
+                    f"Record data: {post}"
+                )
+                # Continue loading other posts instead of crashing
+                continue
         
-        logger.debug(f"Found {len(posts)} posts")
+        if skipped_count > 0:
+            logger.warning(f"Found {len(posts)} posts, skipped {skipped_count} malformed records")
+        else:
+            logger.debug(f"Found {len(posts)} posts")
         return posts
 
     @classmethod
@@ -547,6 +591,7 @@ class MongoStorage():
         logger.info("Loading all tasks from MongoDB.")
         cursor = cls._tasks.find().sort('updated_at', -1)
         tasks = []
+        skipped_count = 0
         async for task in cursor:
             task.pop('_id', None)
             # Parse timestamps if needed
@@ -562,18 +607,33 @@ class MongoStorage():
                     updated_at = Timestamp(updated_at)
                 except Exception:
                     pass
-            tasks.append(Task(
-                task_id=task.get('task_id'),
-                name=task.get('name'),
-                post_ids=task.get('post_ids'),
-                accounts=task.get('accounts'),
-                action=task.get('action'),
-                description=task.get('description'),
-                status=task.get('status'),
-                created_at=created_at,
-                updated_at=updated_at
-            ))
-        logger.debug(f"Loaded {len(tasks)} tasks from MongoDB.")
+            
+            # Defensive: wrap Task instantiation to skip malformed records
+            try:
+                tasks.append(Task(
+                    task_id=task.get('task_id'),
+                    name=task.get('name'),
+                    post_ids=task.get('post_ids'),
+                    accounts=task.get('accounts'),
+                    action=task.get('action'),
+                    description=task.get('description'),
+                    status=task.get('status'),
+                    created_at=created_at,
+                    updated_at=updated_at
+                ))
+            except Exception as e:
+                skipped_count += 1
+                logger.error(
+                    f"Skipping malformed task record (task_id={task.get('task_id')}, name={task.get('name')}): {e}. "
+                    f"Record data: {task}"
+                )
+                # Continue loading other tasks instead of crashing
+                continue
+        
+        if skipped_count > 0:
+            logger.warning(f"Loaded {len(tasks)} tasks from MongoDB, skipped {skipped_count} malformed records.")
+        else:
+            logger.debug(f"Loaded {len(tasks)} tasks from MongoDB.")
         return tasks
 
     @classmethod
@@ -1220,6 +1280,149 @@ class MongoStorage():
         logger.debug(f"Found {count} verified admin users")
         return count
 
+# --- Database validation and cleanup methods ---
+    @classmethod
+    async def validate_and_report_broken_objects(cls):
+        """
+        Scan all collections for malformed objects and return a report.
+        Does NOT delete or modify any records - only reports issues.
+        
+        Returns:
+            Dictionary with counts and details of broken objects per collection
+        """
+        await cls._ensure_ready()
+        logger.info("Starting database validation scan for malformed objects")
+        
+        report = {
+            'tasks': {'total': 0, 'broken': 0, 'details': []},
+            'accounts': {'total': 0, 'broken': 0, 'details': []},
+            'posts': {'total': 0, 'broken': 0, 'details': []},
+        }
+        
+        # Validate tasks
+        cursor = cls._tasks.find()
+        async for task in cursor:
+            report['tasks']['total'] += 1
+            task_copy = task.copy()
+            task_copy.pop('_id', None)
+            
+            try:
+                # Try to instantiate Task object
+                created_at = task_copy.get('created_at')
+                updated_at = task_copy.get('updated_at')
+                if isinstance(created_at, str):
+                    try:
+                        created_at = Timestamp(created_at)
+                    except Exception:
+                        pass
+                if isinstance(updated_at, str):
+                    try:
+                        updated_at = Timestamp(updated_at)
+                    except Exception:
+                        pass
+                
+                Task(
+                    task_id=task_copy.get('task_id'),
+                    name=task_copy.get('name'),
+                    post_ids=task_copy.get('post_ids'),
+                    accounts=task_copy.get('accounts'),
+                    action=task_copy.get('action'),
+                    description=task_copy.get('description'),
+                    status=task_copy.get('status'),
+                    created_at=created_at,
+                    updated_at=updated_at
+                )
+            except Exception as e:
+                report['tasks']['broken'] += 1
+                report['tasks']['details'].append({
+                    'task_id': task_copy.get('task_id'),
+                    'name': task_copy.get('name'),
+                    'error': str(e),
+                    'error_type': type(e).__name__,
+                    'record': task_copy
+                })
+        
+        # Validate accounts
+        cursor = cls._accounts.find()
+        async for acc in cursor:
+            report['accounts']['total'] += 1
+            acc_copy = acc.copy()
+            acc_copy.pop('_id', None)
+            
+            try:
+                Account(acc_copy)
+            except Exception as e:
+                report['accounts']['broken'] += 1
+                report['accounts']['details'].append({
+                    'phone_number': acc_copy.get('phone_number'),
+                    'account_id': acc_copy.get('account_id'),
+                    'error': str(e),
+                    'error_type': type(e).__name__,
+                    'record': acc_copy
+                })
+        
+        # Validate posts
+        cursor = cls._posts.find()
+        async for post in cursor:
+            report['posts']['total'] += 1
+            post_copy = post.copy()
+            post_copy.pop('_id', None)
+            post_copy.pop('is_validated', None)
+            
+            try:
+                Post(**post_copy)
+            except Exception as e:
+                report['posts']['broken'] += 1
+                report['posts']['details'].append({
+                    'post_id': post_copy.get('post_id'),
+                    'message_link': post_copy.get('message_link'),
+                    'error': str(e),
+                    'error_type': type(e).__name__,
+                    'record': post_copy
+                })
+        
+        # Log summary
+        total_broken = report['tasks']['broken'] + report['accounts']['broken'] + report['posts']['broken']
+        total_objects = report['tasks']['total'] + report['accounts']['total'] + report['posts']['total']
+        
+        logger.info(
+            f"Database validation complete: {total_objects} total objects scanned, {total_broken} malformed objects found. "
+            f"Tasks: {report['tasks']['broken']}/{report['tasks']['total']}, "
+            f"Accounts: {report['accounts']['broken']}/{report['accounts']['total']}, "
+            f"Posts: {report['posts']['broken']}/{report['posts']['total']}"
+        )
+        
+        return report
+
+    @classmethod
+    async def delete_broken_objects(cls, collection_name: str, identifiers: list):
+        """
+        Delete broken objects from a specific collection.
+        Use with caution - this permanently deletes records!
+        
+        Args:
+            collection_name: One of 'tasks', 'accounts', 'posts'
+            identifiers: List of identifiers to delete (task_id, phone_number, or post_id)
+            
+        Returns:
+            Number of deleted objects
+        """
+        await cls._ensure_ready()
+        logger.warning(f"Deleting {len(identifiers)} broken objects from {collection_name}")
+        
+        if collection_name == 'tasks':
+            result = await cls._tasks.delete_many({'task_id': {'$in': identifiers}})
+        elif collection_name == 'accounts':
+            result = await cls._accounts.delete_many({'phone_number': {'$in': identifiers}})
+        elif collection_name == 'posts':
+            result = await cls._posts.delete_many({'post_id': {'$in': identifiers}})
+        else:
+            raise ValueError(f"Invalid collection_name: {collection_name}. Must be 'tasks', 'accounts', or 'posts'")
+        
+        deleted_count = result.deleted_count
+        logger.info(f"Deleted {deleted_count} broken objects from {collection_name}")
+        return deleted_count
+
 # --- Proxy methods ---
     @classmethod
     async def add_proxy(cls, proxy_data: dict):
@@ -1787,6 +1990,42 @@ class MongoStorage():
         return Channel(**channel) if channel else None
 
     @classmethod
+    async def get_channels_bulk(cls, chat_ids: list):
+        """
+        Get multiple channels by their chat_ids in a single query.
+        Accepts both normalized and -100 prefixed forms for each chat_id.
+        
+        Args:
+            chat_ids: List of Telegram chat IDs (with or without -100 prefix)
+            
+        Returns:
+            List of Channel objects found (may be fewer than requested if some don't exist)
+        """
+        await cls._ensure_ready()
+        
+        if not chat_ids:
+            return []
+        
+        # Build list of all possible ID forms (normalized and prefixed) for each chat_id
+        all_possible_ids = []
+        for chat_id in chat_ids:
+            normalized_id = normalize_chat_id(chat_id)
+            prefixed_id = int(f"-100{normalized_id}")
+            all_possible_ids.extend([normalized_id, prefixed_id])
+        
+        logger.info(f"Getting {len(chat_ids)} channels from MongoDB in bulk")
+        
+        # Single query to get all matching channels
+        cursor = cls._channels.find({"chat_id": {"$in": all_possible_ids}})
+        channels = []
+        async for channel in cursor:
+            channel.pop('_id', None)
+            channels.append(Channel(**channel))
+        
+        logger.debug(f"Found {len(channels)} channels out of {len(chat_ids)} requested")
+        return channels
+
+    @classmethod
     async def get_all_channels(cls):
         """
         Get all channels from the database.
@@ -1890,6 +2129,50 @@ class MongoStorage():
         
         logger.debug(f"Found {len(channels)} subscribed channels for account {phone_number}")
         return channels
+
+    @classmethod
+    async def get_channel_subscribers(cls, chat_id: int):
+        """
+        Get all Account objects that are subscribed to a given channel.
+        Uses native MongoDB query on the subscribed_to array field.
+        Searches for both normalized and -100 prefixed forms of chat_id.
+        
+        Args:
+            chat_id: Telegram chat ID (with or without -100 prefix)
+            
+        Returns:
+            List of Account objects subscribed to the channel
+        """
+        await cls._ensure_ready()
+        # Normalize chat_id to handle -100 prefix
+        normalized_id = normalize_chat_id(chat_id)
+        # Also compute the -100 prefixed form
+        prefixed_id = int(f"-100{normalized_id}")
+        
+        logger.info(f"Getting subscribers for channel: {chat_id} (searching for {normalized_id} or {prefixed_id})")
+        
+        # MongoDB natively supports querying array fields - if subscribed_to contains
+        # either the normalized or prefixed form, the account will be returned
+        cursor = cls._accounts.find({
+            "subscribed_to": {"$in": [normalized_id, prefixed_id]}
+        })
+        
+        accounts = []
+        skipped_count = 0
+        async for acc in cursor:
+            acc.pop('_id', None)
+            try:
+                accounts.append(Account(acc))
+            except Exception as e:
+                logger.warning(f"Skipping malformed account during channel subscriber lookup: {e}")
+                skipped_count += 1
+        
+        if skipped_count > 0:
+            logger.warning(f"Found {len(accounts)} subscribers for channel {chat_id}, skipped {skipped_count} malformed records")
+        else:
+            logger.debug(f"Found {len(accounts)} subscribers for channel {chat_id}")
+        
+        return accounts
 
     @classmethod
     async def update_channel(cls, chat_id: int, update_data: dict):

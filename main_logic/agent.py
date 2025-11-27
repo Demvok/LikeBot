@@ -1,28 +1,35 @@
 """
-Telegram account and client management utilities using Telethon.
-Defines Account and Client classes to manage account data, session creation,
-connection lifecycle, and common actions (react/comment/undo).
+Telegram client management utilities using Telethon.
+
+Defines the Client class to manage Telegram connections, session handling,
+and common actions (react/comment/undo).
+
+The Account class has been moved to main_logic/account.py but is re-exported
+here for backwards compatibility.
 """
 
 import os, random, asyncio, time
-from pandas import Timestamp 
 from telethon.tl.functions.messages import SendReactionRequest, GetMessagesViewsRequest
 from telethon import TelegramClient, functions, types, errors
 from telethon.sessions import StringSession
 from utils.logger import setup_logger, load_config
 from dotenv import load_dotenv
-from main_logic.schemas import AccountStatus, status_name
+from main_logic.schemas import AccountStatus
 from auxilary_logic.telethon_error_handler import map_telethon_exception
 from urllib.parse import urlparse, unquote
 from auxilary_logic.encryption import (
     decrypt_secret,
-    encrypt_secret,
-    PURPOSE_PASSWORD,
     PURPOSE_STRING_SESSION,
 )
-from auxilary_logic.humaniser import rate_limiter, estimate_reading_time
+from auxilary_logic.humaniser import rate_limiter, estimate_reading_time, TelegramAPIRateLimiter
 from collections import OrderedDict
 from main_logic.channel import normalize_chat_id, Channel
+
+# Re-export Account for backwards compatibility
+from main_logic.account import Account
+
+# Explicit exports for `from main_logic.agent import *`
+__all__ = ['Account', 'Client', 'TelegramAPIRateLimiter', 'AccountLockManager', 'AccountLockError', 'get_account_lock_manager']
 
 load_dotenv()
 api_id = os.getenv('api_id')
@@ -31,222 +38,182 @@ api_hash = os.getenv('api_hash')
 config = load_config()
 
 
-class Account(object):
+# ============= ACCOUNT LOCKING =============
 
-    AccountStatus = AccountStatus
-    
-    def __init__(self, account_data):
-        try:
-            self.phone_number = account_data.get('phone_number')
-            self.account_id = account_data.get('account_id', None)
-            self.session_name = account_data.get('session_name', None)
-            self.session_encrypted = account_data.get('session_encrypted', None)
-            self.twofa = account_data.get('twofa', False)
-            self.password_encrypted = account_data.get('password_encrypted', None)
-            self.notes = account_data.get('notes', "")
-            self.subscribed_to = account_data.get('subscribed_to', [])
-            self.status = account_data.get('status', self.AccountStatus.NEW)
-            self.created_at = account_data.get('created_at', Timestamp.now())
-            self.updated_at = account_data.get('updated_at', Timestamp.now())
-            
-            # Status tracking fields
-            self.last_error = account_data.get('last_error', None)
-            self.last_error_type = account_data.get('last_error_type', None)
-            self.last_error_time = account_data.get('last_error_time', None)
-            self.last_success_time = account_data.get('last_success_time', None)
-            self.last_checked = account_data.get('last_checked', None)
-            self.flood_wait_until = account_data.get('flood_wait_until', None)
+class AccountLockError(Exception):
+    """Raised when attempting to use an account that is already locked by another task."""
+    def __init__(self, phone_number: str, locked_by_task_id: int, message: str = None):
+        self.phone_number = phone_number
+        self.locked_by_task_id = locked_by_task_id
+        self.message = message or f"Account {phone_number} is already in use by task {locked_by_task_id}"
+        super().__init__(self.message)
 
-        except KeyError as e:
-            raise ValueError(f"Missing key in account configuration: {e}")
 
-        if self.twofa and not self.password_encrypted:
-            raise ValueError("2FA is enabled but no password provided in account configuration.")
-
-        if self.session_name is None:
-            self.session_name = self.phone_number
+class AccountLockManager:
+    """
+    Thread-safe manager for account locks.
     
-    def __repr__(self):
-        return f"Account({self.account_id}, {self.phone_number}, status={self.status})"
+    Tracks which accounts are currently in use by tasks to prevent
+    concurrent access from multiple tasks.
     
-    def __str__(self):
-        return f"Account ID: {self.account_id}, phone: {self.phone_number}, status: {self.status}"
+    Usage:
+        lock_manager = get_account_lock_manager()
+        
+        # Acquire lock (raises AccountLockError if already locked)
+        lock_manager.acquire(phone_number, task_id)
+        
+        # Release lock
+        lock_manager.release(phone_number, task_id)
+        
+        # Check if locked
+        if lock_manager.is_locked(phone_number):
+            info = lock_manager.get_lock_info(phone_number)
+    """
     
-    def is_usable(self) -> bool:
-        """Check if account can be used in tasks."""
-        return AccountStatus.is_usable(self.status)
+    _instance = None
+    _lock = None
     
-    def needs_attention(self) -> bool:
-        """Check if account requires manual intervention."""
-        return AccountStatus.needs_attention(self.status)
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._locks = {}  # {phone_number: {'task_id': int, 'locked_at': datetime}}
+            cls._instance._async_lock = None  # Will be initialized on first use
+        return cls._instance
     
-    async def update_status(self, new_status: AccountStatus, error: Exception = None, success: bool = False):
+    async def _ensure_lock(self):
+        """Ensure async lock is initialized (must be done in async context)."""
+        if self._async_lock is None:
+            import asyncio
+            self._async_lock = asyncio.Lock()
+    
+    async def acquire(self, phone_number: str, task_id: int = None, force: bool = False) -> bool:
         """
-        Update account status and related tracking fields in database.
+        Acquire a lock on an account.
         
         Args:
-            new_status: New AccountStatus to set
-            error: Optional exception that caused the status change
-            success: If True, updates last_success_time
+            phone_number: The phone number of the account to lock
+            task_id: Optional task ID that is acquiring the lock
+            force: If True, forcefully acquire lock even if already locked (use with caution)
+            
+        Returns:
+            True if lock was acquired successfully
+            
+        Raises:
+            AccountLockError: If account is already locked by another task
         """
-        from main_logic.database import get_db
         from datetime import datetime, timezone
         
-        db = get_db()
-        update_data = {
-            'status': status_name(new_status),
-            'last_checked': datetime.now(timezone.utc),
-            'updated_at': datetime.now(timezone.utc)
-        }
+        await self._ensure_lock()
         
-        if error:
-            update_data['last_error'] = str(error)
-            update_data['last_error_type'] = type(error).__name__
-            update_data['last_error_time'] = datetime.now(timezone.utc)
-        
-        if success:
-            update_data['last_success_time'] = datetime.now(timezone.utc)
-            # Clear error fields on success
-            update_data['last_error'] = None
-            update_data['last_error_type'] = None
-        
-        # Update local instance
-        self.status = new_status
-        self.last_checked = update_data['last_checked']
-        if error:
-            self.last_error = update_data['last_error']
-            self.last_error_type = update_data['last_error_type']
-            self.last_error_time = update_data['last_error_time']
-        if success:
-            self.last_success_time = update_data['last_success_time']
-            self.last_error = None
-            self.last_error_type = None
-        
-        # Update database
-        await db.update_account(self.phone_number, update_data)
-    
-    async def set_flood_wait(self, seconds: int, error: Exception = None):
-        """Set flood wait status and expiration time.
-
-        Args:
-            seconds: number of seconds the flood wait will last
-            error: optional exception to record in last_error/last_error_type
-        """
-        from main_logic.database import get_db
-        from datetime import datetime, timezone, timedelta
-        
-        db = get_db()
-        flood_wait_until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
-
-        # The explicit FLOOD_WAIT status was removed from AccountStatus. Use
-        # ERROR to flag the account for attention while still recording the
-        # flood-wait expiration. Record the error details when available.
-        update_payload = {
-            'status': AccountStatus.ERROR.name,
-            'flood_wait_until': flood_wait_until,
-            'last_checked': datetime.now(timezone.utc)
-        }
-        if error:
-            update_payload['last_error'] = str(error)
-            update_payload['last_error_type'] = type(error).__name__
-            update_payload['last_error_time'] = datetime.now(timezone.utc)
-
-        await db.update_account(self.phone_number, update_payload)
-        
-        self.status = AccountStatus.ERROR
-        self.flood_wait_until = flood_wait_until
-        if error:
-            self.last_error = update_payload.get('last_error')
-            self.last_error_type = update_payload.get('last_error_type')
-            self.last_error_time = update_payload.get('last_error_time')
-    
-    def to_dict(self, secure=False):
-        """Convert Account object to dictionary matching AccountDict schema.
-        
-        Args:
-            secure (bool): If True, excludes password_encrypted field for security
-        """
-        base_dict = {
-            'account_id': self.account_id,
-            'session_name': self.session_name,
-            'phone_number': self.phone_number,
-            'session_encrypted': self.session_encrypted,
-            'twofa': self.twofa,
-            'notes': self.notes,
-            'subscribed_to': self.subscribed_to if hasattr(self, 'subscribed_to') else [],
-            'status': status_name(self.status),
-            'created_at': self.created_at,
-            'updated_at': self.updated_at,
-            'last_error': self.last_error,
-            'last_error_type': self.last_error_type,
-            'last_error_time': self.last_error_time,
-            'last_success_time': self.last_success_time,
-            'last_checked': self.last_checked,
-            'flood_wait_until': self.flood_wait_until
-        }
-        
-        if not secure:
-            base_dict['password_encrypted'] = self.password_encrypted
+        async with self._async_lock:
+            if phone_number in self._locks:
+                existing = self._locks[phone_number]
+                existing_task_id = existing.get('task_id')
+                
+                # Same task re-acquiring is OK
+                if existing_task_id == task_id and task_id is not None:
+                    return True
+                
+                if not force:
+                    raise AccountLockError(
+                        phone_number=phone_number,
+                        locked_by_task_id=existing_task_id,
+                        message=f"Account {phone_number} is already in use by task {existing_task_id} (locked since {existing.get('locked_at')})"
+                    )
+                
+                # Force acquire - log warning
+                logger = setup_logger("AccountLock", "main.log")
+                logger.warning(f"Force-acquiring lock on {phone_number} from task {existing_task_id} for task {task_id}")
             
-        return base_dict
+            self._locks[phone_number] = {
+                'task_id': task_id,
+                'locked_at': datetime.now(timezone.utc)
+            }
+            return True
+    
+    async def release(self, phone_number: str, task_id: int = None) -> bool:
+        """
+        Release a lock on an account.
+        
+        Args:
+            phone_number: The phone number of the account to unlock
+            task_id: Optional task ID releasing the lock (for validation)
+            
+        Returns:
+            True if lock was released, False if not locked
+        """
+        await self._ensure_lock()
+        
+        async with self._async_lock:
+            if phone_number not in self._locks:
+                return False
+            
+            existing = self._locks[phone_number]
+            existing_task_id = existing.get('task_id')
+            
+            # Validate task_id if provided
+            if task_id is not None and existing_task_id != task_id:
+                logger = setup_logger("AccountLock", "main.log")
+                logger.warning(
+                    f"Task {task_id} attempted to release lock on {phone_number} "
+                    f"but it was locked by task {existing_task_id}"
+                )
+                return False
+            
+            del self._locks[phone_number]
+            return True
+    
+    async def release_all_for_task(self, task_id: int) -> int:
+        """
+        Release all locks held by a specific task.
+        
+        Args:
+            task_id: The task ID whose locks should be released
+            
+        Returns:
+            Number of locks released
+        """
+        await self._ensure_lock()
+        
+        async with self._async_lock:
+            to_release = [
+                phone for phone, info in self._locks.items()
+                if info.get('task_id') == task_id
+            ]
+            for phone in to_release:
+                del self._locks[phone]
+            return len(to_release)
+    
+    def is_locked(self, phone_number: str) -> bool:
+        """Check if an account is currently locked."""
+        return phone_number in self._locks
+    
+    def get_lock_info(self, phone_number: str) -> dict:
+        """
+        Get lock information for an account.
+        
+        Returns:
+            Dict with 'task_id' and 'locked_at', or None if not locked
+        """
+        return self._locks.get(phone_number)
+    
+    def get_all_locks(self) -> dict:
+        """Get all current locks. Returns a copy to prevent external modification."""
+        return dict(self._locks)
+    
+    async def clear_all(self) -> int:
+        """Clear all locks (use for cleanup/testing). Returns number of locks cleared."""
+        await self._ensure_lock()
+        async with self._async_lock:
+            count = len(self._locks)
+            self._locks.clear()
+            return count
 
-    async def create_connection(self):
-        """Create a TelegramClient connection from account, useful for debugging."""
-        client = Client(self)
-        await client.connect()
-        client.logger.info(f"Client for {self.phone_number} connected successfully.")  # Use self.logger instead of client.logger
-        return client
 
-    async def add_password(self, password):
-        """Add or update the encrypted password for 2FA."""
-        if not password:
-            raise ValueError("Password cannot be empty.")
-        self.password_encrypted = encrypt_secret(password, PURPOSE_PASSWORD)
-        self.twofa = True
-
-        from main_logic.database import get_db  # Avoid circular import if any
-        db = get_db()
-        await db.update_account(self.phone_number, {'password_encrypted': self.password_encrypted, 'twofa': self.twofa})
-
-    @classmethod
-    def from_keys(
-        cls,
-        phone_number,
-        account_id=None,
-        session_name=None,
-        session_encrypted=None,
-        twofa=False,
-        password_encrypted=None,
-        password=None,
-        notes=None,
-        subscribed_to=None,
-        status=None,
-        created_at=None,
-        updated_at=None
-    ):
-        """Create an Account object from keys, matching AccountBase schema."""
-        account_data = {
-            'phone_number': phone_number,
-            'account_id': account_id,
-            'session_name': session_name,
-            'session_encrypted': session_encrypted,
-            'twofa': twofa,
-            'password_encrypted': password_encrypted if password_encrypted else encrypt_secret(password, PURPOSE_PASSWORD) if password else None,
-            'notes': notes if notes is not None else "",
-            'subscribed_to': subscribed_to if subscribed_to is not None else [],
-            'status': status if status is not None else cls.AccountStatus.NEW,
-            'created_at': created_at or Timestamp.now(),
-            'updated_at': updated_at or Timestamp.now()
-        }
-        return cls(account_data)
-
-    @classmethod
-    async def get_accounts(cls, phones:list):
-        """Get a list of Account objects from a list of phone numbers."""
-        from main_logic.database import get_db
-        db = get_db()
-        all_accounts = await db.load_all_accounts()
-        return [elem for elem in all_accounts if elem.phone_number in phones]
+# Singleton accessor
+def get_account_lock_manager() -> AccountLockManager:
+    """Get the singleton AccountLockManager instance."""
+    return AccountLockManager()
 
 
 class Client(object):
@@ -276,6 +243,10 @@ class Client(object):
         self.palette_ordered = False  # Whether to use emojis sequentially or randomly
         
         self.proxy_name = None # Initialize proxy_name as None - will be set during connection
+        
+        # Task context for locking
+        self._task_id = None  # Task ID that owns this client connection
+        self._is_locked = False  # Whether this client holds a lock on the account
         
         # Entity cache with LRU eviction (max 100 entities, 5 min TTL)
         self._entity_cache = OrderedDict()  # {identifier: (entity, timestamp)}
@@ -369,7 +340,31 @@ class Client(object):
             self.logger.error(error_msg)
             raise ValueError(error_msg)
 
-    async def connect(self):
+    async def connect(self, task_id: int = None):
+        """
+        Connect the client to Telegram.
+        
+        Args:
+            task_id: Optional task ID for account locking. If provided, acquires
+                     a lock on this account. If the account is already locked by
+                     another task, logs a warning but continues (best-effort locking).
+        """
+        # Attempt to acquire lock if task_id provided
+        if task_id is not None:
+            self._task_id = task_id
+            lock_manager = get_account_lock_manager()
+            try:
+                await lock_manager.acquire(self.phone_number, task_id)
+                self._is_locked = True
+                self.logger.debug(f"Acquired lock on account {self.phone_number} for task {task_id}")
+            except AccountLockError as e:
+                # Log warning but don't fail - allow task to proceed with caution
+                self.logger.warning(
+                    f"⚠️ ACCOUNT LOCK CONFLICT: {self.phone_number} is already in use by task {e.locked_by_task_id}. "
+                    f"Proceeding anyway, but this may cause issues. Consider pausing the other task first."
+                )
+                self._is_locked = False
+        
         retries = config.get('delays', {}).get('connection_retries', 5)
         delay = config.get('delays', {}).get('reconnect_delay', 3)
         
@@ -547,7 +542,7 @@ class Client(object):
                     raise
 
     async def disconnect(self):
-        """Disconnect the client."""
+        """Disconnect the client and release account lock if held."""
         retries = config.get('delays', {}).get('connection_retries', 5)
         delay = config.get('delays', {}).get('reconnect_delay', 3)
         attempt = 0
@@ -555,6 +550,14 @@ class Client(object):
             try:
                 await self.client.disconnect()
                 self.logger.info(f"Client for {self.phone_number} disconnected.")
+                
+                # Release account lock if we hold one
+                if self._is_locked:
+                    lock_manager = get_account_lock_manager()
+                    released = await lock_manager.release(self.phone_number, self._task_id)
+                    if released:
+                        self.logger.debug(f"Released lock on account {self.phone_number} for task {self._task_id}")
+                    self._is_locked = False
                 
                 # Decrement proxy usage counter if a proxy was used
                 if self.proxy_name:
@@ -572,6 +575,14 @@ class Client(object):
                 if attempt < retries:
                     await asyncio.sleep(delay)
                 else:
+                    # Even on failure, try to release lock
+                    if self._is_locked:
+                        try:
+                            lock_manager = get_account_lock_manager()
+                            await lock_manager.release(self.phone_number, self._task_id)
+                            self._is_locked = False
+                        except Exception:
+                            pass
                     self.logger.critical(f"All disconnection attempts failed for {self.phone_number}. Error: {e}")
                     raise
 
@@ -763,13 +774,26 @@ class Client(object):
 # Mass methods
 
     @classmethod
-    async def connect_clients(cls, accounts: list[Account], logger):
+    async def connect_clients(cls, accounts: list[Account], logger, task_id: int = None):
+        """
+        Connect multiple clients in parallel.
+        
+        Args:
+            accounts: List of Account objects to connect
+            logger: Logger instance for status messages
+            task_id: Optional task ID for account locking. When provided,
+                     each client will attempt to acquire a lock on its account.
+                     
+        Returns:
+            List of connected Client objects, or None if no clients connected
+        """
         if logger:
             logger.info(f"Connecting clients for {len(accounts)} accounts...")
 
         clients = [Client(account) for account in accounts]
         
-        await asyncio.gather(*(client.connect() for client in clients))  # Connect all clients in parallel
+        # Connect all clients in parallel, passing task_id for locking
+        await asyncio.gather(*(client.connect(task_id=task_id) for client in clients))
 
         if logger:
             logger.info(f"Connected clients for {len(clients)} accounts.")
@@ -777,7 +801,19 @@ class Client(object):
         return clients if clients else None
     
     @classmethod
-    async def disconnect_clients(cls, clients: list["Client"], logger):
+    async def disconnect_clients(cls, clients: list["Client"], logger, task_id: int = None):
+        """
+        Disconnect multiple clients in parallel.
+        
+        Args:
+            clients: List of Client objects to disconnect
+            logger: Logger instance for status messages
+            task_id: Optional task ID. If provided and clients failed to disconnect,
+                     will forcefully release all locks for this task as cleanup.
+                     
+        Returns:
+            None to indicate all clients are disconnected
+        """
         if not clients:
             if logger:
                 logger.info("No clients to disconnect.")
@@ -787,6 +823,14 @@ class Client(object):
             logger.info(f"Disconnecting {len(clients)} clients...")
 
         await asyncio.gather(*(client.disconnect() for client in clients))
+
+        # Cleanup: ensure all locks for this task are released
+        # This handles edge cases where disconnect might have failed silently
+        if task_id is not None:
+            lock_manager = get_account_lock_manager()
+            released = await lock_manager.release_all_for_task(task_id)
+            if released > 0 and logger:
+                logger.debug(f"Released {released} remaining locks for task {task_id}")
 
         if logger:
             logger.info(f"Disconnected {len(clients)} clients.")
@@ -1472,7 +1516,7 @@ class Client(object):
                 if entity is None:
                     # Extract username/identifier from link and use that to fetch entity
                     identifier = self._extract_identifier_from_link(message_link)
-                    entity = await self.get_entity_cached(identifier)
+                    entity = await self.get_entity_cached(identifier) # Possible duplicate call
                 
                 # Get or fetch channel data (for consistency, though not strictly needed for undo)
                 channel = await self._get_or_fetch_channel_data(chat_id, entity=entity)
@@ -1539,7 +1583,7 @@ class Client(object):
                     # Extract username/identifier from link and use that to fetch entity
                     # (using raw chat_id doesn't work for channels without access_hash)
                     identifier = self._extract_identifier_from_link(message_link)
-                    entity = await self.get_entity_cached(identifier)
+                    entity = await self.get_entity_cached(identifier)  # Possible duplicate call
                 
                 # Get or fetch channel data (minimizes API calls by reusing entity)
                 channel = await self._get_or_fetch_channel_data(chat_id, entity=entity)

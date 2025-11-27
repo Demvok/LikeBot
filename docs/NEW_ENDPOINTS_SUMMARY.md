@@ -284,6 +284,45 @@ All channel endpoints require authentication via `Depends(get_current_user)`.
 **Description:** Returns list of Channel objects based on the account's subscribed_to list.  
 **Response:** List of channel objects the account is subscribed to
 
+### POST /accounts/{phone_number}/channels/sync
+**Summary:** Sync account's subscribed channels from Telegram  
+**Tags:** Accounts  
+**Authentication:** Required  
+**Parameters:**
+- `phone_number` (path): Phone number of the account
+
+**Description:** Connects to Telegram, fetches all subscribed channels, updates the account's `subscribed_to` field, and upserts channel data to the channels collection. Requires account to have a valid session.
+
+**Response:**
+```json
+{
+  "message": "Successfully synced 15 channels for account +1234567890",
+  "phone_number": "+1234567890",
+  "channels_count": 15,
+  "chat_ids": [-1001234567890, -1009876543210],
+  "synced_at": "2025-01-01T12:00:00Z"
+}
+```
+
+### GET /channels/{chat_id}/subscribers
+**Summary:** Get accounts subscribed to a channel  
+**Tags:** Channels  
+**Authentication:** Required  
+**Parameters:**
+- `chat_id` (path): Telegram chat ID
+
+**Description:** Returns all accounts that are subscribed to the specified channel.  
+**Response:** List of account objects (secure format, without passwords)
+
+### POST /channels/bulk
+**Summary:** Get multiple channels by chat_ids  
+**Tags:** Channels  
+**Authentication:** Required  
+**Request Body:** Array of chat_ids (e.g., `[-1001234567890, 123456789]`)
+
+**Description:** Get multiple channels in a single request. Returns only channels that exist.  
+**Response:** List of channel objects
+
 ---
 
 ## Enhanced Posts Endpoint
@@ -367,7 +406,7 @@ All channel endpoints require authentication via `Depends(get_current_user)`.
 ## Future Enhancements
 
 1. **Pagination:** Add offset/limit parameters for large result sets
-2. **Bulk Operations:** Add bulk endpoints for channels and proxies
+2. **Bulk Operations for Proxies:** Add bulk endpoints for proxy management
 3. **Export/Import:** Add endpoints to export/import channel and proxy configurations
 4. **Analytics:** Enhanced statistics with date ranges and trends
 5. **Webhooks:** Notifications when proxy errors occur or channels are updated

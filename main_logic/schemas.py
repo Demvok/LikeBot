@@ -92,11 +92,21 @@ class AccountStatus(Enum):
 
 
 class TaskStatus(Enum):
-    """Task execution status enumeration."""
+    """Task execution status enumeration.
+    
+    States:
+    - PENDING: Task created but not yet started
+    - RUNNING: Task is currently executing
+    - PAUSED: Task execution is paused
+    - FINISHED: Task completed successfully
+    - FAILED: Task ran correctly but all workers failed due to account issues
+    - CRASHED: Task encountered infrastructure/system-level errors
+    """
     PENDING = auto()
     RUNNING = auto()
     PAUSED = auto()
     FINISHED = auto()
+    FAILED = auto()
     CRASHED = auto()
     
     def __str__(self):
@@ -237,6 +247,10 @@ class AccountBase(BaseModel):
     last_success_time: Optional[datetime] = Field(None, description="Timestamp of last successful operation")
     last_checked: Optional[datetime] = Field(None, description="Last time account status was checked")
     flood_wait_until: Optional[datetime] = Field(None, description="Timestamp until which account is in flood wait")
+    
+    # Channel sync metadata
+    last_channel_sync_at: Optional[datetime] = Field(None, description="Timestamp of last channel sync operation")
+    last_channel_sync_count: Optional[int] = Field(None, description="Number of channels found in last sync")
 
     @field_validator('phone_number')
     def validate_phone_number(cls, v):
@@ -341,6 +355,8 @@ class AccountDict(BaseModel):
     subscribed_to: Optional[List[int]]
     created_at: Optional[Union[str, datetime]]
     updated_at: Optional[Union[str, datetime]]
+    last_channel_sync_at: Optional[Union[str, datetime]] = None
+    last_channel_sync_count: Optional[int] = None
 
     class Config:
         use_enum_values = True
@@ -359,6 +375,8 @@ class AccountDictSecure(BaseModel):
     subscribed_to: Optional[List[int]]
     created_at: Optional[Union[str, datetime]]
     updated_at: Optional[Union[str, datetime]]
+    last_channel_sync_at: Optional[Union[str, datetime]] = None
+    last_channel_sync_count: Optional[int] = None
 
     class Config:
         use_enum_values = True

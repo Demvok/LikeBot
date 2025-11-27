@@ -150,7 +150,7 @@ class Post:
                             validation_succeeded = True
                             if logger:
                                 logger.debug(f"Post {post.post_id} validated successfully with client {client_idx + 1}")
-                            break
+                            break ### Exit the client loop on success
                         else:
                             if logger:
                                 logger.warning(f"Post {post.post_id} validation returned but not validated with client {client_idx + 1}")

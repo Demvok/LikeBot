@@ -19,7 +19,7 @@ class TelegramAPIRateLimiter:
         self._last_call = {}
         # Minimum delay between calls (in seconds)
         self._min_delay = {
-            'get_entity': 0.5,      # 500ms between entity lookups
+            'get_entity': 3,        # 3 seconds between entity lookups
             'get_messages': 0.3,    # 300ms between message fetches
             'send_reaction': 0.5,   # 500ms between reactions
             'send_message': 0.5,    # 500ms between messages
