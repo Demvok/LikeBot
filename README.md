@@ -3,9 +3,8 @@
 ### TO DO:
 
 ##### Account health system - stage 1
-- review pauses and retries for flood avoiding - minimize retries?
 - !!!!! Try to cache entity object
-- !!! Rework chaching to be on task scope
+- !!! Rework caching to be on task scope
 - Map chat_id to chat username and include this to channel parser
 - Add chat "opening" before reacting?
 - fix proxy load balancing
@@ -33,6 +32,9 @@
 // #### TO TEST:
 
 ## Changelog
+
+### v.1.1.2
+- reviewed and standartized pauses and retries for flood avoiding
 
 ### v.1.1.1
 - fixed malformed task object creation on low RAM (cleanup and safe loading)

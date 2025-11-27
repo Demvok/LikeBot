@@ -1,5 +1,5 @@
 from pandas import Timestamp
-import asyncio, random
+import asyncio
 from dataclasses import dataclass
 from typing import Optional
 
@@ -13,6 +13,7 @@ from auxilary_logic.reporter import Reporter
 from utils.logger import setup_logger, load_config, crash_handler, handle_task_exception
 from main_logic.schemas import TaskStatus, status_name
 from auxilary_logic.telethon_error_handler import map_telethon_exception, reporter_payload_from_mapping
+from utils.retry import get_retry_config, get_delay_config, random_delay, WorkerRetryContext, ActionOutcome
 
 config = load_config()
 
@@ -151,6 +152,15 @@ class Task:
         db = get_db()
         await db.update_task(self.task_id, {'status': status_name(self.status)})
 
+    async def _update_account_status_from_mapping(self, client, mapping: dict, error: Exception):
+        """Helper to update account status based on telethon error mapping."""
+        try:
+            if mapping.get('status'):
+                await client.account.update_status(mapping['status'], error=error)
+                self.logger.info(f"Marked account {client.phone_number} as {mapping['status']}")
+        except Exception as update_error:
+            self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
+
     async def _mark_crashed(self, exc: Exception | None = None, context: str | None = None):
         """Mark the task as crashed and persist status to DB.
 
@@ -270,7 +280,7 @@ class Task:
                 if unusable_accounts:
                     unusable_details = [f"{acc.phone_number} ({status_name(acc.status)})" for acc in unusable_accounts]
                     self.logger.warning(f"Excluding {len(unusable_accounts)}/{total_accounts} accounts with unusable status: {', '.join(unusable_details)}")
-                    await reporter.event(run_id, self.task_id, "WARNING", "warn.accounts_filtered", 
+                    await reporter.event(run_id, self.task_id, "ERROR", "error.accounts_filtered", 
                                        f"Excluding {len(unusable_accounts)}/{total_accounts} accounts with unusable status",
                                        {"excluded_accounts": unusable_details, "total": total_accounts, "usable": len(usable_accounts)})
                 
@@ -482,11 +492,7 @@ class Task:
             WorkerResult indicating success or failure with reason.
         """
         # CRITICAL: Stagger worker starts to prevent all accounts hitting API simultaneously
-        worker_delay_min = config.get('delays', {}).get('worker_start_delay_min', 2)
-        worker_delay_max = config.get('delays', {}).get('worker_start_delay_max', 10)
-        start_delay = random.uniform(worker_delay_min, worker_delay_max)
-        self.logger.info(f"Worker for {client.phone_number} starting in {start_delay:.2f}s (anti-spam stagger)")
-        await asyncio.sleep(start_delay)
+        await random_delay('worker_start_delay_min', 'worker_start_delay_max', self.logger, f"Worker for {client.phone_number} starting after stagger delay")
         
         await reporter.event(run_id, self.task_id, "INFO", "info.worker", f"Worker started for client {client.phone_number}")
         if self.get_action_type() == 'react':
@@ -497,12 +503,14 @@ class Task:
             palette_ordered = getattr(client, 'palette_ordered', False)
             self.logger.debug(f"Client {client.phone_number} using palette with {len(palette)} emojis, ordered={palette_ordered}")
             
-            retries = config.get('delays', {}).get('action_retries', 5)
+            ctx = WorkerRetryContext(logger=self.logger)
+            
             for post in posts:
                 client = await self._check_pause_single(client, reporter, run_id)  # Check pause before each post
                 if post.is_validated:
-                    attempt = 0
-                    while attempt < retries:
+                    ctx.reset_for_item()
+                    
+                    while ctx.should_retry():
                         try:
                             # Use message_link for proper entity resolution (username-based links resolve better than bare IDs)
                             await client.react(message_link=post.message_link)
@@ -510,182 +518,138 @@ class Task:
                             await reporter.event(run_id, self.task_id, "DEBUG", "info.worker.react", 
                                                  f"Client {client.phone_number} reacted to post {post.post_id} with {self.get_reaction_palette_name()}",
                                                  {"client": client.phone_number, "post_id": post.post_id, "palette": self.get_reaction_palette_name()})
-                            break  # Success, exit retry loop
+                            ctx.success()
                         except errors.FloodWaitError as e:
-                            attempt += 1
                             wait_seconds = e.seconds
                             required_sleep = wait_seconds + 5
-                            self.logger.error(f"Client {client.account_id} hit FloodWaitError on post {post.post_id}: wait for {wait_seconds} seconds. Attempt {attempt}/{retries}")
+                            self.logger.error(f"Client {client.account_id} hit FloodWaitError on post {post.post_id}: wait for {wait_seconds} seconds. Attempt {ctx.attempt + 1}/{ctx.max_retries}")
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.flood_wait", 
-                                                 f"Client {client.phone_number} hit FloodWaitError on post {post.post_id}: wait for {wait_seconds} seconds. Attempt {attempt}/{retries}",
-                                                 {"client": client.phone_number, "post_id": post.post_id, "wait_seconds": wait_seconds, "required_sleep": required_sleep, "attempt": attempt, "flood_wait_seconds": wait_seconds})
-                            # Update account with flood wait status
+                                                 f"Client {client.phone_number} hit FloodWaitError on post {post.post_id}: wait for {wait_seconds} seconds.",
+                                                 {"client": client.phone_number, "post_id": post.post_id, "wait_seconds": wait_seconds, "attempt": ctx.attempt + 1, "flood_wait_seconds": wait_seconds})
                             try:
                                 await client.account.set_flood_wait(wait_seconds, error=e)
                                 self.logger.info(f"Marked account {client.phone_number} as ERROR due to flood-wait until {wait_seconds}s from now (flood_wait_until set)")
                             except Exception as update_error:
                                 self.logger.warning(f"Failed to update flood wait status for {client.phone_number}: {update_error}")
-                            await asyncio.sleep(required_sleep)  # Sleep for the required time plus a buffer
-                        except errors.SessionPasswordNeededError:
-                            self.logger.error(f"Client {client.account_id} requires 2FA password to proceed. Stopping worker.")
+                            await asyncio.sleep(required_sleep)  # Custom sleep for flood wait
+                            await ctx.retry(e, delay=False)  # Already slept
+                        except errors.SessionPasswordNeededError as e:
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.2fa_required", 
-                                                 f"Client {client.phone_number} requires 2FA password to proceed. Stopping worker.",
+                                                 f"Client {client.phone_number} requires 2FA password. Stopping worker.",
                                                  {"client": client.phone_number})
-                            return WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue')
-                        except (errors.PhoneCodeInvalidError, errors.PhoneCodeExpiredError):  # To move to auth codeblock
-                            self.logger.error(f"Client {client.account_id} has invalid or expired phone code. Stopping worker.")
+                            return ctx.stop(e, f"Client {client.account_id} requires 2FA password. Stopping worker.",
+                                          WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue'))
+                        except (errors.PhoneCodeInvalidError, errors.PhoneCodeExpiredError) as e:
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.phone_code_invalid", 
-                                                 f"Client {client.phone_number} has invalid or expired phone code. Stopping worker.",
+                                                 f"Client {client.phone_number} has invalid/expired phone code. Stopping worker.",
                                                  {"client": client.phone_number})
-                            return WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue')
-                        except errors.UserNotParticipantError:
-                            self.logger.error(f"Client {client.account_id} is not a participant of the chat for post {post.post_id}. Cannot react. Skipping post.")
+                            return ctx.stop(e, f"Client {client.account_id} has invalid/expired phone code. Stopping worker.",
+                                          WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue'))
+                        except errors.UserNotParticipantError as e:
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.not_participant", 
-                                                 f"Client {client.phone_number} is not a participant of the chat for post {post.post_id}. Cannot react. Skipping post.",
+                                                 f"Client {client.phone_number} is not a participant. Skipping post.",
                                                  {"client": client.phone_number, "post_id": post.post_id})
-                            break  # Skip to next post
-                        except errors.ChatAdminRequiredError:
-                            self.logger.error(f"Client {client.account_id} requires admin privileges to react in the chat for post {post.post_id}. Skipping post.")
+                            ctx.skip(e, f"Client {client.account_id} is not a participant. Skipping post {post.post_id}.")
+                        except errors.ChatAdminRequiredError as e:
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.admin_required", 
-                                                 f"Client {client.phone_number} requires admin privileges to react in the chat for post {post.post_id}. Skipping post.",
+                                                 f"Client {client.phone_number} requires admin privileges. Skipping post.",
                                                  {"client": client.phone_number, "post_id": post.post_id})
-                            break
-                        except errors.ChannelPrivateError:
-                            self.logger.error(f"Client {client.account_id} cannot access the chat for post {post.post_id} (channel might be private). Skipping post.")
+                            ctx.skip(e, f"Client {client.account_id} requires admin privileges. Skipping post {post.post_id}.")
+                        except errors.ChannelPrivateError as e:
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.channel_private", 
-                                                 f"Client {client.phone_number} cannot access the chat for post {post.post_id} (channel might be private). Skipping post.",
+                                                 f"Client {client.phone_number} cannot access private channel. Skipping post.",
                                                  {"client": client.phone_number, "post_id": post.post_id})
-                            break
+                            ctx.skip(e, f"Client {client.account_id} cannot access private channel. Skipping post {post.post_id}.")
                         except errors.PhoneNumberBannedError as e:
-                            self.logger.error(f"Client {client.account_id} is banned. Stopping worker.")
                             mapping = map_telethon_exception(e)
                             payload = reporter_payload_from_mapping(mapping, e, {"client": client.phone_number})
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.phone_banned",
-                                                 f"Client {client.phone_number} is banned. Stopping worker.",
-                                                 payload)
-                            # Update account status using centralized mapping
-                            try:
-                                if mapping.get('status'):
-                                    await client.account.update_status(mapping['status'], error=e)
-                                    self.logger.info(f"Marked account {client.phone_number} as {mapping['status']}")
-                            except Exception as update_error:
-                                self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
-                            return WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue', error=e)
+                                                 f"Client {client.phone_number} is banned. Stopping worker.", payload)
+                            await self._update_account_status_from_mapping(client, mapping, e)
+                            return ctx.stop(e, f"Client {client.account_id} is banned. Stopping worker.",
+                                          WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue', error=e))
                         except errors.UserDeactivatedBanError as e:
-                            self.logger.error(f"Client {client.account_id} account is deactivated/banned. Stopping worker.")
                             mapping = map_telethon_exception(e)
                             payload = reporter_payload_from_mapping(mapping, e, {"client": client.phone_number})
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.user_deactivated_ban",
-                                                 f"Client {client.phone_number} account is deactivated/banned. Stopping worker.",
-                                                 payload)
-                            # Update account status using centralized mapping
-                            try:
-                                if mapping.get('status'):
-                                    await client.account.update_status(mapping['status'], error=e)
-                                    self.logger.info(f"Marked account {client.phone_number} as {mapping['status']}")
-                            except Exception as update_error:
-                                self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
-                            return WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue', error=e)
+                                                 f"Client {client.phone_number} is deactivated/banned. Stopping worker.", payload)
+                            await self._update_account_status_from_mapping(client, mapping, e)
+                            return ctx.stop(e, f"Client {client.account_id} is deactivated/banned. Stopping worker.",
+                                          WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue', error=e))
                         except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.SessionRevokedError) as e:
-                            self.logger.error(f"Client {client.account_id} has invalid/expired session. Stopping worker.")
                             mapping = map_telethon_exception(e)
                             payload = reporter_payload_from_mapping(mapping, e, {"client": client.phone_number})
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.session_invalid",
-                                                 f"Client {client.phone_number} has invalid/expired session. Stopping worker.",
-                                                 payload)
-                            # Update account status using centralized mapping
-                            try:
-                                if mapping.get('status'):
-                                    await client.account.update_status(mapping['status'], error=e)
-                                    self.logger.info(f"Marked account {client.phone_number} as {mapping['status']} due to invalid session")
-                            except Exception as update_error:
-                                self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
-                            return WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue', error=e)
+                                                 f"Client {client.phone_number} has invalid/expired session. Stopping worker.", payload)
+                            await self._update_account_status_from_mapping(client, mapping, e)
+                            return ctx.stop(e, f"Client {client.account_id} has invalid/expired session. Stopping worker.",
+                                          WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue', error=e))
                         except ConnectionError as e:
-                            attempt += 1
-                            self.logger.error(f"Client {client.account_id} encountered ConnectionError on post {post.post_id}: {e}. Attempt {attempt}/{retries}")
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.connection_error", 
-                                                 f"Client {client.phone_number} encountered ConnectionError on post {post.post_id}: {e}. Attempt {attempt}/{retries}",
-                                                 {"client": client.phone_number, "post_id": post.post_id, "error": str(e), "attempt": attempt})
-                            await asyncio.sleep(5)
+                                                 f"Client {client.phone_number} ConnectionError on post {post.post_id}. Attempt {ctx.attempt + 1}/{ctx.max_retries}",
+                                                 {"client": client.phone_number, "post_id": post.post_id, "error": str(e), "attempt": ctx.attempt + 1})
+                            await ctx.retry(e)
                         except TimeoutError as e:
-                            attempt += 1
-                            self.logger.error(f"Client {client.account_id} encountered TimeoutError on post {post.post_id}: {e}. Attempt {attempt}/{retries}")
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.timeout_error", 
-                                                 f"Client {client.phone_number} encountered TimeoutError on post {post.post_id}: {e}. Attempt {attempt}/{retries}",
-                                                 {"client": client.phone_number, "post_id": post.post_id, "error": str(e), "attempt": attempt})
-                            await asyncio.sleep(5)
+                                                 f"Client {client.phone_number} TimeoutError on post {post.post_id}. Attempt {ctx.attempt + 1}/{ctx.max_retries}",
+                                                 {"client": client.phone_number, "post_id": post.post_id, "error": str(e), "attempt": ctx.attempt + 1})
+                            await ctx.retry(e)
                         except errors.RPCError as e:
-                            attempt += 1
-                            self.logger.error(f"Client {client.account_id} encountered RPCError on post {post.post_id}: {e}. Attempt {attempt}/{retries}")
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.rpc_error", 
-                                                 f"Client {client.phone_number} encountered RPCError on post {post.post_id}: {e}. Attempt {attempt}/{retries}",
-                                                 {"client": client.phone_number, "post_id": post.post_id, "error": str(e), "attempt": attempt})
-                            await asyncio.sleep(5)
+                                                 f"Client {client.phone_number} RPCError on post {post.post_id}. Attempt {ctx.attempt + 1}/{ctx.max_retries}",
+                                                 {"client": client.phone_number, "post_id": post.post_id, "error": str(e), "attempt": ctx.attempt + 1})
+                            await ctx.retry(e)
                         except errors.ServerError as e:
-                            attempt += 1
-                            self.logger.error(f"Client {client.account_id} encountered ServerError on post {post.post_id}: {e}. Attempt {attempt}/{retries}")
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.server_error", 
-                                                 f"Client {client.phone_number} encountered ServerError on post {post.post_id}: {e}. Attempt {attempt}/{retries}",
-                                                 {"client": client.phone_number, "post_id": post.post_id, "error": str(e), "attempt": attempt})
-                            await asyncio.sleep(5)
-                        except errors.MessageIdInvalidError:
-                            self.logger.error(f"Client {client.account_id} encountered MessageIdInvalidError on post {post.post_id}. Skipping post.")
+                                                 f"Client {client.phone_number} ServerError on post {post.post_id}. Attempt {ctx.attempt + 1}/{ctx.max_retries}",
+                                                 {"client": client.phone_number, "post_id": post.post_id, "error": str(e), "attempt": ctx.attempt + 1})
+                            await ctx.retry(e)
+                        except errors.MessageIdInvalidError as e:
                             await reporter.event(run_id, self.task_id, "ERROR", "error.worker.message_id_invalid", 
-                                                 f"Client {client.phone_number} encountered MessageIdInvalidError on post {post.post_id}. Skipping post.",
+                                                 f"Client {client.phone_number} MessageIdInvalidError on post {post.post_id}. Skipping post.",
                                                  {"client": client.phone_number, "post_id": post.post_id})
-                            break
+                            ctx.skip(e, f"Client {client.account_id} MessageIdInvalidError. Skipping post {post.post_id}.")
                         except ValueError as e:
-                            # Catches entity resolution errors like "Could not find the input entity"
                             if "Could not find the input entity" in str(e) or "PeerUser" in str(e):
-                                self.logger.error(f"Client {client.account_id} could not resolve entity for post {post.post_id} (invalid chat_id or broken message link). Skipping post.")
                                 await reporter.event(run_id, self.task_id, "ERROR", "error.worker.entity_not_found", 
-                                                     f"Client {client.phone_number} could not resolve entity for post {post.post_id}. Possibly invalid chat_id or message link. Skipping post.",
+                                                     f"Client {client.phone_number} could not resolve entity for post {post.post_id}. Skipping post.",
                                                      {"client": client.phone_number, "post_id": post.post_id, "error": str(e)})
-                                break
+                                ctx.skip(e, f"Client {client.account_id} could not resolve entity. Skipping post {post.post_id}.")
                             else:
-                                # Other ValueError - raise it
                                 raise
                         except Exception as e:
                             # Centralized mapping for unknown/other exceptions
-                            self.logger.warning(f"Client {client.account_id} failed to react to post {post.post_id}: {e}")
                             mapping = map_telethon_exception(e)
                             payload = reporter_payload_from_mapping(mapping, e, {"client": client.phone_number, "post_id": post.post_id})
-                            # Report event including message code and details
-                            await reporter.event(run_id, self.task_id, "WARNING", "error.worker.react", f"Client {client.phone_number} failed to react to post {post.post_id}: {e}", payload)
-
-                            # Decide next action based on mapping
+                            await reporter.event(run_id, self.task_id, "WARNING", "error.worker.react", 
+                                               f"Client {client.phone_number} failed to react to post {post.post_id}: {e}", payload)
+                            
                             action = mapping.get('action')
-                            if action == 'retry' and attempt < retries:
-                                attempt += 1
-                                await asyncio.sleep(5)
-                                continue
+                            if action == 'retry':
+                                await ctx.retry(e, f"Client {client.account_id} failed (mapped action=retry)")
                             elif action == 'ignore':
-                                break
+                                ctx.skip(e, f"Client {client.account_id} failed (mapped action=ignore). Skipping post.")
                             elif mapping.get('status'):
-                                # Mark account with mapped status and stop worker
-                                try:
-                                    await client.account.update_status(mapping['status'], error=e)
-                                except Exception as update_error:
-                                    self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
-                                return WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue', error=e)
+                                await self._update_account_status_from_mapping(client, mapping, e)
+                                return ctx.stop(e, f"Client {client.account_id} failed with status update. Stopping worker.",
+                                              WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue', error=e))
                             else:
-                                # Fallback: mark account as ERROR and stop
                                 try:
                                     await client.account.update_status(Account.AccountStatus.ERROR, error=e)
-                                except Exception as update_error:
-                                    self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
-                                return WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue', error=e)
-                    if attempt == retries:   # Optionally, log/report if all retries failed
-                        self.logger.error(f"Client {client.account_id} failed to react to post {post.post_id} after {retries} attempts due to repeated FloodWaitError.")
-                        await reporter.event(run_id, self.task_id, "ERROR", "error.worker.react.max_retries", f"Client {client.phone_number} failed to react to post {post.post_id} after {retries} FloodWaitError retries.", {"client": client.phone_number, "post_id": post.post_id, "retries": retries})
+                                except Exception:
+                                    pass
+                                return ctx.stop(e, f"Client {client.account_id} failed with unknown error. Stopping worker.",
+                                              WorkerResult(success=False, phone_number=client.phone_number, failure_reason='account_issue', error=e))
+                    
+                    # Log if all retries exhausted
+                    if ctx.retries_exhausted:
+                        self.logger.error(f"Client {client.account_id} failed to react to post {post.post_id} after {ctx.max_retries} attempts.")
+                        await reporter.event(run_id, self.task_id, "ERROR", "error.worker.react.max_retries", 
+                                           f"Client {client.phone_number} failed to react to post {post.post_id} after {ctx.max_retries} retries.", 
+                                           {"client": client.phone_number, "post_id": post.post_id, "retries": ctx.max_retries})
                 
                 # CRITICAL: Add delay between reactions to prevent spam detection
-                min_delay = config.get('delays', {}).get('min_delay_between_reactions', 3)
-                max_delay = config.get('delays', {}).get('max_delay_between_reactions', 8)
-                inter_reaction_delay = random.uniform(min_delay, max_delay)
-                self.logger.debug(f"Waiting {inter_reaction_delay:.2f}s before next reaction (anti-spam delay)")
-                await asyncio.sleep(inter_reaction_delay)
+                await random_delay('min_delay_between_reactions', 'max_delay_between_reactions', self.logger, "Inter-reaction delay")
 
 
         if self.get_action_type() == 'comment':  # Logic to handle comment actions can be added here

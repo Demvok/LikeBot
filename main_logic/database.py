@@ -427,8 +427,9 @@ class MongoStorage():
             # Use a small retry loop in case of rare DuplicateKey after allocation
             from pymongo import ReturnDocument
             from pymongo.errors import DuplicateKeyError
-
-            for attempt in range(3):
+            
+            id_retries = config.get('database', {}).get('id_allocation_retries', 3)
+            for attempt in range(id_retries):
                 seq_doc = await cls._counters.find_one_and_update(
                     {"_id": "post_id"}, {"$inc": {"seq": 1}}, upsert=True,
                     return_document=ReturnDocument.AFTER
@@ -464,7 +465,8 @@ class MongoStorage():
 
         post.pop('_id', None)
         from pymongo.errors import DuplicateKeyError
-        for attempt in range(3):
+        id_retries = config.get('database', {}).get('id_allocation_retries', 3)
+        for attempt in range(id_retries):
             try:
                 await cls._posts.insert_one(post)
                 logger.debug("Post with post_id %s added to MongoDB.", post_id)
@@ -648,8 +650,9 @@ class MongoStorage():
         if not task_id:
             from pymongo import ReturnDocument
             from pymongo.errors import DuplicateKeyError
-
-            for attempt in range(3):
+            
+            id_retries = config.get('database', {}).get('id_allocation_retries', 3)
+            for attempt in range(id_retries):
                 seq_doc = await cls._counters.find_one_and_update(
                     {"_id": "task_id"}, {"$inc": {"seq": 1}}, upsert=True,
                     return_document=ReturnDocument.AFTER
@@ -686,8 +689,9 @@ class MongoStorage():
         # Insert with duplicate-key retry in case of race
         from pymongo.errors import DuplicateKeyError
         from pymongo import ReturnDocument
-
-        for attempt in range(3):
+        
+        id_retries = config.get('database', {}).get('id_allocation_retries', 3)
+        for attempt in range(id_retries):
             try:
                 await cls._tasks.insert_one(task)
                 logger.debug("Task with task_id %s added to MongoDB.", task_id)

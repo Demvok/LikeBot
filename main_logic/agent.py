@@ -24,6 +24,7 @@ from auxilary_logic.encryption import (
 from auxilary_logic.humaniser import rate_limiter, estimate_reading_time, TelegramAPIRateLimiter
 from collections import OrderedDict
 from main_logic.channel import normalize_chat_id, Channel
+from utils.retry import RetryContext, get_retry_config, get_delay_config, random_delay
 
 # Re-export Account for backwards compatibility
 from main_logic.account import Account
@@ -365,9 +366,6 @@ class Client(object):
                 )
                 self._is_locked = False
         
-        retries = config.get('delays', {}).get('connection_retries', 5)
-        delay = config.get('delays', {}).get('reconnect_delay', 3)
-        
         # Proxy configuration
         proxy_mode = config.get('proxy', {}).get('mode', 'soft')  # 'strict' or 'soft'
         
@@ -376,215 +374,221 @@ class Client(object):
         proxy_assigned = False
         proxy_failed = False
         
-        for attempt in range(1, retries + 1):
-            try:    
-                # Try to get session only once per connect() call, unless we need to force a new one
-                if not session_created or force_new_session:
-                    try:
-                        session = await self._get_session(force_new=force_new_session)
-                        session_created = True
-                        force_new_session = False  # Reset the flag
-                    except Exception as e:
-                        self.logger.error(f"Session creation failed: {e}")
-                        # Don't retry session creation here - it has its own retry logic
-                        raise
-                
-                # Get proxy configuration (skip if proxy already failed in strict mode)
-                if proxy_mode == 'strict' and proxy_failed:
-                    raise ConnectionError("Strict proxy mode: Proxy connection failed, cannot proceed")
-                
-                # Get proxy (or None if soft mode and proxy previously failed)
-                if proxy_failed and proxy_mode == 'soft':
-                    proxy_candidates, proxy_data = None, None
-                    self.logger.info(f"Connecting without proxy (fallback after proxy failure)")
-                else:
-                    proxy_candidates, proxy_data = await self._get_proxy_config()
-                    if proxy_candidates:
-                        self.logger.info(f"Connecting with proxy record: {proxy_data.get('proxy_name')}")
+        async with RetryContext(
+            retries_key='connection_retries',
+            delay_key='reconnect_delay',
+            logger=self.logger
+        ) as ctx:
+            while ctx.should_retry():
+                try:    
+                    # Try to get session only once per connect() call, unless we need to force a new one
+                    if not session_created or force_new_session:
+                        try:
+                            session = await self._get_session(force_new=force_new_session)
+                            session_created = True
+                            force_new_session = False  # Reset the flag
+                        except Exception as e:
+                            self.logger.error(f"Session creation failed: {e}")
+                            # Don't retry session creation here - it has its own retry logic
+                            raise
+                    
+                    # Get proxy configuration (skip if proxy already failed in strict mode)
+                    if proxy_mode == 'strict' and proxy_failed:
+                        raise ConnectionError("Strict proxy mode: Proxy connection failed, cannot proceed")
+                    
+                    # Get proxy (or None if soft mode and proxy previously failed)
+                    if proxy_failed and proxy_mode == 'soft':
+                        proxy_candidates, proxy_data = None, None
+                        self.logger.info(f"Connecting without proxy (fallback after proxy failure)")
                     else:
-                        self.logger.info(f"Connecting without proxy")
+                        proxy_candidates, proxy_data = await self._get_proxy_config()
+                        if proxy_candidates:
+                            self.logger.info(f"Connecting with proxy record: {proxy_data.get('proxy_name')}")
+                        else:
+                            self.logger.info(f"Connecting without proxy")
 
-                    selected_candidate = None
-                    # If proxy_candidates is a list, try them in order until one connects
-                    if proxy_candidates:
+                        selected_candidate = None
+                        # If proxy_candidates is a list, try them in order until one connects
+                        if proxy_candidates:
+                            from main_logic.database import get_db
+                            db = get_db()
+                            for candidate in proxy_candidates:
+                                try:
+                                    self.logger.debug(f"Attempting connection via proxy candidate {candidate.get('addr')}:{candidate.get('port')}")
+                                    self.client = TelegramClient(
+                                        session=session,
+                                        api_id=api_id,
+                                        api_hash=api_hash,
+                                        proxy=candidate
+                                    )
+                                    if not self.client:
+                                        raise ValueError("TelegramClient is not initialized.")
+
+                                    await self.client.connect()
+                                    # success for this candidate
+                                    selected_candidate = candidate
+                                    # Clear proxy error on success
+                                    await db.clear_proxy_error(proxy_data.get('proxy_name'))
+                                    # Increment proxy usage counter once per assigned proxy record
+                                    if not proxy_assigned:
+                                        await db.increment_proxy_usage(proxy_data.get('proxy_name'))
+                                        proxy_assigned = True
+                                        self.logger.debug(f"Incremented usage counter for proxy {proxy_data.get('proxy_name')}")
+                                    break
+                                except (OSError, TimeoutError, ConnectionError) as proxy_error:
+                                    # Candidate failed - record the error and try next candidate
+                                    error_msg = f"Proxy candidate {candidate.get('addr')}:{candidate.get('port')} failed: {type(proxy_error).__name__}: {str(proxy_error)}"
+                                    self.logger.warning(error_msg)
+                                    await db.set_proxy_error(proxy_data.get('proxy_name'), error_msg)
+                                    # try next candidate
+                                    continue
+                            # If none succeeded, raise a ConnectionError to be handled below
+                            if selected_candidate is None:
+                                proxy_failed = True
+                                if proxy_mode == 'strict':
+                                    raise ConnectionError(f"Strict mode - all proxy candidates failed for {proxy_data.get('proxy_name')}")
+                                else:
+                                    self.logger.warning("Soft proxy mode: all proxy candidates failed, will retry without proxy")
+                                    # Increment attempt and continue to retry without proxy
+                                    await ctx.failed(ConnectionError("All proxy candidates failed"), delay=False)
+                                    continue
+                        else:
+                            # No proxy - normal client creation
+                            self.client = TelegramClient(
+                                session=session,
+                                api_id=api_id,
+                                api_hash=api_hash
+                            )
+                            if not self.client:
+                                raise ValueError("TelegramClient is not initialized.")
+
+                            self.logger.debug(f"Starting client for {self.phone_number}...")
+                            await self.client.connect()
+                    
+                    # Verify the session is still valid
+                    try:
+                        await self.client.get_me()
+                        self.logger.debug(f"Client for {self.phone_number} started successfully.")
+                        # Update status to ACTIVE on successful connection
+                        await self.account.update_status(AccountStatus.ACTIVE, success=True)
+                    except errors.AuthKeyUnregisteredError as auth_error:
+                        # Centralized handling for auth-key invalid / revoked sessions
+                        self.logger.warning(f"Session for {self.phone_number} is invalid/expired. Creating new session...")
+                        self.session_encrypted = None
+                        force_new_session = True
+                        session_created = False
+
+                        mapping = map_telethon_exception(auth_error)
+                        try:
+                            if mapping.get('status'):
+                                await self.account.update_status(mapping['status'], error=auth_error)
+                        except Exception as _u:
+                            self.logger.warning(f"Failed to update account status for {self.phone_number}: {_u}")
+
+                        # Update database to clear invalid session
                         from main_logic.database import get_db
                         db = get_db()
-                        for candidate in proxy_candidates:
-                            try:
-                                self.logger.debug(f"Attempting connection via proxy candidate {candidate.get('addr')}:{candidate.get('port')}")
-                                self.client = TelegramClient(
-                                    session=session,
-                                    api_id=api_id,
-                                    api_hash=api_hash,
-                                    proxy=candidate
-                                )
-                                if not self.client:
-                                    raise ValueError("TelegramClient is not initialized.")
+                        await db.update_account(self.phone_number, {
+                            'session_encrypted': None
+                        })
 
-                                await self.client.connect()
-                                # success for this candidate
-                                selected_candidate = candidate
-                                # Clear proxy error on success
-                                await db.clear_proxy_error(proxy_data.get('proxy_name'))
-                                # Increment proxy usage counter once per assigned proxy record
-                                if not proxy_assigned:
-                                    await db.increment_proxy_usage(proxy_data.get('proxy_name'))
-                                    proxy_assigned = True
-                                    self.logger.debug(f"Incremented usage counter for proxy {proxy_data.get('proxy_name')}")
-                                break
-                            except (OSError, TimeoutError, ConnectionError) as proxy_error:
-                                # Candidate failed - record the error and try next candidate
-                                error_msg = f"Proxy candidate {candidate.get('addr')}:{candidate.get('port')} failed: {type(proxy_error).__name__}: {str(proxy_error)}"
-                                self.logger.warning(error_msg)
-                                await db.set_proxy_error(proxy_data.get('proxy_name'), error_msg)
-                                # try next candidate
-                                continue
-                        # If none succeeded, raise a ConnectionError to be handled below
-                        if selected_candidate is None:
-                            proxy_failed = True
-                            if proxy_mode == 'strict':
-                                raise ConnectionError(f"Strict mode - all proxy candidates failed for {proxy_data.get('proxy_name')}")
-                            else:
-                                self.logger.warning("Soft proxy mode: all proxy candidates failed, will retry without proxy")
-                                # Loop will continue and attempt without proxy
-                                continue
-                    else:
-                        # No proxy - normal client creation
-                        self.client = TelegramClient(
-                            session=session,
-                            api_id=api_id,
-                            api_hash=api_hash
-                        )
-                        if not self.client:
-                            raise ValueError("TelegramClient is not initialized.")
+                        await self.client.disconnect()
 
-                        self.logger.debug(f"Starting client for {self.phone_number}...")
-                        await self.client.connect()
+                        # Decrement proxy usage if it was incremented
+                        if proxy_assigned and proxy_data:
+                            await db.decrement_proxy_usage(proxy_data.get('proxy_name'))
+                            proxy_assigned = False
+                            self.logger.debug(f"Decremented usage counter for proxy {proxy_data.get('proxy_name')}")
+
+                        await ctx.failed(auth_error, delay=False)  # Retry with new session immediately
+                        continue
+                    except (errors.AuthKeyInvalidError, errors.UserDeactivatedError) as auth_error:
+                        self.logger.error(f"Account {self.phone_number} authentication failed: {auth_error}")
+                        mapping = map_telethon_exception(auth_error)
+                        try:
+                            if mapping.get('status'):
+                                await self.account.update_status(mapping['status'], error=auth_error)
+                        except Exception as _u:
+                            self.logger.warning(f"Failed to update account status for {self.phone_number}: {_u}")
+                        raise
+                    except errors.UserDeactivatedBanError as ban_error:
+                        self.logger.error(f"Account {self.phone_number} has been banned.")
+                        mapping = map_telethon_exception(ban_error)
+                        try:
+                            if mapping.get('status'):
+                                await self.account.update_status(mapping['status'], error=ban_error)
+                        except Exception as _u:
+                            self.logger.warning(f"Failed to update account status for {self.phone_number}: {_u}")
+                        raise
+                    
+                    if not self.account_id:
+                        await self.update_account_id_from_telegram()
                 
-                # Verify the session is still valid
-                try:
-                    await self.client.get_me()
-                    self.logger.debug(f"Client for {self.phone_number} started successfully.")
-                    # Update status to ACTIVE on successful connection
-                    await self.account.update_status(AccountStatus.ACTIVE, success=True)
-                except errors.AuthKeyUnregisteredError as auth_error:
-                    # Centralized handling for auth-key invalid / revoked sessions
-                    self.logger.warning(f"Session for {self.phone_number} is invalid/expired. Creating new session...")
-                    self.session_encrypted = None
-                    force_new_session = True
-                    session_created = False
-
-                    mapping = map_telethon_exception(auth_error)
-                    try:
-                        if mapping.get('status'):
-                            await self.account.update_status(mapping['status'], error=auth_error)
-                    except Exception as _u:
-                        self.logger.warning(f"Failed to update account status for {self.phone_number}: {_u}")
-
-                    # Update database to clear invalid session
-                    from main_logic.database import get_db
-                    db = get_db()
-                    await db.update_account(self.phone_number, {
-                        'session_encrypted': None
-                    })
-
-                    await self.client.disconnect()
-
-                    # Decrement proxy usage if it was incremented
-                    if proxy_assigned and proxy_data:
-                        await db.decrement_proxy_usage(proxy_data.get('proxy_name'))
-                        proxy_assigned = False
-                        self.logger.debug(f"Decremented usage counter for proxy {proxy_data.get('proxy_name')}")
-
-                    continue  # Retry with new session
-                except (errors.AuthKeyInvalidError, errors.UserDeactivatedError) as auth_error:
-                    self.logger.error(f"Account {self.phone_number} authentication failed: {auth_error}")
-                    mapping = map_telethon_exception(auth_error)
-                    try:
-                        if mapping.get('status'):
-                            await self.account.update_status(mapping['status'], error=auth_error)
-                    except Exception as _u:
-                        self.logger.warning(f"Failed to update account status for {self.phone_number}: {_u}")
+                    ctx.success()
+                    return self
+                    
+                except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.UserDeactivatedError, errors.UserDeactivatedBanError):
+                    # Don't retry on these errors - status already updated above
                     raise
-                except errors.UserDeactivatedBanError as ban_error:
-                    self.logger.error(f"Account {self.phone_number} has been banned.")
-                    mapping = map_telethon_exception(ban_error)
-                    try:
-                        if mapping.get('status'):
-                            await self.account.update_status(mapping['status'], error=ban_error)
-                    except Exception as _u:
-                        self.logger.warning(f"Failed to update account status for {self.phone_number}: {_u}")
-                    raise
-                except errors.UserDeactivatedBanError:
-                    self.logger.error(f"Account {self.phone_number} has been banned.")
-                    raise
-                
-                if not self.account_id:
-                    await self.update_account_id_from_telegram()
-            
-                return self
-                
-            except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.UserDeactivatedError, errors.UserDeactivatedBanError):
-                # Don't retry on these errors - status already updated above
-                raise
-            except ValueError as e:
-                # Session creation errors - don't retry connection
-                self.logger.error(f"Failed to create session for {self.phone_number}: {e}")
-                await self.account.update_status(AccountStatus.ERROR, error=e)
-                raise
-            except Exception as e:
-                self.logger.error(f"Failed to connect client for {self.phone_number} (attempt {attempt}/{retries}): {e}")
-                if attempt < retries:
-                    await asyncio.sleep(delay)
-                else:
-                    self.logger.critical(f"All connection attempts failed for {self.phone_number}. Error: {e}")
+                except ValueError as e:
+                    # Session creation errors - don't retry connection
+                    self.logger.error(f"Failed to create session for {self.phone_number}: {e}")
                     await self.account.update_status(AccountStatus.ERROR, error=e)
                     raise
+                except Exception as e:
+                    await ctx.failed(e)
+            
+            # All retries exhausted
+            self.logger.critical(f"All connection attempts failed for {self.phone_number}")
+            await self.account.update_status(AccountStatus.ERROR, error=ctx.last_error)
+            ctx.raise_if_exhausted()
 
     async def disconnect(self):
         """Disconnect the client and release account lock if held."""
-        retries = config.get('delays', {}).get('connection_retries', 5)
-        delay = config.get('delays', {}).get('reconnect_delay', 3)
-        attempt = 0
-        while attempt < retries:
-            try:
-                await self.client.disconnect()
-                self.logger.info(f"Client for {self.phone_number} disconnected.")
-                
-                # Release account lock if we hold one
-                if self._is_locked:
-                    lock_manager = get_account_lock_manager()
-                    released = await lock_manager.release(self.phone_number, self._task_id)
-                    if released:
-                        self.logger.debug(f"Released lock on account {self.phone_number} for task {self._task_id}")
-                    self._is_locked = False
-                
-                # Decrement proxy usage counter if a proxy was used
-                if self.proxy_name:
-                    from main_logic.database import get_db
-                    db = get_db()
-                    await db.decrement_proxy_usage(self.proxy_name)
-                    self.logger.debug(f"Decremented usage counter for proxy {self.proxy_name}")
-                    # Clear proxy name after disconnecting
-                    self.proxy_name = None
-                
-                break
-            except Exception as e:
-                attempt += 1
-                self.logger.error(f"Failed to disconnect client for {self.phone_number} (attempt {attempt}/{retries}): {e}")
-                if attempt < retries:
-                    await asyncio.sleep(delay)
-                else:
-                    # Even on failure, try to release lock
+        from utils.retry import RetryContext
+        
+        async with RetryContext(
+            retries_key='connection_retries',
+            delay_key='reconnect_delay',
+            logger=self.logger
+        ) as ctx:
+            while ctx.should_retry():
+                try:
+                    await self.client.disconnect()
+                    self.logger.info(f"Client for {self.phone_number} disconnected.")
+                    
+                    # Release account lock if we hold one
                     if self._is_locked:
-                        try:
-                            lock_manager = get_account_lock_manager()
-                            await lock_manager.release(self.phone_number, self._task_id)
-                            self._is_locked = False
-                        except Exception:
-                            pass
-                    self.logger.critical(f"All disconnection attempts failed for {self.phone_number}. Error: {e}")
-                    raise
+                        lock_manager = get_account_lock_manager()
+                        released = await lock_manager.release(self.phone_number, self._task_id)
+                        if released:
+                            self.logger.debug(f"Released lock on account {self.phone_number} for task {self._task_id}")
+                        self._is_locked = False
+                    
+                    # Decrement proxy usage counter if a proxy was used
+                    if self.proxy_name:
+                        from main_logic.database import get_db
+                        db = get_db()
+                        await db.decrement_proxy_usage(self.proxy_name)
+                        self.logger.debug(f"Decremented usage counter for proxy {self.proxy_name}")
+                        # Clear proxy name after disconnecting
+                        self.proxy_name = None
+                    
+                    ctx.success()
+                    return
+                except Exception as e:
+                    await ctx.failed(e)
+            
+            # All retries exhausted - ensure cleanup happens anyway
+            if self._is_locked:
+                try:
+                    lock_manager = get_account_lock_manager()
+                    await lock_manager.release(self.phone_number, self._task_id)
+                    self._is_locked = False
+                except Exception:
+                    pass
+            
+            ctx.raise_if_exhausted()
 
     async def ensure_connected(self):
         if not self.client or not self.is_connected:
@@ -1236,15 +1240,13 @@ class Client(object):
                 self.logger.debug(f"Estimated reading time: {reading_time} seconds")
                 await asyncio.sleep(reading_time)
             else:
-                # Message content empty - use fallback delay
-                fallback_delay = random.uniform(2, 5)
-                self.logger.debug(f"Message content empty, using fallback delay: {fallback_delay:.2f}s")
-                await asyncio.sleep(fallback_delay)
+                # Message content empty - use fallback delay from config
+                await random_delay('reading_fallback_delay_min', 'reading_fallback_delay_max', 
+                                   self.logger, "Message content empty, using fallback delay")
         else:
             # Minimal humanization: just add a random delay to prevent instant reactions
-            minimal_delay = random.uniform(1.5, 4)
-            self.logger.debug(f"Minimal humanization delay: {minimal_delay:.2f}s")
-            await asyncio.sleep(minimal_delay)
+            await random_delay('minimal_humanization_delay_min', 'minimal_humanization_delay_max',
+                               self.logger, "Minimal humanization delay")
 
         # Check for active emoji palette
         if not self.active_emoji_palette:
@@ -1445,7 +1447,8 @@ class Client(object):
         
         # Text typing speed should be added to simulate properly
 
-        await asyncio.sleep(random.uniform(0.5, 2))  # Prevent spam if everything is broken
+        # Anti-spam delay before sending comment
+        await random_delay('anti_spam_delay_min', 'anti_spam_delay_max', self.logger, "Anti-spam delay")
 
         # Rate limit message sending
         await rate_limiter.wait_if_needed('send_message')
@@ -1467,7 +1470,8 @@ class Client(object):
             increment=True
         ))
         
-        await asyncio.sleep(random.uniform(0.5, 1))  # Prevent spam if everything is broken
+        # Anti-spam delay before removing reaction
+        await random_delay('anti_spam_delay_min', 'anti_spam_delay_max', self.logger, "Anti-spam delay")
         
         # Rate limit reaction removal
         await rate_limiter.wait_if_needed('send_reaction')
@@ -1493,7 +1497,8 @@ class Client(object):
             increment=True
         ))
 
-        await asyncio.sleep(random.uniform(0.5, 1))  # Prevent spam if everything is broken
+        # Anti-spam delay before fetching discussion
+        await random_delay('anti_spam_delay_min', 'anti_spam_delay_max', self.logger, "Anti-spam delay")
         discussion = await self.client(functions.messages.GetDiscussionMessageRequest(
             peer=input_peer,
             msg_id=message.id
@@ -1506,64 +1511,40 @@ class Client(object):
 # Actions
 
     async def undo_reaction(self, message_link:str=None):
-        retries = config.get('delays', {}).get('action_retries', 3)
-        delay = config.get('delays', {}).get('action_retry_delay', 3)
-        attempt = 0
-        while attempt < retries:
-            try:
-                chat_id, message_id, entity = await self.get_message_ids(message_link)
-                # Use entity from get_message_ids if available, otherwise fetch it
-                if entity is None:
-                    # Extract username/identifier from link and use that to fetch entity
-                    identifier = self._extract_identifier_from_link(message_link)
-                    entity = await self.get_entity_cached(identifier) # Possible duplicate call
-                
-                # Get or fetch channel data (for consistency, though not strictly needed for undo)
-                channel = await self._get_or_fetch_channel_data(chat_id, entity=entity)
-                
-                # Rate limit message fetching
-                await rate_limiter.wait_if_needed('get_messages')
-                message = await self.client.get_messages(entity, ids=message_id)
-                await self._undo_reaction(message, entity)
-                self.logger.info("Reaction removed successfully")
-                return
-            except Exception as e:
-                attempt += 1
-                self.logger.warning(f"Undo reaction failed (attempt {attempt}/{retries}): {e}")
-                if attempt < retries:
-                    await asyncio.sleep(delay)
-                else:
-                    raise
+        """Remove reaction from a message."""
+        chat_id, message_id, entity = await self.get_message_ids(message_link)
+        # Use entity from get_message_ids if available, otherwise fetch it
+        if entity is None:
+            # Extract username/identifier from link and use that to fetch entity
+            identifier = self._extract_identifier_from_link(message_link)
+            entity = await self.get_entity_cached(identifier)
+        
+        # Get or fetch channel data (for consistency, though not strictly needed for undo)
+        channel = await self._get_or_fetch_channel_data(chat_id, entity=entity)
+        
+        # Rate limit message fetching
+        await rate_limiter.wait_if_needed('get_messages')
+        message = await self.client.get_messages(entity, ids=message_id)
+        await self._undo_reaction(message, entity)
+        self.logger.info("Reaction removed successfully")
 
     async def undo_comment(self, message_link:str=None):
-        retries = config.get('delays', {}).get('action_retries', 3)
-        delay = config.get('delays', {}).get('action_retry_delay', 3)
-        attempt = 0
-        while attempt < retries:
-            try:
-                chat_id, message_id, entity = await self.get_message_ids(message_link)
-                # Use entity from get_message_ids if available, otherwise fetch it
-                if entity is None:
-                    # Extract username/identifier from link and use that to fetch entity
-                    identifier = self._extract_identifier_from_link(message_link)
-                    entity = await self.get_entity_cached(identifier)
-                
-                # Get or fetch channel data (for consistency)
-                channel = await self._get_or_fetch_channel_data(chat_id, entity=entity)
-                
-                # Rate limit message fetching
-                await rate_limiter.wait_if_needed('get_messages')
-                message = await self.client.get_messages(entity, ids=message_id)
-                await self._undo_comment(message, entity)
-                self.logger.info(f"Comment {message} deleted successfully!")
-                return
-            except Exception as e:
-                attempt += 1
-                self.logger.warning(f"undo_comment failed (attempt {attempt}/{retries}): {e}")
-                if attempt < retries:
-                    await asyncio.sleep(delay)
-                else:
-                    raise
+        """Delete all user comments on a post."""
+        chat_id, message_id, entity = await self.get_message_ids(message_link)
+        # Use entity from get_message_ids if available, otherwise fetch it
+        if entity is None:
+            # Extract username/identifier from link and use that to fetch entity
+            identifier = self._extract_identifier_from_link(message_link)
+            entity = await self.get_entity_cached(identifier)
+        
+        # Get or fetch channel data (for consistency)
+        channel = await self._get_or_fetch_channel_data(chat_id, entity=entity)
+        
+        # Rate limit message fetching
+        await rate_limiter.wait_if_needed('get_messages')
+        message = await self.client.get_messages(entity, ids=message_id)
+        await self._undo_comment(message, entity)
+        self.logger.info(f"Comment {message} deleted successfully!")
 
     async def react(self, message_link:str):
         """
@@ -1572,64 +1553,40 @@ class Client(object):
         Args:
             message_link: Telegram message link
         """
-        retries = config.get('delays', {}).get('action_retries', 1)
-        delay = config.get('delays', {}).get('action_retry_delay', 3)
-        attempt = 0
-        while attempt < retries:
-            try:
-                chat_id, message_id, entity = await self.get_message_ids(message_link)
-                # Use entity from get_message_ids if available, otherwise fetch it
-                if entity is None:
-                    # Extract username/identifier from link and use that to fetch entity
-                    # (using raw chat_id doesn't work for channels without access_hash)
-                    identifier = self._extract_identifier_from_link(message_link)
-                    entity = await self.get_entity_cached(identifier)  # Possible duplicate call
-                
-                # Get or fetch channel data (minimizes API calls by reusing entity)
-                channel = await self._get_or_fetch_channel_data(chat_id, entity=entity)
-                
-                # Rate limit message fetching
-                await rate_limiter.wait_if_needed('get_messages')
-                message = await self.client.get_messages(entity, ids=message_id)                
-                await self._react(message, entity, channel=channel)                
-                self.logger.info("Reaction added successfully")
-                return
-            except Exception as e:
-                attempt += 1
-                self.logger.warning(f"React failed (attempt {attempt}/{retries}): {e}")
-                if attempt < retries:
-                    await asyncio.sleep(delay)
-                else:
-                    raise
+        chat_id, message_id, entity = await self.get_message_ids(message_link)
+        # Use entity from get_message_ids if available, otherwise fetch it
+        if entity is None:
+            # Extract username/identifier from link and use that to fetch entity
+            # (using raw chat_id doesn't work for channels without access_hash)
+            identifier = self._extract_identifier_from_link(message_link)
+            entity = await self.get_entity_cached(identifier)
+        
+        # Get or fetch channel data (minimizes API calls by reusing entity)
+        channel = await self._get_or_fetch_channel_data(chat_id, entity=entity)
+        
+        # Rate limit message fetching
+        await rate_limiter.wait_if_needed('get_messages')
+        message = await self.client.get_messages(entity, ids=message_id)                
+        await self._react(message, entity, channel=channel)                
+        self.logger.info("Reaction added successfully")
     
     async def comment(self, content, message_id:int=None, chat_id:str=None, message_link:str=None):
-        """Comment on a message by its ID in a specific chat."""
-        retries = config.get('delays', {}).get('action_retries', 3)
-        delay = config.get('delays', {}).get('action_retry_delay', 3)
-        attempt = 0
-        while attempt < retries:
-            try:
-                chat_id, message_id, entity = await self.get_message_ids(message_link)
-                # Use entity from get_message_ids if available, otherwise fetch it
-                if entity is None:
-                    # Extract username/identifier from link and use that to fetch entity
-                    identifier = self._extract_identifier_from_link(message_link)
-                    entity = await self.get_entity_cached(identifier)
-                
-                # Get or fetch channel data (minimizes API calls by reusing entity)
-                channel = await self._get_or_fetch_channel_data(chat_id, entity=entity)
-                
-                # Rate limit message fetching
-                await rate_limiter.wait_if_needed('get_messages')
-                message = await self.client.get_messages(entity, ids=message_id)
-                await self._comment(message=message, target_chat=entity, content=content, channel=channel)
-                self.logger.info("Comment added successfully!")
-                return
-            except Exception as e:
-                attempt += 1
-                self.logger.warning(f"Comment failed (attempt {attempt}/{retries}): {e}")
-                if attempt < retries:
-                    await asyncio.sleep(delay)
-                else:
-                    raise
+        """
+        Comment on a message by its ID in a specific chat.
+        """
+        chat_id, message_id, entity = await self.get_message_ids(message_link)
+        # Use entity from get_message_ids if available, otherwise fetch it
+        if entity is None:
+            # Extract username/identifier from link and use that to fetch entity
+            identifier = self._extract_identifier_from_link(message_link)
+            entity = await self.get_entity_cached(identifier)
+        
+        # Get or fetch channel data (minimizes API calls by reusing entity)
+        channel = await self._get_or_fetch_channel_data(chat_id, entity=entity)
+        
+        # Rate limit message fetching
+        await rate_limiter.wait_if_needed('get_messages')
+        message = await self.client.get_messages(entity, ids=message_id)
+        await self._comment(message=message, target_chat=entity, content=content, channel=channel)
+        self.logger.info("Comment added successfully!")
 

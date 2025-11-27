@@ -124,8 +124,10 @@ class Reporter:
 
             except Exception as exc:
                 # transient writer-level errors; avoid tight loop
+                from utils.retry import get_delay_config
+                error_delay = get_delay_config('batch_error_delay', default=0.2)
                 logger.error("Writer loop error:", exc)
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(error_delay)
 
 
     async def start(self):

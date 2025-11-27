@@ -7,28 +7,36 @@ import asyncio
 import time
 from scipy.stats import skewnorm
 from numpy import arange, random as rnd
+from utils.retry import get_delay_config
 
 
 class TelegramAPIRateLimiter:
     """
     Rate limiter for Telegram API calls to prevent flood errors.
     Tracks calls per method and enforces delays between calls.
+    Uses config-based delays for consistency with rest of codebase.
     """
     def __init__(self):
         # Track last call time for each method
         self._last_call = {}
-        # Minimum delay between calls (in seconds)
-        self._min_delay = {
-            'get_entity': 3,        # 3 seconds between entity lookups
-            'get_messages': 0.3,    # 300ms between message fetches
-            'send_reaction': 0.5,   # 500ms between reactions
-            'send_message': 0.5,    # 500ms between messages
-            'default': 0.2          # 200ms for other calls
-        }
+        # Load delays from config (lazy-loaded on first use)
+        self._min_delay = None
         self._lock = asyncio.Lock()
+    
+    def _ensure_delays_loaded(self):
+        """Lazy-load delay configuration from config.yaml."""
+        if self._min_delay is None:
+            self._min_delay = {
+                'get_entity': get_delay_config('rate_limit_get_entity', 3.0),
+                'get_messages': get_delay_config('rate_limit_get_messages', 0.3),
+                'send_reaction': get_delay_config('rate_limit_send_reaction', 0.5),
+                'send_message': get_delay_config('rate_limit_send_message', 0.5),
+                'default': get_delay_config('rate_limit_default', 0.2)
+            }
     
     async def wait_if_needed(self, method_name: str):
         """Wait if needed to respect rate limits."""
+        self._ensure_delays_loaded()
         async with self._lock:
             now = time.time()
             delay = self._min_delay.get(method_name, self._min_delay['default'])

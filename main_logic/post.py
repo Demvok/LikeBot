@@ -1,5 +1,4 @@
 from pandas import Timestamp
-import asyncio
 import datetime
 
 from telethon import errors
@@ -66,31 +65,24 @@ class Post:
 
 
     async def validate(self, client, logger=None):
-        """Validate the post by fetching its chat_id and message_id, and update the record in file."""
+        """
+        Validate the post by fetching its chat_id and message_id, and update the record in file.
+        
+        Note: This method does not implement its own retry logic. Retries are handled by the caller
+        (mass_validate_posts) which tries different clients on failure. This avoids nested retries.
+        """
         from main_logic.database import get_db
         db = get_db()
-        retries = config.get('delays', {}).get('action_retries', 5)
-        delay = config.get('delays', {}).get('action_retry_delay', 3)
-        attempt = 0
-        while attempt < retries:
-            try:
-                chat_id, message_id, _ = await client.get_message_ids(self.message_link)
-                self.chat_id = normalize_chat_id(chat_id)
-                self.message_id = message_id
-                self.updated_at = Timestamp.now()
-                await db.update_post(self.post_id, {
-                    'chat_id': self.chat_id,
-                    'message_id': self.message_id,
-                    'updated_at': str(self.updated_at)
-                })
-                break  # If you got here - task succeeded
-            except Exception as e:
-                attempt += 1
-                if attempt < retries:
-                    await asyncio.sleep(delay)
-                elif logger:
-                    logger.error(f"Failed to validate post {self.post_id} after {retries} attempts. Error: {e}")
-                    raise
+        
+        chat_id, message_id, _ = await client.get_message_ids(self.message_link)
+        self.chat_id = normalize_chat_id(chat_id)
+        self.message_id = message_id
+        self.updated_at = Timestamp.now()
+        await db.update_post(self.post_id, {
+            'chat_id': self.chat_id,
+            'message_id': self.message_id,
+            'updated_at': str(self.updated_at)
+        })
         return self
     
     @classmethod
