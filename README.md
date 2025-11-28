@@ -3,8 +3,6 @@
 ### TO DO:
 
 ##### Account health system - stage 1
-- !!!!! Try to cache entity object
-- !!! Rework caching to be on task scope
 - Map chat_id to chat username and include this to channel parser
 - Add chat "opening" before reacting?
 - fix proxy load balancing
@@ -35,6 +33,10 @@
 
 ### v.1.1.2
 - reviewed and standartized pauses and retries for flood avoiding
+- complete caching rework, now works on task scope
+- now entity object is cached completely, with thread managing
+- reviewed and reduced usage of get_messages() and get_message_content() telegram requests
+- fixed channel indexing endpoint
 
 ### v.1.1.1
 - fixed malformed task object creation on low RAM (cleanup and safe loading)

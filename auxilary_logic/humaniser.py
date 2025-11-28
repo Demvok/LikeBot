@@ -78,3 +78,77 @@ def estimate_reading_time(text: str, wpm=None) -> float:
         return round(float(words / wpm * 60), 3)
     except Exception as e:
         raise ValueError(f"Error estimating reading time: {e}")
+
+
+async def apply_reading_delay(message_content: str = None, logger=None):
+    """
+    Apply reading time delay based on message content.
+    
+    Simulates human reading behavior with either content-based estimation
+    or fallback random delay.
+    
+    Args:
+        message_content: Message text to estimate reading time for
+        logger: Optional logger instance for debug output
+    """
+    from utils.retry import random_delay
+    from utils.logger import load_config
+    
+    config = load_config()
+    humanisation_level = config.get('delays', {}).get('humanisation_level', 1)
+    
+    if humanisation_level >= 1 and message_content:
+        reading_time = estimate_reading_time(message_content)
+        if logger:
+            logger.debug(f"Estimated reading time: {reading_time}s")
+        await asyncio.sleep(reading_time)
+    else:
+        # Fallback delay
+        await random_delay(
+            'reading_fallback_delay_min', 
+            'reading_fallback_delay_max',
+            logger, 
+            "Message content empty, using fallback delay"
+        )
+
+
+async def apply_pre_action_delay(logger=None):
+    """
+    Apply random delay before action (reaction/comment).
+    
+    Adds unpredictability to prevent detection of automated behavior.
+    
+    Args:
+        logger: Optional logger instance for debug output
+    """
+    import random
+    from utils.logger import load_config
+    
+    config = load_config()
+    min_delay = config.get('delays', {}).get('min_delay_before_reaction', 1)
+    max_delay = config.get('delays', {}).get('max_delay_before_reaction', 3)
+    delay = random.uniform(min_delay, max_delay)
+    
+    if logger:
+        logger.debug(f"Pre-action delay: {delay:.2f}s")
+    
+    await asyncio.sleep(delay)
+
+
+async def apply_anti_spam_delay(logger=None):
+    """
+    Apply anti-spam delay between actions.
+    
+    Prevents rapid-fire actions that could trigger spam detection.
+    
+    Args:
+        logger: Optional logger instance for debug output
+    """
+    from utils.retry import random_delay
+    
+    await random_delay(
+        'anti_spam_delay_min', 
+        'anti_spam_delay_max',
+        logger, 
+        "Anti-spam delay"
+    )

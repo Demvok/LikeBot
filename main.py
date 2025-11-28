@@ -2794,12 +2794,11 @@ async def sync_account_subscribed_channels(
         db = get_db()
         
         # Check if account exists
-        account_data = await db.get_account(phone_number)
-        if not account_data:
+        account = await db.get_account(phone_number)
+        if not account:
             raise HTTPException(status_code=404, detail=f"Account with phone number {phone_number} not found")
         
-        # Create Account object and Client
-        account = Account.from_dict(account_data)
+        # Create Client
         client = Client(account)
         
         try:

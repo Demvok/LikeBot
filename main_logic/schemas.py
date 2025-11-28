@@ -21,7 +21,6 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Union, Literal
 from enum import Enum, auto
 from pydantic import BaseModel, Field, field_validator, model_validator
-from pandas import Timestamp
 from asyncio import Future
 from telethon import TelegramClient
 
@@ -390,6 +389,8 @@ class PostBase(BaseModel):
     message_link: str = Field(..., description="Telegram message link")
     chat_id: Optional[int] = Field(None, description="Telegram chat ID")
     message_id: Optional[int] = Field(None, description="Telegram message ID")
+    message_content: Optional[str] = Field(None, description="Message text content (cached)")
+    content_fetched_at: Optional[datetime] = Field(None, description="When message content was last fetched")
 
     @field_validator('message_link')
     def validate_message_link(cls, v):
@@ -408,6 +409,8 @@ class PostUpdate(BaseModel):
     message_link: Optional[str] = Field(None, description="Telegram message link")
     chat_id: Optional[int] = Field(None, description="Telegram chat ID")
     message_id: Optional[int] = Field(None, description="Telegram message ID")
+    message_content: Optional[str] = Field(None, description="Message text content (cached)")
+    content_fetched_at: Optional[datetime] = Field(None, description="When message content was last fetched")
 
     @field_validator('message_link')
     def validate_message_link(cls, v):
@@ -429,6 +432,8 @@ class PostDict(BaseModel):
     message_id: Optional[int]
     message_link: str
     is_validated: bool
+    message_content: Optional[str] = None
+    content_fetched_at: Optional[Union[str, datetime]] = None
     created_at: Union[str, datetime]
     updated_at: Union[str, datetime]
 

@@ -10,6 +10,7 @@ from pandas import errors as pd_errors
 from main_logic.agent import Account, Client
 from main_logic.post import Post
 from auxilary_logic.reporter import Reporter
+from auxilary_logic.telegram_cache import TelegramCache
 from utils.logger import setup_logger, load_config, crash_handler, handle_task_exception
 from main_logic.schemas import TaskStatus, status_name
 from auxilary_logic.telethon_error_handler import map_telethon_exception, reporter_payload_from_mapping
@@ -242,6 +243,10 @@ class Task:
                 self._current_run_id = run_id
                 await reporter.event(run_id, self.task_id, "INFO", "info.init.run_start", f"Starting run for task.")
                 
+                
+                telegram_cache = TelegramCache(task_id=self.task_id)
+                await reporter.event(run_id, self.task_id, "DEBUG", "info.init.cache_created", f"Initialized Telegram cache for task")
+                
                 # Load accounts and posts with specific DB error handling
                 try:
                     accounts = await self.get_accounts()
@@ -298,6 +303,13 @@ class Task:
 
                 await self._check_pause(reporter, run_id)
                 self._clients = await Client.connect_clients(accounts, self.logger, task_id=self.task_id)
+                
+
+                for client in self._clients:
+                    client.telegram_cache = telegram_cache
+                await reporter.event(run_id, self.task_id, "DEBUG", "info.init.cache_injected", f"Injected cache into {len(self._clients)} clients")
+                
+
                 await reporter.event(run_id, self.task_id, "INFO", "info.connecting.client_connect", f"Connected {len(self._clients)} clients.")
 
                 await self._check_pause(reporter, run_id)
@@ -455,6 +467,17 @@ class Task:
                 await self._update_status()
                 raise e
             finally:
+                # Log cache statistics before cleanup
+                if 'telegram_cache' in locals():
+                    try:
+                        stats = telegram_cache.get_stats()
+                        self.logger.info(f"Task {self.task_id} cache stats: {stats}")
+                        await reporter.event(run_id, self.task_id, "INFO", "info.cache_stats", 
+                                           f"Cache statistics", stats)
+                        await telegram_cache.clear()
+                    except Exception as cache_error:
+                        self.logger.warning(f"Error logging cache stats: {cache_error}")
+                
                 self._clients = await Client.disconnect_clients(self._clients, self.logger, task_id=self.task_id)
                 self._clients = None
                 self.updated_at = Timestamp.now()

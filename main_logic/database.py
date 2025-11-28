@@ -45,6 +45,22 @@ db_name = os.getenv('db_name', 'LikeBot')
 mongo_timeout_ms = int(os.getenv('db_timeout_ms', '5000'))
 
 
+def ensure_async(fn):
+    """
+    Decorator to wrap a sync function to run in asyncio.to_thread().
+    
+    Usage:
+        @ensure_async
+        def blocking_function(x, y):
+            return x + y
+            
+        result = await blocking_function(1, 2)
+    """
+    async def wrapper(*args, **kwargs):
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    return wrapper
+
+
 class MongoStorage():
     _accounts = None
     _db = None

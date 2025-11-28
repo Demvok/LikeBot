@@ -125,7 +125,6 @@ async def test_taskhandler_integration():
     
     # This requires a Task instance, so we'll create a minimal one
     from main_logic.task import Task
-    from main_logic.schemas import ReactAction, ReactionPalette
     
     print("\n[Test] Creating task with reaction action...")
     

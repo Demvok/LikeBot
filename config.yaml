@@ -16,6 +16,16 @@ database:
   batch_timeout: 0.5  # Timeout for batch flushing
   id_allocation_retries: 3  # Retries for atomic ID allocation (race condition handling)
 
+cache:
+  # Task-scoped Telegram object cache settings
+  entity_ttl: 300  # 5 minutes - entities (users, channels, chats)
+  message_ttl: 60  # 1 minute - message objects
+  full_channel_ttl: 600  # 10 minutes - full channel info (reactions, discussion groups)
+  discussion_ttl: 300  # 5 minutes - discussion group data
+  input_peer_ttl: 300  # 5 minutes - InputPeer objects
+  max_size: 500  # Maximum cache entries per task (increased from 100 per client)
+  enable_in_flight_dedup: true  # De-duplicate concurrent requests (recommended: true)
+
 proxy:
   mode: "soft"  # "strict" or "soft" - strict fails on proxy error, soft falls back to no proxy
 

@@ -11,11 +11,14 @@ config = load_config()
 
 class Post:
 
-    def __init__(self, message_link:str, post_id:int=None, chat_id:int=None, message_id:int=None, created_at=None, updated_at=None):
+    def __init__(self, message_link:str, post_id:int=None, chat_id:int=None, message_id:int=None, 
+                 message_content:str=None, content_fetched_at=None, created_at=None, updated_at=None):
         self.post_id = post_id
         self.chat_id = normalize_chat_id(chat_id) if chat_id else None
         self.message_id = message_id
         self.message_link = message_link
+        self.message_content = message_content
+        self.content_fetched_at = content_fetched_at
         self.created_at = created_at or Timestamp.now()
         self.updated_at = updated_at or Timestamp.now()
 
@@ -48,18 +51,21 @@ class Post:
             'message_id': self.message_id,
             'message_link': self.message_link,
             'is_validated': self.is_validated,
+            'message_content': self.message_content,
+            'content_fetched_at': self.content_fetched_at.isoformat() if isinstance(self.content_fetched_at, Timestamp) else self.content_fetched_at,
             'created_at': self.created_at.isoformat() if isinstance(self.created_at, Timestamp) else self.created_at,
             'updated_at': self.updated_at.isoformat() if isinstance(self.updated_at, Timestamp) else self.updated_at
         }
 
     @classmethod
-    def from_keys(cls, message_link:str, post_id:int=None, chat_id:int=None, message_id:int=None):
+    def from_keys(cls, message_link:str, post_id:int=None, chat_id:int=None, message_id:int=None, message_content:str=None):
         """Create a Post object from keys."""
         return cls(
             post_id=post_id,
             message_link=message_link,
             chat_id=chat_id,
-            message_id=message_id
+            message_id=message_id,
+            message_content=message_content
         )
 
 
@@ -67,6 +73,7 @@ class Post:
     async def validate(self, client, logger=None):
         """
         Validate the post by fetching its chat_id and message_id, and update the record in file.
+        Also fetches and stores message content to minimize future API calls.
         
         Note: This method does not implement its own retry logic. Retries are handled by the caller
         (mass_validate_posts) which tries different clients on failure. This avoids nested retries.
@@ -77,12 +84,37 @@ class Post:
         chat_id, message_id, _ = await client.get_message_ids(self.message_link)
         self.chat_id = normalize_chat_id(chat_id)
         self.message_id = message_id
+        
+        # Fetch message content during validation to minimize future API calls
+        try:
+            message_content = await client.get_message_content(
+                chat_id=self.chat_id, 
+                message_id=self.message_id
+            )
+            self.message_content = message_content
+            self.content_fetched_at = Timestamp.now()
+            if logger:
+                logger.debug(f"Fetched message content for post {self.post_id} (length: {len(message_content) if message_content else 0})")
+        except Exception as e:
+            if logger:
+                logger.warning(f"Could not fetch message content during validation for post {self.post_id}: {e}")
+            self.message_content = None
+            self.content_fetched_at = None
+        
         self.updated_at = Timestamp.now()
-        await db.update_post(self.post_id, {
+        
+        update_data = {
             'chat_id': self.chat_id,
             'message_id': self.message_id,
             'updated_at': str(self.updated_at)
-        })
+        }
+        
+        # Only update content fields if successfully fetched
+        if self.message_content is not None:
+            update_data['message_content'] = self.message_content
+            update_data['content_fetched_at'] = str(self.content_fetched_at)
+        
+        await db.update_post(self.post_id, update_data)
         return self
     
     @classmethod
