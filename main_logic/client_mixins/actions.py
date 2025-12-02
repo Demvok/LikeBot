@@ -7,6 +7,7 @@ Uses humanization helpers from auxilary_logic for realistic behavior simulation.
 
 import random
 import asyncio
+from typing import Optional, TYPE_CHECKING
 from telethon.tl.functions.messages import SendReactionRequest, GetMessagesViewsRequest
 from telethon import functions, types, errors
 
@@ -15,6 +16,9 @@ from auxilary_logic.humaniser import rate_limiter, apply_reading_delay, apply_pr
 from utils.logger import load_config
 
 config = load_config()
+
+if TYPE_CHECKING:
+    from main_logic.post import Post
 
 
 class ActionsMixin:
@@ -364,27 +368,32 @@ class ActionsMixin:
         await self._undo_comment(message, entity)
         self.logger.info(f"Comment {message} deleted successfully!")
 
-    async def react(self, message_link: str):
+    async def react(self, message_link: Optional[str] = None, post: Optional["Post"] = None):
         """
-        React to a message by its link.
+        React to a message by link or by a preloaded Post object.
         
         Args:
             message_link: Telegram message link
+            post: Optional Post instance with validated chat/message identifiers
         """
-        chat_id, message_id, entity = await self.get_message_ids(message_link)
+        link = message_link or (getattr(post, 'message_link', None) if post else None)
+        if not link:
+            raise ValueError("Either message_link or post.message_link must be provided for reaction.")
+
+        chat_id, message_id, entity = await self.get_message_ids(link, post=post)
         # Use entity from get_message_ids if available, otherwise fetch it
         if entity is None:
             # Extract username/identifier from link and use that to fetch entity
             # (using raw chat_id doesn't work for channels without access_hash)
-            identifier = self._extract_identifier_from_link(message_link)
+            identifier = self._extract_identifier_from_link(link)
             entity = await self.get_entity_cached(identifier)
         
         # Get or fetch channel data (minimizes API calls by reusing entity)
         channel = await self._get_or_fetch_channel_data(chat_id, entity=entity)
         
         # Fetch message with caching
-        message = await self.get_message_cached(chat_id, message_id)                
-        await self._react(message, entity, channel=channel)                
+        message = await self.get_message_cached(chat_id, message_id)
+        await self._react(message, entity, channel=channel)
         self.logger.info("Reaction added successfully")
     
     async def comment(self, content, message_id: int = None, chat_id: str = None, message_link: str = None):

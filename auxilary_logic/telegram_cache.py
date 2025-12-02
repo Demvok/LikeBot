@@ -1,9 +1,10 @@
 """
 Telegram Cache Module
 
-Task-scoped, thread-safe cache for Telegram API objects.
+Task-scoped, thread-safe cache for Telegram API objects with per-account isolation.
 
 Features:
+- Per-account cache isolation (entities from one account cannot be used by another)
 - Thread-safe concurrent access with asyncio.Lock
 - In-flight request de-duplication (prevents redundant API calls)
 - Auto-expiring entries with configurable TTL per object type
@@ -19,7 +20,7 @@ Usage:
     for client in clients:
         client.telegram_cache = cache
     
-    # In client methods:
+    # In client methods (cache uses client.phone_number for isolation):
     entity = await self.telegram_cache.get_entity(identifier, self.client)
 """
 
@@ -61,9 +62,10 @@ class InFlightRequest:
 
 class TelegramCache:
     """
-    Task-scoped cache for Telegram API objects with thread-safe operations.
+    Task-scoped cache for Telegram API objects with per-account isolation.
     
     Features:
+    - Per-account cache isolation (entities from one account cannot be used by another)
     - Thread-safe concurrent access with asyncio.Lock
     - In-flight request de-duplication (prevents redundant API calls)
     - Auto-expiring entries with configurable TTL per object type
@@ -79,7 +81,7 @@ class TelegramCache:
         for client in clients:
             client.telegram_cache = cache
         
-        # In client methods:
+        # In client methods (cache uses client.phone_number for isolation):
         entity = await self.telegram_cache.get_entity(identifier, self.client)
     """
     
@@ -105,11 +107,12 @@ class TelegramCache:
         config = load_config()
         cache_config = config.get('cache', {})
         
-        # Cache storage: {(cache_type, key): CacheEntry}
-        self._cache: OrderedDict[Tuple[str, str], CacheEntry] = OrderedDict()
+        # Cache storage: {(cache_type, account_id, key): CacheEntry}
+        # account_id ensures entities are cached per-account (session-specific)
+        self._cache: OrderedDict[Tuple[str, str, str], CacheEntry] = OrderedDict()
         
-        # In-flight requests: {(cache_type, key): InFlightRequest}
-        self._in_flight: Dict[Tuple[str, str], InFlightRequest] = {}
+        # In-flight requests: {(cache_type, account_id, key): InFlightRequest}
+        self._in_flight: Dict[Tuple[str, str, str], InFlightRequest] = {}
         
         # Thread safety
         self._lock = asyncio.Lock()
@@ -136,22 +139,36 @@ class TelegramCache:
         }
         
         self.logger.info(f"TelegramCache initialized: max_size={self._max_size}, dedup={self._enable_dedup}")
+
+    def _consume_future_result(self, future: asyncio.Future) -> None:
+        """Ensure future result/exception is retrieved to avoid unhandled warnings."""
+        if future.cancelled():
+            return
+        try:
+            future.result()
+        except Exception as exc:
+            # Exception is already propagated elsewhere; keep logs at debug level to avoid spam
+            try:
+                self.logger.debug(f"In-flight future exception consumed: {exc}")
+            except Exception:
+                pass
     
-    def _normalize_key(self, cache_type: str, key: Any) -> Tuple[str, str]:
+    def _normalize_key(self, cache_type: str, account_id: str, key: Any) -> Tuple[str, str, str]:
         """
-        Normalize cache key to consistent format.
+        Normalize cache key to consistent format with account isolation.
         
         Args:
             cache_type: Cache type constant
+            account_id: Account identifier (phone_number) to isolate cache per account
             key: Raw key (int, str, tuple, etc.)
         
         Returns:
-            Tuple of (cache_type, normalized_key_string)
+            Tuple of (cache_type, account_id, normalized_key_string)
             
         Examples:
-            _normalize_key(ENTITY, 12345) -> ("entity", "12345")
-            _normalize_key(ENTITY, "@username") -> ("entity", "username")
-            _normalize_key(MESSAGE, (12345, 678)) -> ("message", "12345:678")
+            _normalize_key(ENTITY, "+1234567890", 12345) -> ("entity", "+1234567890", "12345")
+            _normalize_key(ENTITY, "+1234567890", "@username") -> ("entity", "+1234567890", "username")
+            _normalize_key(MESSAGE, "+1234567890", (12345, 678)) -> ("message", "+1234567890", "12345:678")
         """
         if isinstance(key, int):
             normalized = str(key)
@@ -164,11 +181,12 @@ class TelegramCache:
         else:
             normalized = str(key)
         
-        return (cache_type, normalized)
+        return (cache_type, account_id, normalized)
     
     async def get(
         self, 
         cache_type: str, 
+        account_id: str,
         key: Any, 
         fetch_func: Callable, 
         ttl: Optional[float] = None,
@@ -180,6 +198,7 @@ class TelegramCache:
         
         Args:
             cache_type: Type of cached object (use class constants)
+            account_id: Account identifier (phone_number) for cache isolation
             key: Cache key (will be normalized)
             fetch_func: Async function to call on cache miss (no args)
             ttl: Optional TTL override (uses default for cache_type if None)
@@ -194,12 +213,13 @@ class TelegramCache:
         Example:
             entity = await cache.get(
                 cache_type=TelegramCache.ENTITY,
+                account_id=client.phone_number,
                 key=chat_id,
                 fetch_func=lambda: client.get_entity(chat_id),
                 rate_limit_method='get_entity'
             )
         """
-        cache_key = self._normalize_key(cache_type, key)
+        cache_key = self._normalize_key(cache_type, account_id, key)
         ttl = ttl or self._ttls.get(cache_type, 300)
         
         # Fast path: Check cache without lock (read-mostly optimization)
@@ -207,7 +227,7 @@ class TelegramCache:
         if entry and not entry.is_expired():
             async with self._lock:  # Brief lock to update stats
                 self._stats['hits'] += 1
-            self.logger.debug(f"Cache HIT: {cache_type}:{key}")
+                self.logger.debug(f"Cache HIT: {cache_type}:{account_id}:{key}")
             return entry.value
         
         # Slow path: Need to fetch (acquire lock for coordination)
@@ -216,7 +236,7 @@ class TelegramCache:
             entry = self._cache.get(cache_key)
             if entry and not entry.is_expired():
                 self._stats['hits'] += 1
-                self.logger.debug(f"Cache HIT (after lock): {cache_type}:{key}")
+                self.logger.debug(f"Cache HIT (after lock): {cache_type}:{account_id}:{key}")
                 return entry.value
             
             # Check if request already in-flight
@@ -224,7 +244,7 @@ class TelegramCache:
                 in_flight = self._in_flight[cache_key]
                 in_flight.waiters += 1
                 self._stats['dedup_saves'] += 1
-                self.logger.debug(f"In-flight WAIT: {cache_type}:{key} ({in_flight.waiters} waiters)")
+                self.logger.debug(f"In-flight WAIT: {cache_type}:{account_id}:{key} ({in_flight.waiters} waiters)")
                 
                 # Release lock and wait for in-flight request to complete
                 # CRITICAL: Must release lock or we deadlock the fetcher
@@ -232,22 +252,21 @@ class TelegramCache:
             else:
                 # We're the first - create in-flight tracker
                 future = asyncio.Future()
+                future.add_done_callback(self._consume_future_result)
                 self._in_flight[cache_key] = InFlightRequest(
                     future=future,
                     started_at=time.time(),
                     waiters=0
                 )
-                self.logger.debug(f"Cache MISS: {cache_type}:{key} (fetching)")
+                self.logger.debug(f"Cache MISS: {cache_type}:{account_id}:{key} (fetching)")
                 self._stats['misses'] += 1
-                future = None  # Signal that we need to fetch
-        
-        # If we're waiting on another request
+                future = None  # Signal that we need to fetch        # If we're waiting on another request
         if future is not None:
             try:
                 result = await future
                 return result
             except Exception as e:
-                self.logger.warning(f"In-flight request failed: {cache_type}:{key}: {e}")
+                self.logger.warning(f"In-flight request failed: {cache_type}:{account_id}:{key}: {e}")
                 raise
         
         # We're responsible for fetching
@@ -287,7 +306,7 @@ class TelegramCache:
                     in_flight.future.set_result(value)
                     del self._in_flight[cache_key]
                     if in_flight.waiters > 0:
-                        self.logger.debug(f"In-flight COMPLETE: {cache_type}:{key} ({in_flight.waiters} waiters notified)")
+                        self.logger.debug(f"In-flight COMPLETE: {cache_type}:{account_id}:{key} ({in_flight.waiters} waiters notified)")
             
             return value
             
@@ -300,7 +319,7 @@ class TelegramCache:
                         in_flight.future.set_exception(e)
                     del self._in_flight[cache_key]
             
-            self.logger.error(f"Fetch failed: {cache_type}:{key}: {e}")
+            self.logger.error(f"Fetch failed: {cache_type}:{account_id}:{key}: {e}")
             raise
     
     async def get_entity(self, identifier: Any, client: 'Client') -> Any:
@@ -317,6 +336,7 @@ class TelegramCache:
         """
         return await self.get(
             cache_type=self.ENTITY,
+            account_id=client.phone_number,
             key=identifier,
             fetch_func=lambda: client.client.get_entity(identifier),
             rate_limit_method='get_entity'
@@ -336,6 +356,7 @@ class TelegramCache:
         """
         return await self.get(
             cache_type=self.MESSAGE,
+            account_id=client.phone_number,
             key=(chat_id, message_id),
             fetch_func=lambda: client.client.get_messages(chat_id, ids=message_id),
             rate_limit_method='get_messages'
@@ -357,6 +378,7 @@ class TelegramCache:
         
         return await self.get(
             cache_type=self.INPUT_PEER,
+            account_id=client.phone_number,
             key=entity_id,
             fetch_func=lambda: client.client.get_input_entity(entity),
             rate_limit_method='get_entity'  # Same rate limit as get_entity
@@ -377,28 +399,30 @@ class TelegramCache:
         
         return await self.get(
             cache_type=self.FULL_CHANNEL,
+            account_id=client.phone_number,
             key=channel_id,
             fetch_func=lambda: client.client(functions.channels.GetFullChannelRequest(channel=channel_id)),
             rate_limit_method='get_entity'
         )
     
-    async def invalidate(self, cache_type: str, key: Any) -> bool:
+    async def invalidate(self, cache_type: str, account_id: str, key: Any) -> bool:
         """
         Manually invalidate a cache entry.
         
         Args:
             cache_type: Type of cached object
+            account_id: Account identifier for cache isolation
             key: Cache key to invalidate
         
         Returns:
             True if entry was removed, False if not found
         """
-        cache_key = self._normalize_key(cache_type, key)
+        cache_key = self._normalize_key(cache_type, account_id, key)
         
         async with self._lock:
             if cache_key in self._cache:
                 del self._cache[cache_key]
-                self.logger.debug(f"Cache INVALIDATE: {cache_type}:{key}")
+                self.logger.debug(f"Cache INVALIDATE: {cache_type}:{account_id}:{key}")
                 return True
             return False
     

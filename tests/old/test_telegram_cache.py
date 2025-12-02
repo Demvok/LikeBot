@@ -3,6 +3,7 @@ Test suite for Telegram cache system.
 
 Tests cover:
 - Basic cache hits/misses and expiration
+- Per-account cache isolation
 - Concurrent in-flight request de-duplication
 - Thread safety with concurrent different keys
 - LRU eviction policy
@@ -13,6 +14,10 @@ Tests cover:
 import pytest
 import asyncio
 from auxilary_logic.telegram_cache import TelegramCache, CacheEntry, InFlightRequest
+
+# Test account identifiers
+ACCOUNT_1 = "+1234567890"
+ACCOUNT_2 = "+0987654321"
 
 
 @pytest.mark.asyncio
@@ -27,12 +32,12 @@ async def test_cache_hit():
         return {"id": 123, "name": "Test"}
     
     # First call - cache miss
-    result1 = await cache.get("entity", 123, fetch_func)
+    result1 = await cache.get("entity", ACCOUNT_1, 123, fetch_func)
     assert result1 == {"id": 123, "name": "Test"}
     assert call_count == 1
     
     # Second call - cache hit
-    result2 = await cache.get("entity", 123, fetch_func)
+    result2 = await cache.get("entity", ACCOUNT_1, 123, fetch_func)
     assert result2 == {"id": 123, "name": "Test"}
     assert call_count == 1  # Should not increase
     
@@ -54,14 +59,14 @@ async def test_cache_expiration():
         return f"value_{call_count}"
     
     # First call
-    result1 = await cache.get("entity", 123, fetch_func, ttl=0.1)  # 100ms TTL
+    result1 = await cache.get("entity", ACCOUNT_1, 123, fetch_func, ttl=0.1)  # 100ms TTL
     assert result1 == "value_1"
     
     # Wait for expiration
     await asyncio.sleep(0.15)
     
     # Second call - should refetch
-    result2 = await cache.get("entity", 123, fetch_func, ttl=0.1)
+    result2 = await cache.get("entity", ACCOUNT_1, 123, fetch_func, ttl=0.1)
     assert result2 == "value_2"
     assert call_count == 2
 
@@ -79,7 +84,7 @@ async def test_in_flight_deduplication():
         return {"id": 123}
     
     # Launch 10 concurrent requests for same entity
-    tasks = [cache.get("entity", 123, slow_fetch) for _ in range(10)]
+    tasks = [cache.get("entity", ACCOUNT_1, 123, slow_fetch) for _ in range(10)]
     results = await asyncio.gather(*tasks)
     
     # All should return same result
@@ -109,7 +114,7 @@ async def test_thread_safety_concurrent_different_keys():
     # Launch concurrent requests for 20 different keys
     tasks = []
     for i in range(20):
-        tasks.append(cache.get("entity", i, await fetch_factory(i)))
+        tasks.append(cache.get("entity", ACCOUNT_1, i, await fetch_factory(i)))
     
     results = await asyncio.gather(*tasks)
     
@@ -129,20 +134,20 @@ async def test_lru_eviction():
     for i in range(5):
         async def fetch(val=i):
             return {"id": val}
-        await cache.get("entity", i, fetch)
+        await cache.get("entity", ACCOUNT_1, i, fetch)
     
     assert len(cache._cache) == 5
     
     # Add one more - should evict oldest (key 0)
     async def fetch_new():
         return {"id": 5}
-    await cache.get("entity", 5, fetch_new)
+    await cache.get("entity", ACCOUNT_1, 5, fetch_new)
     
     assert len(cache._cache) == 5
     assert cache.get_stats()['evictions'] == 1
     
     # Key 0 should be evicted
-    cache_keys = [k[1] for k in cache._cache.keys()]
+    cache_keys = [k[2] for k in cache._cache.keys()]  # Changed from k[1] to k[2] for account-aware keys
     assert "0" not in cache_keys
     assert "5" in cache_keys
 
@@ -157,7 +162,7 @@ async def test_fetch_error_propagation():
         raise ValueError("API Error")
     
     # Launch concurrent requests that will all fail
-    tasks = [cache.get("entity", 123, failing_fetch) for _ in range(5)]
+    tasks = [cache.get("entity", ACCOUNT_1, 123, failing_fetch) for _ in range(5)]
     
     # All should raise the same exception
     with pytest.raises(ValueError, match="API Error"):
@@ -178,10 +183,11 @@ async def test_get_entity_integration():
             return {"id": identifier, "name": f"User{identifier}"}
     
     class MockClient:
-        def __init__(self):
+        def __init__(self, phone):
             self.client = MockTelegramClient()
+            self.phone_number = phone
     
-    mock_client = MockClient()
+    mock_client = MockClient(ACCOUNT_1)
     
     # First call
     entity1 = await cache.get_entity(123, mock_client)
@@ -202,15 +208,15 @@ async def test_key_normalization():
     cache = TelegramCache(task_id=1)
     
     # Test username normalization
-    assert cache._normalize_key("entity", "@username") == ("entity", "username")
-    assert cache._normalize_key("entity", "USERNAME") == ("entity", "username")
-    assert cache._normalize_key("entity", "@UsErNaMe") == ("entity", "username")
+    assert cache._normalize_key("entity", ACCOUNT_1, "@username") == ("entity", ACCOUNT_1, "username")
+    assert cache._normalize_key("entity", ACCOUNT_1, "USERNAME") == ("entity", ACCOUNT_1, "username")
+    assert cache._normalize_key("entity", ACCOUNT_1, "@UsErNaMe") == ("entity", ACCOUNT_1, "username")
     
     # Test integer keys
-    assert cache._normalize_key("entity", 12345) == ("entity", "12345")
+    assert cache._normalize_key("entity", ACCOUNT_1, 12345) == ("entity", ACCOUNT_1, "12345")
     
     # Test tuple keys (for composite keys like message)
-    assert cache._normalize_key("message", (12345, 678)) == ("message", "12345:678")
+    assert cache._normalize_key("message", ACCOUNT_1, (12345, 678)) == ("message", ACCOUNT_1, "12345:678")
 
 
 @pytest.mark.asyncio
@@ -222,16 +228,16 @@ async def test_cache_invalidation():
         return {"data": "test"}
     
     # Add entry to cache
-    await cache.get("entity", 123, fetch)
+    await cache.get("entity", ACCOUNT_1, 123, fetch)
     assert len(cache._cache) == 1
     
     # Invalidate it
-    result = await cache.invalidate("entity", 123)
+    result = await cache.invalidate("entity", ACCOUNT_1, 123)
     assert result is True
     assert len(cache._cache) == 0
     
     # Try to invalidate non-existent entry
-    result = await cache.invalidate("entity", 999)
+    result = await cache.invalidate("entity", ACCOUNT_1, 999)
     assert result is False
 
 
@@ -244,7 +250,7 @@ async def test_cache_clear():
     for i in range(10):
         async def fetch(val=i):
             return {"id": val}
-        await cache.get("entity", i, fetch)
+        await cache.get("entity", ACCOUNT_1, i, fetch)
     
     assert len(cache._cache) == 10
     
@@ -266,8 +272,8 @@ async def test_different_cache_types():
         return {"type": "message", "id": 123}
     
     # Store same key in different cache types
-    entity = await cache.get(TelegramCache.ENTITY, 123, fetch_entity)
-    message = await cache.get(TelegramCache.MESSAGE, 123, fetch_message)
+    entity = await cache.get(TelegramCache.ENTITY, ACCOUNT_1, 123, fetch_entity)
+    message = await cache.get(TelegramCache.MESSAGE, ACCOUNT_1, 123, fetch_message)
     
     assert entity["type"] == "entity"
     assert message["type"] == "message"
@@ -287,10 +293,10 @@ async def test_rate_limiter_integration():
         return {"id": 123}
     
     # First call - will apply rate limiting
-    await cache.get("entity", 1, fetch, rate_limit_method='get_entity')
+    await cache.get("entity", ACCOUNT_1, 1, fetch, rate_limit_method='get_entity')
     
     # Different key - will apply rate limiting again
-    await cache.get("entity", 2, fetch, rate_limit_method='get_entity')
+    await cache.get("entity", ACCOUNT_1, 2, fetch, rate_limit_method='get_entity')
     
     # Ensure rate limiting caused a delay (at least 2.5 seconds based on config)
     if len(call_times) >= 2:
@@ -314,7 +320,7 @@ async def test_concurrent_mixed_operations():
     
     # Pre-populate some entries
     for i in range(5):
-        await cache.get("entity", i, await fetch_factory(i))
+        await cache.get("entity", ACCOUNT_1, i, await fetch_factory(i))
     
     # Launch mixed operations:
     # - Some will hit cache (0-4)
@@ -323,7 +329,7 @@ async def test_concurrent_mixed_operations():
     tasks = []
     for i in range(20):
         key = i % 10  # Create duplicates
-        tasks.append(cache.get("entity", key, await fetch_factory(key)))
+        tasks.append(cache.get("entity", ACCOUNT_1, key, await fetch_factory(key)))
     
     results = await asyncio.gather(*tasks)
     
@@ -348,10 +354,10 @@ async def test_cache_stats_accuracy():
         return {"id": val}
     
     # Perform various operations
-    await cache.get("entity", 1, lambda: fetch(1))  # Miss
-    await cache.get("entity", 1, lambda: fetch(1))  # Hit
-    await cache.get("entity", 1, lambda: fetch(1))  # Hit
-    await cache.get("entity", 2, lambda: fetch(2))  # Miss
+    await cache.get("entity", ACCOUNT_1, 1, lambda: fetch(1))  # Miss
+    await cache.get("entity", ACCOUNT_1, 1, lambda: fetch(1))  # Hit
+    await cache.get("entity", ACCOUNT_1, 1, lambda: fetch(1))  # Hit
+    await cache.get("entity", ACCOUNT_1, 2, lambda: fetch(2))  # Miss
     
     stats = cache.get_stats()
     assert stats['hits'] == 2
@@ -359,6 +365,50 @@ async def test_cache_stats_accuracy():
     assert stats['total_requests'] == 4
     assert stats['hit_rate_percent'] == 50.0
     assert stats['cache_size'] == 2
+
+
+@pytest.mark.asyncio
+async def test_per_account_isolation():
+    """Test that cache isolates entities per account."""
+    cache = TelegramCache(task_id=1)
+    
+    account1_call_count = 0
+    account2_call_count = 0
+    
+    async def fetch_account1():
+        nonlocal account1_call_count
+        account1_call_count += 1
+        return {"id": 123, "account": "account1"}
+    
+    async def fetch_account2():
+        nonlocal account2_call_count
+        account2_call_count += 1
+        return {"id": 123, "account": "account2"}
+    
+    # Same entity ID (123) but different accounts
+    result1 = await cache.get("entity", ACCOUNT_1, 123, fetch_account1)
+    result2 = await cache.get("entity", ACCOUNT_2, 123, fetch_account2)
+    
+    # Both should be fetched (no cross-account cache hit)
+    assert account1_call_count == 1
+    assert account2_call_count == 1
+    
+    # Results should be different
+    assert result1["account"] == "account1"
+    assert result2["account"] == "account2"
+    
+    # Cache should have 2 separate entries
+    assert len(cache._cache) == 2
+    
+    # Second call to account1 should hit cache
+    result1_cached = await cache.get("entity", ACCOUNT_1, 123, fetch_account1)
+    assert account1_call_count == 1  # No additional fetch
+    assert result1_cached == result1
+    
+    # Second call to account2 should also hit cache
+    result2_cached = await cache.get("entity", ACCOUNT_2, 123, fetch_account2)
+    assert account2_call_count == 1  # No additional fetch
+    assert result2_cached == result2
 
 
 if __name__ == "__main__":

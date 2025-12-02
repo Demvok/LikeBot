@@ -50,6 +50,8 @@ delays:
   action_retries: 1  # Number of retries for Telegram actions (react, comment, etc.)
   action_retry_delay: 40  # Delay between action retries (seconds)
   error_retry_delay: 90  # Delay after transient errors (ConnectionError, TimeoutError, RPCError)
+  entity_resolution_retries: 1  # Username/channel resolution attempts (set >1 to enable retries)
+  entity_resolution_retry_delay: 30  # Delay between entity resolution retries (seconds)
   
   # === ANTI-SPAM DELAYS (prevent account bans) ===
   

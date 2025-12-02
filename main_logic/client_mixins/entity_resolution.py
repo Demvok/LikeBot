@@ -5,10 +5,16 @@ Handles resolution of usernames, chat IDs, and message links to Telegram entitie
 Provides caching and optimization for entity lookups.
 """
 
+import asyncio
+from typing import Optional, TYPE_CHECKING
 from urllib.parse import urlparse, unquote
-from telethon import errors
+from telethon import errors, functions
 from main_logic.channel import normalize_chat_id
 from auxilary_logic.humaniser import rate_limiter
+from utils.retry import async_retry
+
+if TYPE_CHECKING:
+    from main_logic.post import Post
 
 
 class EntityResolutionMixin:
@@ -28,8 +34,18 @@ class EntityResolutionMixin:
         if not identifier:
             return identifier
         # Remove @ prefix and normalize case for username comparison
-        normalized = identifier.lstrip('@').lower().strip()
+        stripped = identifier.strip()
+        normalized = stripped.lstrip('@').lower()
         return normalized
+    
+    def _sanitize_username_identifier(self, identifier: str) -> str:
+        """Strip @ prefix while preserving case for Telegram resolution calls."""
+        if not identifier:
+            return identifier
+        stripped = identifier.strip()
+        if stripped.startswith('@'):
+            return stripped[1:]
+        return stripped
     
     def _extract_identifier_from_link(self, link: str):
         """
@@ -72,10 +88,9 @@ class EntityResolutionMixin:
                 username = segments[1]
             else:
                 username = segments[0]
-            
-            # Normalize username for storage
-            normalized_username = self._normalize_url_identifier(username)
-            return normalized_username
+
+            sanitized_username = self._sanitize_username_identifier(username)
+            return sanitized_username
             
         except Exception as e:
             self.logger.warning(f"Error extracting identifier from '{link}': {e}")
@@ -132,7 +147,7 @@ class EntityResolutionMixin:
             self.logger.warning(f"Error extracting URL alias from '{link}': {e}")
             raise
     
-    async def get_message_ids(self, link: str):
+    async def get_message_ids(self, link: Optional[str] = None, post: Optional["Post"] = None):
         """
         Extract (chat_id, message_id, entity) from a Telegram link of types:
         - https://t.me/c/<raw>/<msg>
@@ -147,33 +162,53 @@ class EntityResolutionMixin:
                    and the cached entity object for username-based links
         """
         try:
+            if link is None and post is not None:
+                link = getattr(post, 'message_link', None)
+            if not link:
+                raise ValueError("Message link or Post with message_link is required.")
+
             link = link.strip()
             if '://' not in link:
                 link = 'https://' + link
+
+            skip_db_lookup = post is not None
+
+            if post is not None:
+                chat_id_from_post = getattr(post, 'chat_id', None)
+                message_id_from_post = getattr(post, 'message_id', None)
+                if getattr(post, 'is_validated', False) and chat_id_from_post is not None and message_id_from_post is not None:
+                    try:
+                        message_id = int(message_id_from_post)
+                    except (TypeError, ValueError):
+                        message_id = message_id_from_post
+                    normalized_chat_id = normalize_chat_id(chat_id_from_post)
+                    self.logger.debug(f"Using validated post data for link {link}: chat_id={normalized_chat_id}, message_id={message_id}")
+                    return normalized_chat_id, message_id, None
             
             # First, try to find a stored Post in DB with the same link. If it exists and
             # is already validated, use its chat_id/message_id and skip network resolution.
-            try:
-                from main_logic.database import get_db
-                db = get_db()
-
+            if not skip_db_lookup:
                 try:
-                    post_obj = await db.get_post_by_link(link)
-                    if post_obj and getattr(post_obj, 'is_validated', False):
-                        # Ensure both ids exist and are integers
-                        if post_obj.chat_id is not None and post_obj.message_id is not None:
-                            try:
-                                chat_id_db = int(post_obj.chat_id)
-                                message_id_db = int(post_obj.message_id)
-                                self.logger.debug(f"Found validated post in DB for link {link}: chat_id={chat_id_db}, message_id={message_id_db}")
-                                return chat_id_db, message_id_db, None  # No entity for DB cached posts
-                            except Exception:
-                                self.logger.debug(f"DB post for link {link} had non-integer ids, falling back to resolution")
-                except Exception as _db_err:
-                    # Do not fail on DB errors; fall back to Telethon resolution
-                    self.logger.debug(f"DB lookup by message_link failed for '{link}': {_db_err}")
-            except Exception:
-                pass
+                    from main_logic.database import get_db
+                    db = get_db()
+
+                    try:
+                        post_obj = await db.get_post_by_link(link)
+                        if post_obj and getattr(post_obj, 'is_validated', False):
+                            # Ensure both ids exist and are integers
+                            if post_obj.chat_id is not None and post_obj.message_id is not None:
+                                try:
+                                    chat_id_db = int(post_obj.chat_id)
+                                    message_id_db = int(post_obj.message_id)
+                                    self.logger.debug(f"Found validated post in DB for link {link}: chat_id={chat_id_db}, message_id={message_id_db}")
+                                    return chat_id_db, message_id_db, None  # No entity for DB cached posts
+                                except Exception:
+                                    self.logger.debug(f"DB post for link {link} had non-integer ids, falling back to resolution")
+                    except Exception as _db_err:
+                        # Do not fail on DB errors; fall back to Telethon resolution
+                        self.logger.debug(f"DB lookup by message_link failed for '{link}': {_db_err}")
+                except Exception:
+                    pass
             
             # Parse link to extract message_id
             parsed = urlparse(unquote(link))
@@ -242,33 +277,42 @@ class EntityResolutionMixin:
                 # Session is invalid/expired/revoked or account is banned - re-raise for proper handling upstream
                 self.logger.error(f"Session invalid/expired or account deactivated while resolving '{identifier}': {auth_error}")
                 raise
-            except Exception as e1:
-                # Try several fallbacks: full URL with scheme, http, www variant, and @username.
-                last_exc = e1
-                tried = []
-                candidates = [
-                    f"https://{parsed.netloc}/{identifier}",
-                    f"http://{parsed.netloc}/{identifier}",
-                    f"{parsed.netloc}/{identifier}",
-                    f"@{identifier}",
-                ]
-                entity = None
-                for candidate in candidates:
-                    tried.append(candidate)
-                    try:
-                        entity = await self.get_entity_cached(candidate)
-                        break
-                    except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.SessionRevokedError, errors.UserDeactivatedError, errors.UserDeactivatedBanError) as auth_error:
-                        # Re-raise auth related errors immediately so they can be handled upstream
-                        self.logger.error(f"Session invalid/expired or account deactivated while resolving '{identifier}' using '{candidate}': {auth_error}")
-                        raise
-                    except Exception as e2:
-                        last_exc = e2
-                        self.logger.debug(f"get_entity failed for candidate '{candidate}': {e2}")
-
-                if entity is None:
-                    self.logger.error(f"Failed to resolve username '{identifier}' from link {link}. Tried: {tried}. Errors: {e1}, last: {last_exc}")
-                    raise ValueError(f"Cannot resolve username '{identifier}' from link {link}")
+            except errors.UsernameNotOccupiedError as username_error:
+                # Try accessing the channel via link - sometimes accounts need to "join" first
+                # This resolves the entity and adds it to the account's dialog list
+                self.logger.info(f"Username '{identifier}' not found in cached entities, attempting to access channel via link...")
+                try:
+                    # Try to access the channel using Telegram's link resolver
+                    # This works even if the account hasn't joined the channel
+                    # Use the full link to resolve
+                    resolved_entity = await self.client(functions.contacts.ResolveUsernameRequest(username=identifier))
+                    if resolved_entity and resolved_entity.chats:
+                        # Successfully resolved! Get the chat/channel
+                        entity = resolved_entity.chats[0]
+                        self.logger.info(f"Successfully resolved username '{identifier}' via ResolveUsername")
+                    else:
+                        raise username_error
+                except Exception as resolve_error:
+                    # Username genuinely doesn't exist
+                    self.logger.warning(f"Username '{identifier}' from link {link} does not exist (deleted, changed, or never existed). Resolve attempt also failed: {resolve_error}")
+                    raise ValueError(
+                        f"Username '{identifier}' does not exist. "
+                        f"The channel may have been deleted, changed its username, or the link is incorrect. "
+                        f"Link: {link}"
+                    ) from username_error
+            except errors.UsernameInvalidError as invalid_error:
+                # Username format is invalid
+                self.logger.warning(f"Username '{identifier}' from link {link} has invalid format")
+                raise ValueError(
+                    f"Username '{identifier}' has invalid format. "
+                    f"Check the link for typos. Link: {link}"
+                ) from invalid_error
+            except Exception as resolve_error:
+                self.logger.error(f"Failed to resolve username '{identifier}' from link {link}: {resolve_error}")
+                raise ValueError(
+                    f"Cannot resolve username '{identifier}' from link {link}. "
+                    f"Please verify that the link is correct and the channel still exists."
+                ) from resolve_error
 
             chat_id = normalize_chat_id(entity.id)
             
@@ -290,6 +334,25 @@ class EntityResolutionMixin:
         except Exception as e:
             self.logger.warning(f"Error extracting IDs from '{link}': {e}")
             raise
+
+    @async_retry(
+        retries_key='entity_resolution_retries',
+        delay_key='entity_resolution_retry_delay',
+        retry_exceptions=(errors.RPCError, ConnectionError, asyncio.TimeoutError),
+        no_retry_exceptions=(
+            errors.AuthKeyUnregisteredError,
+            errors.AuthKeyInvalidError,
+            errors.SessionRevokedError,
+            errors.UserDeactivatedError,
+            errors.UserDeactivatedBanError,
+            errors.UsernameNotOccupiedError,
+            errors.UsernameInvalidError,
+        ),
+        logger_attr='logger',
+    )
+    async def _fetch_entity_with_retry(self, identifier):
+        """Fetch entity via telegram_cache with configurable retries for transient errors."""
+        return await self.telegram_cache.get_entity(identifier, self)
 
     async def get_entity_cached(self, identifier):
         """
@@ -318,7 +381,7 @@ class EntityResolutionMixin:
                 f"or use client.client.get_entity() directly for uncached access."
             )
         
-        return await self.telegram_cache.get_entity(identifier, self)
+        return await self._fetch_entity_with_retry(identifier)
     
     async def get_message_content(self, chat_id=None, message_id=None, message_link=None) -> str | None:
         """

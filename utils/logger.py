@@ -1,4 +1,4 @@
-import logging, time, sys, os, yaml, multiprocessing, threading, traceback, inspect, copy, glob
+import logging, time, sys, os, yaml, multiprocessing, threading, traceback, inspect, copy, glob, atexit
 from asyncio import CancelledError
 from functools import wraps
 from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
@@ -315,6 +315,9 @@ def cleanup_logging():
             _log_queue.join_thread()
         except Exception:
             pass
+
+
+atexit.register(cleanup_logging)
 
 
 def get_log_directory() -> str:

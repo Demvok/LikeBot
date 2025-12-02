@@ -2,7 +2,6 @@
 
 ### TO DO:
 
-- remove entity caching
 - redo analysis & test
 - simplify agent mixins
 
@@ -25,12 +24,26 @@
 - add report export as .csv/.xlsx
 - add .xlsx proxy import
 - refactor `task.py` and split it into blocks
+- add counter table reset on deletion
+- fix counters logic - merges new objects with old ones
 
 #### TO TEST:
 - added task cancelling on API stop (WIP)
 - included chat_id to chat username mapping into channel parser
 
 ## Changelog
+
+### v.1.1.4
+
+
+### v.1.1.3
+- removed entity caching on task scope, still is used per client
+- fixed incorrect task crashing on account error
+- fixed retries on channel name resolution
+- fixed post validation racing issues
+- fixed channel name racing and retry issues
+- added post object reuse between workers to decrease DB calls
+- fixed some telegram cache futures
 
 ### v.1.1.2
 - reviewed and standartized pauses and retries for flood avoiding

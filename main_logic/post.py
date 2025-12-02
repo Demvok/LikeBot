@@ -1,3 +1,4 @@
+import asyncio
 from pandas import Timestamp
 import datetime
 
@@ -7,6 +8,45 @@ from utils.logger import load_config
 from main_logic.channel import normalize_chat_id
 
 config = load_config()
+
+
+# Registry of per-post asyncio locks used to serialize validation attempts.
+_validation_lock_registry: dict[str, asyncio.Lock] = {}
+_registry_lock: asyncio.Lock | None = None
+
+
+def _ensure_registry_lock() -> asyncio.Lock:
+    global _registry_lock
+    if _registry_lock is None:
+        _registry_lock = asyncio.Lock()
+    return _registry_lock
+
+
+def _lock_key_for_post(post: "Post") -> str:
+    if getattr(post, 'post_id', None) is not None:
+        return f"post:{post.post_id}"
+    if getattr(post, 'message_link', None):
+        return f"link:{post.message_link}"
+    return f"object:{id(post)}"
+
+
+async def _acquire_post_lock(post: "Post") -> tuple[str, asyncio.Lock]:
+    key = _lock_key_for_post(post)
+    registry_lock = _ensure_registry_lock()
+    async with registry_lock:
+        lock = _validation_lock_registry.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _validation_lock_registry[key] = lock
+    return key, lock
+
+
+async def _release_post_lock(key: str, lock: asyncio.Lock) -> None:
+    registry_lock = _ensure_registry_lock()
+    async with registry_lock:
+        current = _validation_lock_registry.get(key)
+        if current is lock and not lock.locked():
+            _validation_lock_registry.pop(key, None)
 
 
 class Post:
@@ -146,117 +186,139 @@ class Post:
                     already_validated += 1
                     new_posts.append(post)
                     continue
-                
-                # Try validation with limited number of clients.
-                # Skip any clients that are currently non-usable (status changed while running)
-                validation_succeeded = False
-                last_error = None
-                usable_clients = [c for c in clients if getattr(c, 'account', None) and c.account.is_usable()]
-                if not usable_clients:
-                    # Nothing to try - all clients are non-usable
-                    if logger:
-                        logger.error(f"No usable clients available to validate post {post.post_id}.")
-                    raise ValueError(f"No usable clients available to validate post {post.post_id}.")
 
-                clients_to_try = min(max_clients_per_post, len(usable_clients))
+                lock_key: str | None = None
+                validation_lock: asyncio.Lock | None = None
+                try:
+                    lock_key, validation_lock = await _acquire_post_lock(post)
+                    async with validation_lock:
+                        refreshed_post = None
+                        if getattr(post, 'post_id', None) is not None:
+                            refreshed_post = await db.get_post(post.post_id)
+                        elif getattr(post, 'message_link', None) and hasattr(db, 'get_post_by_link'):
+                            refreshed_post = await db.get_post_by_link(post.message_link)
 
-                for client_idx, client in enumerate(usable_clients[:clients_to_try]):
-                    try:
-                        if logger:
-                            logger.debug(f"Attempting to validate post {post.post_id} with client {client_idx + 1}/{clients_to_try}")
+                        if refreshed_post:
+                            post = refreshed_post
+
+                        if post.is_validated:
+                            already_validated += 1
+                            new_posts.append(post)
+                            continue
                         
-                        await post.validate(client=client, logger=logger)
-                        new_post = await db.get_post(post.post_id)
-                        new_posts.append(new_post)
+                        # Try validation with limited number of clients.
+                        # Skip any clients that are currently non-usable (status changed while running)
+                        validation_succeeded = False
+                        last_error = None
+                        usable_clients = [c for c in clients if getattr(c, 'account', None) and c.account.is_usable()]
+                        if not usable_clients:
+                            # Nothing to try - all clients are non-usable
+                            if logger:
+                                logger.error(f"No usable clients available to validate post {post.post_id}.")
+                            raise ValueError(f"No usable clients available to validate post {post.post_id}.")
 
-                        if new_post.is_validated:
-                            newly_validated += 1
-                            validation_succeeded = True
-                            if logger:
-                                logger.debug(f"Post {post.post_id} validated successfully with client {client_idx + 1}")
-                            break ### Exit the client loop on success
-                        else:
-                            if logger:
-                                logger.warning(f"Post {post.post_id} validation returned but not validated with client {client_idx + 1}")
-                    
-                    except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.SessionRevokedError) as auth_error:
-                        last_error = auth_error
-                        if logger:
-                            logger.error(f"Client {client.phone_number} has invalid/expired session while validating post {post.post_id}: {auth_error}")
-                        # Use centralized mapping to decide action and status
-                        from auxilary_logic.telethon_error_handler import map_telethon_exception
-                        mapping = map_telethon_exception(auth_error)
-                        try:
-                            if mapping.get('status'):
-                                await client.account.update_status(mapping['status'], error=auth_error)
+                        clients_to_try = min(max_clients_per_post, len(usable_clients))
+
+                        for client_idx, client in enumerate(usable_clients[:clients_to_try]):
+                            try:
                                 if logger:
-                                    logger.info(f"Marked account {client.phone_number} as {mapping['status']}")
-                        except Exception as update_error:
-                            if logger:
-                                logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
-                        # Try next client
-                        continue
-                    
-                    except errors.UserDeactivatedBanError as ban_error:
-                        last_error = ban_error
-                        if logger:
-                            logger.error(f"Client {client.phone_number} is banned: {ban_error}")
-                        from auxilary_logic.telethon_error_handler import map_telethon_exception
-                        mapping = map_telethon_exception(ban_error)
-                        try:
-                            if mapping.get('status'):
-                                await client.account.update_status(mapping['status'], error=ban_error)
+                                    logger.debug(f"Attempting to validate post {post.post_id} with client {client_idx + 1}/{clients_to_try}")
+                                
+                                await post.validate(client=client, logger=logger)
+                                new_post = await db.get_post(post.post_id)
+                                new_posts.append(new_post)
+
+                                if new_post.is_validated:
+                                    newly_validated += 1
+                                    validation_succeeded = True
+                                    if logger:
+                                        logger.debug(f"Post {post.post_id} validated successfully with client {client_idx + 1}")
+                                    break ### Exit the client loop on success
+                                else:
+                                    if logger:
+                                        logger.warning(f"Post {post.post_id} validation returned but not validated with client {client_idx + 1}")
+                            
+                            except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.SessionRevokedError) as auth_error:
+                                last_error = auth_error
                                 if logger:
-                                    logger.info(f"Marked account {client.phone_number} as {mapping['status']}")
-                        except Exception as update_error:
-                            if logger:
-                                logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
-                        # Try next client
-                        continue
-                    
-                    except errors.PhoneNumberBannedError as ban_error:
-                        last_error = ban_error
-                        if logger:
-                            logger.error(f"Client {client.phone_number} phone number is banned: {ban_error}")
-                        from auxilary_logic.telethon_error_handler import map_telethon_exception
-                        mapping = map_telethon_exception(ban_error)
-                        try:
-                            if mapping.get('status'):
-                                await client.account.update_status(mapping['status'], error=ban_error)
+                                    logger.error(f"Client {client.phone_number} has invalid/expired session while validating post {post.post_id}: {auth_error}")
+                                # Use centralized mapping to decide action and status
+                                from auxilary_logic.telethon_error_handler import map_telethon_exception
+                                mapping = map_telethon_exception(auth_error)
+                                try:
+                                    if mapping.get('status'):
+                                        await client.account.update_status(mapping['status'], error=auth_error)
+                                        if logger:
+                                            logger.info(f"Marked account {client.phone_number} as {mapping['status']}")
+                                except Exception as update_error:
+                                    if logger:
+                                        logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
+                                # Try next client
+                                continue
+                            
+                            except errors.UserDeactivatedBanError as ban_error:
+                                last_error = ban_error
                                 if logger:
-                                    logger.info(f"Marked account {client.phone_number} as {mapping['status']}")
-                        except Exception as update_error:
+                                    logger.error(f"Client {client.phone_number} is banned: {ban_error}")
+                                from auxilary_logic.telethon_error_handler import map_telethon_exception
+                                mapping = map_telethon_exception(ban_error)
+                                try:
+                                    if mapping.get('status'):
+                                        await client.account.update_status(mapping['status'], error=ban_error)
+                                        if logger:
+                                            logger.info(f"Marked account {client.phone_number} as {mapping['status']}")
+                                except Exception as update_error:
+                                    if logger:
+                                        logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
+                                # Try next client
+                                continue
+                            
+                            except errors.PhoneNumberBannedError as ban_error:
+                                last_error = ban_error
+                                if logger:
+                                    logger.error(f"Client {client.phone_number} phone number is banned: {ban_error}")
+                                from auxilary_logic.telethon_error_handler import map_telethon_exception
+                                mapping = map_telethon_exception(ban_error)
+                                try:
+                                    if mapping.get('status'):
+                                        await client.account.update_status(mapping['status'], error=ban_error)
+                                        if logger:
+                                            logger.info(f"Marked account {client.phone_number} as {mapping['status']}")
+                                except Exception as update_error:
+                                    if logger:
+                                        logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
+                                # Try next client
+                                continue
+                            
+                            except errors.RPCError as rpc_error:
+                                last_error = rpc_error
+                                if logger:
+                                    logger.warning(f"Telegram error validating post {post.post_id} with client {client.phone_number}: {rpc_error}")
+                                # Try next client
+                                continue
+                            
+                            except Exception as client_error:
+                                last_error = client_error
+                                if logger:
+                                    logger.warning(f"Error validating post {post.post_id} with client {client.phone_number}: {client_error}")
+                                # Try next client
+                                continue
+                        
+                        # If all attempted clients failed, add to failed count and raise the last error
+                        if not validation_succeeded:
+                            failed_validation += 1
+                            error_type = type(last_error).__name__ if last_error else "Unknown"
                             if logger:
-                                logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
-                        # Try next client
-                        continue
-                    
-                    except errors.RPCError as rpc_error:
-                        last_error = rpc_error
-                        if logger:
-                            logger.warning(f"Telegram error validating post {post.post_id} with client {client.phone_number}: {rpc_error}")
-                        # Try next client
-                        continue
-                    
-                    except Exception as client_error:
-                        last_error = client_error
-                        if logger:
-                            logger.warning(f"Error validating post {post.post_id} with client {client.phone_number}: {client_error}")
-                        # Try next client
-                        continue
-                
-                # If all attempted clients failed, add to failed count and raise the last error
-                if not validation_succeeded:
-                    failed_validation += 1
-                    error_type = type(last_error).__name__ if last_error else "Unknown"
-                    if logger:
-                        logger.error(f"Post {post.post_id} failed validation with {clients_to_try} clients. Last error ({error_type}): {last_error}")
-                    
-                    # Provide more helpful error message based on error type
-                    if isinstance(last_error, (errors.AuthKeyUnregisteredError, errors.SessionRevokedError)):
-                        raise ValueError(f"Post {post.post_id} validation failed: All {clients_to_try} client sessions are invalid/expired or revoked. Please re-login accounts.")
-                    else:
-                        raise last_error if last_error else ValueError(f"Post {post.post_id} failed validation with {clients_to_try} clients")
+                                logger.error(f"Post {post.post_id} failed validation with {clients_to_try} clients. Last error ({error_type}): {last_error}")
+                            
+                            # Provide more helpful error message based on error type
+                            if isinstance(last_error, (errors.AuthKeyUnregisteredError, errors.SessionRevokedError)):
+                                raise ValueError(f"Post {post.post_id} validation failed: All {clients_to_try} client sessions are invalid/expired or revoked. Please re-login accounts.")
+                            else:
+                                raise last_error if last_error else ValueError(f"Post {post.post_id} failed validation with {clients_to_try} clients")
+                finally:
+                    if lock_key is not None and validation_lock is not None:
+                        await _release_post_lock(lock_key, validation_lock)
 
             except Exception as e:
                 if logger:

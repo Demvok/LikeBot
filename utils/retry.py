@@ -120,6 +120,7 @@ def get_retry_config(key: str, default: int = None) -> int:
         'action_retries': 1,
         'connection_retries': 5,
         'session_creation_retries': 2,
+        'entity_resolution_retries': 1,
     }
     if default is None:
         default = defaults.get(key, 1)
@@ -142,6 +143,7 @@ def get_delay_config(key: str, default: float = None) -> float:
         'action_retry_delay': 2.0,
         'reconnect_delay': 3.0,
         'error_retry_delay': 5.0,
+        'entity_resolution_retry_delay': 30.0,
         'anti_spam_delay_min': 0.5,
         'anti_spam_delay_max': 2.0,
         'min_delay_between_reactions': 3.0,
