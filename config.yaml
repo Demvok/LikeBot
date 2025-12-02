@@ -18,6 +18,7 @@ database:
 
 cache:
   # Task-scoped Telegram object cache settings
+  scope: "process"  # "task" (default) or "process" for long-lived cache
   entity_ttl: 300  # 5 minutes - entities (users, channels, chats)
   message_ttl: 60  # 1 minute - message objects
   full_channel_ttl: 600  # 10 minutes - full channel info (reactions, discussion groups)
@@ -25,6 +26,11 @@ cache:
   input_peer_ttl: 300  # 5 minutes - InputPeer objects
   max_size: 500  # Maximum cache entries per task (increased from 100 per client)
   enable_in_flight_dedup: true  # De-duplicate concurrent requests (recommended: true)
+  process:
+    max_size: 2000  # Overrides task max_size when scope == "process"
+    cleanup_interval: 60  # Seconds between background sweeps for expired entries
+  per_account:
+    max_entries: 400  # Prevent a single account from consuming the entire cache
 
 proxy:
   mode: "soft"  # "strict" or "soft" - strict fails on proxy error, soft falls back to no proxy

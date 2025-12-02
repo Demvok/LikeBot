@@ -1,33 +1,13 @@
-"""
-Telegram Cache Module
+"""Telegram cache primitives with optional task/process scope management."""
 
-Task-scoped, thread-safe cache for Telegram API objects with per-account isolation.
-
-Features:
-- Per-account cache isolation (entities from one account cannot be used by another)
-- Thread-safe concurrent access with asyncio.Lock
-- In-flight request de-duplication (prevents redundant API calls)
-- Auto-expiring entries with configurable TTL per object type
-- LRU eviction when max size exceeded
-- Integrated rate limiting on cache misses
-- Support for multiple object types (entities, messages, channels)
-
-Usage:
-    # In task.py _run():
-    cache = TelegramCache(task_id=self.task_id)
-    
-    # Inject into clients:
-    for client in clients:
-        client.telegram_cache = cache
-    
-    # In client methods (cache uses client.phone_number for isolation):
-    entity = await self.telegram_cache.get_entity(identifier, self.client)
-"""
+from __future__ import annotations
 
 import asyncio
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
+from contextlib import suppress
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Optional, Callable, Dict, Tuple, TYPE_CHECKING
 
 from utils.logger import setup_logger, load_config
@@ -37,6 +17,19 @@ from auxilary_logic.humaniser import rate_limiter
 if TYPE_CHECKING:
     from main_logic.agent import Client
 
+__all__ = [
+    "CacheEntry",
+    "InFlightRequest",
+    "TelegramCache",
+    "TelegramCacheScope",
+]
+
+
+class TelegramCacheScope(str, Enum):
+    """Runtime scope for cache lifetime management."""
+
+    TASK = "task"
+    PROCESS = "process"
 
 @dataclass
 class CacheEntry:
@@ -46,6 +39,7 @@ class CacheEntry:
     ttl: float
     cache_type: str
     key: str
+    owner_account: str | None = None
     
     def is_expired(self) -> bool:
         """Check if entry has expired based on TTL."""
@@ -62,27 +56,7 @@ class InFlightRequest:
 
 class TelegramCache:
     """
-    Task-scoped cache for Telegram API objects with per-account isolation.
-    
-    Features:
-    - Per-account cache isolation (entities from one account cannot be used by another)
-    - Thread-safe concurrent access with asyncio.Lock
-    - In-flight request de-duplication (prevents redundant API calls)
-    - Auto-expiring entries with configurable TTL per object type
-    - LRU eviction when max size exceeded
-    - Integrated rate limiting on cache misses
-    - Support for multiple object types (entities, messages, channels)
-    
-    Usage:
-        # In task.py _run():
-        cache = TelegramCache(task_id=self.task_id)
-        
-        # Inject into clients:
-        for client in clients:
-            client.telegram_cache = cache
-        
-        # In client methods (cache uses client.phone_number for isolation):
-        entity = await self.telegram_cache.get_entity(identifier, self.client)
+    Task- or process-scoped cache for Telegram API objects with per-account isolation.
     """
     
     # Cache type constants
@@ -92,36 +66,41 @@ class TelegramCache:
     DISCUSSION = "discussion"
     INPUT_PEER = "input_peer"
     
-    def __init__(self, task_id: int = None, max_size: int = None):
-        """
-        Initialize task-scoped cache.
-        
-        Args:
-            task_id: Optional task ID for logging context
-            max_size: Maximum cache entries (default from config)
-        """
+    def __init__(
+        self,
+        task_id: int | None = None,
+        max_size: int | None = None,
+        *,
+        scope: TelegramCacheScope = TelegramCacheScope.TASK,
+        per_account_max_entries: int | None = None,
+        enable_background_cleanup: bool = False,
+        cleanup_interval: int = 60,
+    ):
+        """Initialize cache instance for a specific scope."""
+
+        self.scope = scope
         self.task_id = task_id
-        self.logger = setup_logger(f"TelegramCache_Task{task_id}", "main.log")
-        
-        # Load configuration
+        scope_suffix = scope.value if scope else "task"
+        label = f"TelegramCache_{scope_suffix}_{task_id or 'process'}"
+        self.logger = setup_logger(label, "main.log")
+
         config = load_config()
         cache_config = config.get('cache', {})
-        
-        # Cache storage: {(cache_type, account_id, key): CacheEntry}
-        # account_id ensures entities are cached per-account (session-specific)
-        self._cache: OrderedDict[Tuple[str, str, str], CacheEntry] = OrderedDict()
-        
-        # In-flight requests: {(cache_type, account_id, key): InFlightRequest}
-        self._in_flight: Dict[Tuple[str, str, str], InFlightRequest] = {}
-        
-        # Thread safety
+
+        # Cache storage: {(cache_type, normalized_key): CacheEntry}
+        self._cache: OrderedDict[Tuple[str, str], CacheEntry] = OrderedDict()
+        self._account_entry_counts: Counter[str] = Counter()
+        self._in_flight: Dict[Tuple[str, str], InFlightRequest] = {}
         self._lock = asyncio.Lock()
-        
-        # Configuration
+
         self._max_size = max_size or cache_config.get('max_size', 500)
         self._enable_dedup = cache_config.get('enable_in_flight_dedup', True)
-        
-        # TTL per cache type (seconds)
+        self._per_account_max_entries = per_account_max_entries
+        self._cleanup_interval = cleanup_interval
+        self._background_cleanup_enabled = enable_background_cleanup and scope == TelegramCacheScope.PROCESS
+        self._cleanup_task: asyncio.Task | None = None
+        self._shutdown = False
+
         self._ttls = {
             self.ENTITY: cache_config.get('entity_ttl', 300),
             self.MESSAGE: cache_config.get('message_ttl', 60),
@@ -129,16 +108,67 @@ class TelegramCache:
             self.DISCUSSION: cache_config.get('discussion_ttl', 300),
             self.INPUT_PEER: cache_config.get('input_peer_ttl', 300),
         }
-        
-        # Statistics
+
         self._stats = {
             'hits': 0,
             'misses': 0,
-            'dedup_saves': 0,  # Times we avoided duplicate API calls
+            'dedup_saves': 0,
             'evictions': 0,
+            'expired': 0,
         }
-        
-        self.logger.info(f"TelegramCache initialized: max_size={self._max_size}, dedup={self._enable_dedup}")
+
+        if self._background_cleanup_enabled:
+            self._start_cleanup_task()
+
+        self.logger.info(
+            "TelegramCache initialized scope=%s max_size=%s per_account_max=%s dedup=%s",
+            self.scope.value,
+            self._max_size,
+            self._per_account_max_entries,
+            self._enable_dedup,
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle helpers
+    # ------------------------------------------------------------------
+
+    def _start_cleanup_task(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.logger.warning("Cleanup task not started: no running event loop")
+            return
+
+        if self._cleanup_task and not self._cleanup_task.done():
+            return
+
+        self._cleanup_task = loop.create_task(self._cleanup_loop())
+        self.logger.debug("Started cache cleanup task (interval=%ss)", self._cleanup_interval)
+
+    async def _cleanup_loop(self) -> None:
+        try:
+            while not self._shutdown:
+                await asyncio.sleep(self._cleanup_interval)
+                removed = await self._remove_expired_entries()
+                if removed:
+                    self.logger.debug("Cleanup removed %s expired entries", removed)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.warning("Cleanup loop error: %s", exc)
+
+    async def shutdown(self, *, clear_cache: bool = True) -> None:
+        """Stop cleanup tasks and optionally clear entries."""
+
+        self._shutdown = True
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._cleanup_task
+            self._cleanup_task = None
+
+        if clear_cache:
+            await self.clear()
 
     def _consume_future_result(self, future: asyncio.Future) -> None:
         """Ensure future result/exception is retrieved to avoid unhandled warnings."""
@@ -153,22 +183,21 @@ class TelegramCache:
             except Exception:
                 pass
     
-    def _normalize_key(self, cache_type: str, account_id: str, key: Any) -> Tuple[str, str, str]:
+    def _normalize_key(self, cache_type: str, key: Any) -> Tuple[str, str]:
         """
-        Normalize cache key to consistent format with account isolation.
+        Normalize cache key to consistent format.
         
         Args:
             cache_type: Cache type constant
-            account_id: Account identifier (phone_number) to isolate cache per account
             key: Raw key (int, str, tuple, etc.)
         
         Returns:
-            Tuple of (cache_type, account_id, normalized_key_string)
+            Tuple of (cache_type, normalized_key_string)
             
         Examples:
-            _normalize_key(ENTITY, "+1234567890", 12345) -> ("entity", "+1234567890", "12345")
-            _normalize_key(ENTITY, "+1234567890", "@username") -> ("entity", "+1234567890", "username")
-            _normalize_key(MESSAGE, "+1234567890", (12345, 678)) -> ("message", "+1234567890", "12345:678")
+            _normalize_key(ENTITY, 12345) -> ("entity", "12345")
+            _normalize_key(ENTITY, "@username") -> ("entity", "username")
+            _normalize_key(MESSAGE, (12345, 678)) -> ("message", "12345:678")
         """
         if isinstance(key, int):
             normalized = str(key)
@@ -181,7 +210,68 @@ class TelegramCache:
         else:
             normalized = str(key)
         
-        return (cache_type, account_id, normalized)
+        return (cache_type, normalized)
+
+    def _track_addition(self, account_id: str) -> None:
+        if account_id:
+            self._account_entry_counts[account_id] += 1
+
+    def _track_removal_for_entry(self, entry: CacheEntry | None) -> None:
+        if entry is None:
+            return
+        account_id = entry.owner_account
+        if not account_id:
+            return
+        current = self._account_entry_counts.get(account_id)
+        if not current:
+            return
+        if current <= 1:
+            self._account_entry_counts.pop(account_id, None)
+        else:
+            self._account_entry_counts[account_id] = current - 1
+
+    def _after_entry_removed(self, cache_key: Tuple[str, str], entry: CacheEntry | None, *, expired: bool = False, evicted: bool = False) -> None:
+        self._track_removal_for_entry(entry)
+        if expired:
+            self._stats['expired'] += 1
+        if evicted:
+            self._stats['evictions'] += 1
+
+    def _evict_oldest_entry(self) -> None:
+        if not self._cache:
+            return
+        evicted_key, entry = self._cache.popitem(last=False)
+        self._after_entry_removed(evicted_key, entry, evicted=True)
+        self.logger.debug("Cache EVICT (global LRU): %s", evicted_key)
+
+    def _evict_oldest_for_account(self, account_id: str) -> bool:
+        for key, entry in list(self._cache.items()):
+            if entry.owner_account == account_id:
+                removed = self._cache.pop(key, None)
+                self._after_entry_removed(key, removed, evicted=True)
+                self.logger.debug("Cache EVICT (per-account %s): %s", account_id, key)
+                return True
+        return False
+
+    def _ensure_account_capacity(self, account_id: str) -> None:
+        if self._per_account_max_entries is None:
+            return
+        while self._account_entry_counts.get(account_id, 0) >= self._per_account_max_entries:
+            if not self._evict_oldest_for_account(account_id):
+                break
+
+    async def _remove_expired_entries(self) -> int:
+        async with self._lock:
+            expired_keys = [key for key, entry in self._cache.items() if entry.is_expired()]
+            for key in expired_keys:
+                entry = self._cache.pop(key, None)
+                self._after_entry_removed(key, entry, expired=True)
+            return len(expired_keys)
+
+    def is_warm(self) -> bool:
+        """Return True if cache already contains entries."""
+
+        return len(self._cache) > 0
     
     async def get(
         self, 
@@ -219,32 +309,47 @@ class TelegramCache:
                 rate_limit_method='get_entity'
             )
         """
-        cache_key = self._normalize_key(cache_type, account_id, key)
+        cache_key = self._normalize_key(cache_type, key)
         ttl = ttl or self._ttls.get(cache_type, 300)
         
         # Fast path: Check cache without lock (read-mostly optimization)
         entry = self._cache.get(cache_key)
-        if entry and not entry.is_expired():
+        if entry and entry.is_expired():
+            async with self._lock:
+                if cache_key in self._cache:
+                    expired_entry = self._cache.pop(cache_key, None)
+                    self._after_entry_removed(cache_key, expired_entry, expired=True)
+        elif entry:
             async with self._lock:  # Brief lock to update stats
                 self._stats['hits'] += 1
-                self.logger.debug(f"Cache HIT: {cache_type}:{account_id}:{key}")
+            self.logger.debug("Cache HIT: %s:%s (account=%s)", cache_type, key, account_id)
             return entry.value
         
         # Slow path: Need to fetch (acquire lock for coordination)
         async with self._lock:
             # Double-check after acquiring lock (another worker may have fetched)
             entry = self._cache.get(cache_key)
-            if entry and not entry.is_expired():
-                self._stats['hits'] += 1
-                self.logger.debug(f"Cache HIT (after lock): {cache_type}:{account_id}:{key}")
-                return entry.value
+            if entry:
+                if entry.is_expired():
+                    expired_entry = self._cache.pop(cache_key, None)
+                    self._after_entry_removed(cache_key, expired_entry, expired=True)
+                else:
+                    self._stats['hits'] += 1
+                    self.logger.debug("Cache HIT (after lock): %s:%s (account=%s)", cache_type, key, account_id)
+                    return entry.value
             
             # Check if request already in-flight
             if self._enable_dedup and cache_key in self._in_flight:
                 in_flight = self._in_flight[cache_key]
                 in_flight.waiters += 1
                 self._stats['dedup_saves'] += 1
-                self.logger.debug(f"In-flight WAIT: {cache_type}:{account_id}:{key} ({in_flight.waiters} waiters)")
+                self.logger.debug(
+                    "In-flight WAIT: %s:%s (account=%s, waiters=%s)",
+                    cache_type,
+                    key,
+                    account_id,
+                    in_flight.waiters,
+                )
                 
                 # Release lock and wait for in-flight request to complete
                 # CRITICAL: Must release lock or we deadlock the fetcher
@@ -258,15 +363,15 @@ class TelegramCache:
                     started_at=time.time(),
                     waiters=0
                 )
-                self.logger.debug(f"Cache MISS: {cache_type}:{account_id}:{key} (fetching)")
+                self.logger.debug("Cache MISS: %s:%s (account=%s, fetching)", cache_type, key, account_id)
                 self._stats['misses'] += 1
-                future = None  # Signal that we need to fetch        # If we're waiting on another request
+                future = None  # Signal that we need to fetch
         if future is not None:
             try:
                 result = await future
                 return result
             except Exception as e:
-                self.logger.warning(f"In-flight request failed: {cache_type}:{account_id}:{key}: {e}")
+                self.logger.warning("In-flight request failed: %s:%s (account=%s): %s", cache_type, key, account_id, e)
                 raise
         
         # We're responsible for fetching
@@ -286,19 +391,21 @@ class TelegramCache:
                     timestamp=time.time(),
                     ttl=ttl,
                     cache_type=cache_type,
-                    key=str(key)
+                    key=str(key),
+                    owner_account=account_id
                 )
                 
-                # LRU: Move to end (most recently used)
-                if cache_key in self._cache:
-                    del self._cache[cache_key]
+                existing_entry = self._cache.pop(cache_key, None)
+                if existing_entry is not None:
+                    self._track_removal_for_entry(existing_entry)
+                needs_capacity = existing_entry is None or existing_entry.owner_account != account_id
+                if needs_capacity:
+                    self._ensure_account_capacity(account_id)
                 self._cache[cache_key] = entry
-                
-                # Evict if over size limit (remove oldest = first item)
+                self._track_addition(account_id)
+
                 while len(self._cache) > self._max_size:
-                    evicted_key, _ = self._cache.popitem(last=False)
-                    self._stats['evictions'] += 1
-                    self.logger.debug(f"Cache EVICT: {evicted_key}")
+                    self._evict_oldest_entry()
                 
                 # Complete in-flight future
                 if cache_key in self._in_flight:
@@ -306,7 +413,12 @@ class TelegramCache:
                     in_flight.future.set_result(value)
                     del self._in_flight[cache_key]
                     if in_flight.waiters > 0:
-                        self.logger.debug(f"In-flight COMPLETE: {cache_type}:{account_id}:{key} ({in_flight.waiters} waiters notified)")
+                        self.logger.debug(
+                            "In-flight COMPLETE: %s:%s (waiters=%s)",
+                            cache_type,
+                            key,
+                            in_flight.waiters,
+                        )
             
             return value
             
@@ -319,7 +431,7 @@ class TelegramCache:
                         in_flight.future.set_exception(e)
                     del self._in_flight[cache_key]
             
-            self.logger.error(f"Fetch failed: {cache_type}:{account_id}:{key}: {e}")
+            self.logger.error("Fetch failed: %s:%s (account=%s): %s", cache_type, key, account_id, e)
             raise
     
     async def get_entity(self, identifier: Any, client: 'Client') -> Any:
@@ -417,12 +529,13 @@ class TelegramCache:
         Returns:
             True if entry was removed, False if not found
         """
-        cache_key = self._normalize_key(cache_type, account_id, key)
+        cache_key = self._normalize_key(cache_type, key)
         
         async with self._lock:
             if cache_key in self._cache:
-                del self._cache[cache_key]
-                self.logger.debug(f"Cache INVALIDATE: {cache_type}:{account_id}:{key}")
+                entry = self._cache.pop(cache_key, None)
+                self._after_entry_removed(cache_key, entry)
+                self.logger.debug("Cache INVALIDATE: %s:%s (account=%s)", cache_type, key, account_id)
                 return True
             return False
     
@@ -432,6 +545,7 @@ class TelegramCache:
             count = len(self._cache)
             self._cache.clear()
             self._in_flight.clear()
+            self._account_entry_counts.clear()
             self.logger.info(f"Cache CLEARED: {count} entries removed")
     
     def get_stats(self) -> dict:
@@ -449,5 +563,8 @@ class TelegramCache:
             'total_requests': total,
             'hit_rate_percent': round(hit_rate, 2),
             'cache_size': len(self._cache),
-            'in_flight': len(self._in_flight)
+            'in_flight': len(self._in_flight),
+            'scope': self.scope.value,
+            'per_account_limit': self._per_account_max_entries,
+            'cleanup_interval': self._cleanup_interval if self._background_cleanup_enabled else None,
         }

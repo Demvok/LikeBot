@@ -10,7 +10,7 @@ from pandas import errors as pd_errors
 from main_logic.agent import Account, Client
 from main_logic.post import Post
 from auxilary_logic.reporter import Reporter
-from auxilary_logic.telegram_cache import TelegramCache
+from auxilary_logic.cache_registry import get_cache_registry
 from utils.logger import setup_logger, load_config, crash_handler, handle_task_exception
 from main_logic.schemas import TaskStatus, status_name
 from auxilary_logic.telethon_error_handler import map_telethon_exception, reporter_payload_from_mapping
@@ -243,14 +243,24 @@ class Task:
             await self._update_status()
             raise
 
+        cache_registry = get_cache_registry()
+
         async with _run_ctx as run_id:
             try:
                 self._current_run_id = run_id
                 await reporter.event(run_id, self.task_id, "WARNING", "info.init.run_start", f"Starting run for task.")
                 
-                
-                telegram_cache = TelegramCache(task_id=self.task_id)
-                await reporter.event(run_id, self.task_id, "DEBUG", "info.init.cache_created", f"Initialized Telegram cache for task")
+                telegram_cache = cache_registry.get_cache(task_id=self.task_id)
+                cache_scope = getattr(cache_registry.scope, "value", "task")
+                warm_start = telegram_cache.is_warm()
+                await reporter.event(
+                    run_id,
+                    self.task_id,
+                    "DEBUG",
+                    "info.init.cache_created",
+                    f"Initialized Telegram cache for task (scope={cache_scope}, warm_start={warm_start})",
+                    {"cache_scope": cache_scope, "warm_start": warm_start},
+                )
                 
                 # Load accounts and posts with specific DB error handling
                 try:
@@ -476,12 +486,18 @@ class Task:
                 if 'telegram_cache' in locals():
                     try:
                         stats = telegram_cache.get_stats()
+                        stats.setdefault('cache_scope', locals().get('cache_scope', 'task'))
+                        stats.setdefault('warm_start', locals().get('warm_start', False))
                         self.logger.info(f"Task {self.task_id} cache stats: {stats}")
                         await reporter.event(run_id, self.task_id, "INFO", "info.cache_stats", 
                                            f"Cache statistics", stats)
-                        await telegram_cache.clear()
                     except Exception as cache_error:
                         self.logger.warning(f"Error logging cache stats: {cache_error}")
+                    finally:
+                        try:
+                            await cache_registry.release_cache(telegram_cache)
+                        except Exception as release_error:
+                            self.logger.warning(f"Failed to release telegram cache: {release_error}")
                 
                 self._clients = await Client.disconnect_clients(self._clients, self.logger, task_id=self.task_id)
                 self._clients = None

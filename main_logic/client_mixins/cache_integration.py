@@ -73,10 +73,18 @@ class CacheIntegrationMixin:
             client.init_standalone_cache()
             entity = await client.get_entity_cached(chat_id)  # Now works!
         """
-        from auxilary_logic.telegram_cache import TelegramCache
+        from auxilary_logic.telegram_cache import TelegramCache, TelegramCacheScope
         
         if self.telegram_cache is not None:
             self.logger.warning("Overwriting existing telegram_cache with standalone cache")
         
-        self.telegram_cache = TelegramCache(task_id=None, max_size=max_size)
-        self.logger.info(f"Initialized standalone cache (max_size={max_size}) for debugging")
+        self.telegram_cache = TelegramCache(
+            task_id=None,
+            max_size=max_size,
+            scope=TelegramCacheScope.TASK,
+            per_account_max_entries=None,
+            enable_background_cleanup=False,
+        )
+        self.logger.info(
+            f"Initialized standalone cache (max_size={max_size}, scope=TASK) for debugging"
+        )

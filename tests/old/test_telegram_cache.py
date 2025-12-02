@@ -13,7 +13,12 @@ Tests cover:
 
 import pytest
 import asyncio
-from auxilary_logic.telegram_cache import TelegramCache, CacheEntry, InFlightRequest
+from auxilary_logic.telegram_cache import (
+    TelegramCache,
+    CacheEntry,
+    InFlightRequest,
+    TelegramCacheScope,
+)
 
 # Test account identifiers
 ACCOUNT_1 = "+1234567890"
@@ -98,6 +103,29 @@ async def test_in_flight_deduplication():
 
 
 @pytest.mark.asyncio
+async def test_cross_account_inflight_deduplication():
+    """Concurrent cross-account requests should reuse same in-flight future."""
+    cache = TelegramCache(task_id=1)
+
+    call_count = 0
+
+    async def slow_fetch():
+        nonlocal call_count
+        call_count += 1
+        await asyncio.sleep(0.05)
+        return {"id": 555}
+
+    results = await asyncio.gather(
+        cache.get("entity", ACCOUNT_1, 555, slow_fetch),
+        cache.get("entity", ACCOUNT_2, 555, slow_fetch),
+    )
+
+    assert all(r == {"id": 555} for r in results)
+    assert call_count == 1
+    assert cache.get_stats()['dedup_saves'] >= 1
+
+
+@pytest.mark.asyncio
 async def test_thread_safety_concurrent_different_keys():
     """Test that concurrent requests for different keys work correctly."""
     cache = TelegramCache(task_id=1)
@@ -147,7 +175,7 @@ async def test_lru_eviction():
     assert cache.get_stats()['evictions'] == 1
     
     # Key 0 should be evicted
-    cache_keys = [k[2] for k in cache._cache.keys()]  # Changed from k[1] to k[2] for account-aware keys
+    cache_keys = [k[1] for k in cache._cache.keys()]
     assert "0" not in cache_keys
     assert "5" in cache_keys
 
@@ -208,15 +236,15 @@ async def test_key_normalization():
     cache = TelegramCache(task_id=1)
     
     # Test username normalization
-    assert cache._normalize_key("entity", ACCOUNT_1, "@username") == ("entity", ACCOUNT_1, "username")
-    assert cache._normalize_key("entity", ACCOUNT_1, "USERNAME") == ("entity", ACCOUNT_1, "username")
-    assert cache._normalize_key("entity", ACCOUNT_1, "@UsErNaMe") == ("entity", ACCOUNT_1, "username")
+    assert cache._normalize_key("entity", "@username") == ("entity", "username")
+    assert cache._normalize_key("entity", "USERNAME") == ("entity", "username")
+    assert cache._normalize_key("entity", "@UsErNaMe") == ("entity", "username")
     
     # Test integer keys
-    assert cache._normalize_key("entity", ACCOUNT_1, 12345) == ("entity", ACCOUNT_1, "12345")
+    assert cache._normalize_key("entity", 12345) == ("entity", "12345")
     
     # Test tuple keys (for composite keys like message)
-    assert cache._normalize_key("message", ACCOUNT_1, (12345, 678)) == ("message", ACCOUNT_1, "12345:678")
+    assert cache._normalize_key("message", (12345, 678)) == ("message", "12345:678")
 
 
 @pytest.mark.asyncio
@@ -368,47 +396,73 @@ async def test_cache_stats_accuracy():
 
 
 @pytest.mark.asyncio
-async def test_per_account_isolation():
-    """Test that cache isolates entities per account."""
+async def test_cross_account_cache_hit():
+    """Same entity fetched by different accounts should hit shared cache."""
     cache = TelegramCache(task_id=1)
-    
-    account1_call_count = 0
-    account2_call_count = 0
-    
-    async def fetch_account1():
-        nonlocal account1_call_count
-        account1_call_count += 1
-        return {"id": 123, "account": "account1"}
-    
-    async def fetch_account2():
-        nonlocal account2_call_count
-        account2_call_count += 1
-        return {"id": 123, "account": "account2"}
-    
-    # Same entity ID (123) but different accounts
-    result1 = await cache.get("entity", ACCOUNT_1, 123, fetch_account1)
-    result2 = await cache.get("entity", ACCOUNT_2, 123, fetch_account2)
-    
-    # Both should be fetched (no cross-account cache hit)
-    assert account1_call_count == 1
-    assert account2_call_count == 1
-    
-    # Results should be different
-    assert result1["account"] == "account1"
-    assert result2["account"] == "account2"
-    
-    # Cache should have 2 separate entries
-    assert len(cache._cache) == 2
-    
-    # Second call to account1 should hit cache
-    result1_cached = await cache.get("entity", ACCOUNT_1, 123, fetch_account1)
-    assert account1_call_count == 1  # No additional fetch
-    assert result1_cached == result1
-    
-    # Second call to account2 should also hit cache
-    result2_cached = await cache.get("entity", ACCOUNT_2, 123, fetch_account2)
-    assert account2_call_count == 1  # No additional fetch
-    assert result2_cached == result2
+
+    call_count = 0
+
+    async def fetch_shared():
+        nonlocal call_count
+        call_count += 1
+        return {"id": 123, "value": "shared"}
+
+    result1 = await cache.get("entity", ACCOUNT_1, 123, fetch_shared)
+    result2 = await cache.get("entity", ACCOUNT_2, 123, fetch_shared)
+
+    assert call_count == 1  # Second call reused cache
+    assert result1 == result2
+    assert len(cache._cache) == 1
+
+
+@pytest.mark.asyncio
+async def test_per_account_entry_limit_enforced():
+    """Ensure per-account limits evict only entries for that account."""
+
+    cache = TelegramCache(task_id=1, per_account_max_entries=2)
+
+    async def fetch(value):
+        return {"id": value}
+
+    # Insert three keys for the same account -> first should be evicted
+    for key in range(3):
+        await cache.get("entity", ACCOUNT_1, key, lambda val=key: fetch(val))
+
+    assert cache._account_entry_counts[ACCOUNT_1] == 2
+    remaining_keys = {
+        int(k[1])
+        for k, entry in cache._cache.items()
+        if entry.owner_account == ACCOUNT_1
+    }
+    assert remaining_keys == {1, 2}
+
+    # Insert entry for another account - should not evict ACCOUNT_1 entries
+    await cache.get("entity", ACCOUNT_2, 999, lambda: fetch(999))
+    assert cache._account_entry_counts[ACCOUNT_2] == 1
+
+
+@pytest.mark.asyncio
+async def test_background_cleanup_removes_expired_entries():
+    """Process-scoped cache should clean expired entries via background loop."""
+
+    cache = TelegramCache(
+        task_id=None,
+        scope=TelegramCacheScope.PROCESS,
+        enable_background_cleanup=True,
+        cleanup_interval=0,
+    )
+
+    async def fetch():
+        return {"id": 1}
+
+    await cache.get("entity", ACCOUNT_1, 1, fetch, ttl=0.05)
+    assert len(cache._cache) == 1
+
+    await asyncio.sleep(0.1)
+    await asyncio.sleep(0)  # allow cleanup loop to run
+    assert len(cache._cache) == 0
+
+    await cache.shutdown()
 
 
 if __name__ == "__main__":

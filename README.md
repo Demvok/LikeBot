@@ -3,12 +3,10 @@
 ### TO DO:
 
 - redo analysis & test
-- simplify agent mixins
 
 ##### Account health system - stage 2
 - Add chat "opening" before reacting? & add "warming-up" and "cooling" stage for account connect, that should help
-- review proxy assigning - should be assigning depending on load, but every account has to have list of favourites
-- implement long-term caching?
+- review proxy assigning - should be assigning depending on load, but every account has to have list of favourites`
 
 ##### Account health system - stage 3
 - add special logging of account's action with markers
@@ -34,7 +32,8 @@
 ## Changelog
 
 ### v.1.1.4
-
+- implemented process-scope caching (with safe fallback to old logic for now)
+- fixed unsuccessful cache deduplication
 
 ### v.1.1.3
 - removed entity caching on task scope, still is used per client
