@@ -241,7 +241,7 @@ class Task:
         async with _run_ctx as run_id:
             try:
                 self._current_run_id = run_id
-                await reporter.event(run_id, self.task_id, "INFO", "info.init.run_start", f"Starting run for task.")
+                await reporter.event(run_id, self.task_id, "WARNING", "info.init.run_start", f"Starting run for task.")
                 
                 
                 telegram_cache = TelegramCache(task_id=self.task_id)
@@ -666,10 +666,12 @@ class Task:
                     
                     # Log if all retries exhausted
                     if ctx.retries_exhausted:
-                        self.logger.error(f"Client {client.account_id} failed to react to post {post.post_id} after {ctx.max_retries} attempts.")
+                        error_msg = str(ctx.last_error) if ctx.last_error else "Unknown error"
+                        error_type = type(ctx.last_error).__name__ if ctx.last_error else "Unknown"
+                        self.logger.error(f"Client {client.account_id} failed to react to post {post.post_id} after {ctx.max_retries} attempts. Last error ({error_type}): {error_msg}")
                         await reporter.event(run_id, self.task_id, "ERROR", "error.worker.react.max_retries", 
-                                           f"Client {client.phone_number} failed to react to post {post.post_id} after {ctx.max_retries} retries.", 
-                                           {"client": client.phone_number, "post_id": post.post_id, "retries": ctx.max_retries})
+                                           f"Client {client.phone_number} failed to react to post {post.post_id} after {ctx.max_retries} retries. Last error: {error_msg}", 
+                                           {"client": client.phone_number, "post_id": post.post_id, "retries": ctx.max_retries, "error": error_msg, "error_type": error_type})
                 
                 # CRITICAL: Add delay between reactions to prevent spam detection
                 await random_delay('min_delay_between_reactions', 'max_delay_between_reactions', self.logger, "Inter-reaction delay")
@@ -742,8 +744,13 @@ class Task:
         if self._task is None or self._task.done():
             self._pause_event.set()
             self._current_run_id = None  # Will empty if exists, but if exists and finished will be used for statistics
-            self.logger.info(f"Starting task {self.task_id} - {self.name}...")
+            self.logger.warning(f"Starting task {self.task_id} - {self.name}...")
             self._task = asyncio.create_task(self._run())
+            
+            # Track task globally for graceful shutdown
+            from utils.task_tracker import track_task
+            track_task(self._task)
+            
             # Ensure that an unhandled exception in the main task is persisted
             self._task.add_done_callback(lambda t, s=self: asyncio.create_task(s._handle_main_done(t)))
             self.updated_at = Timestamp.now()

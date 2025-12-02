@@ -29,6 +29,7 @@ from auxilary_logic.auth import (
 )
 from jose import JWTError
 from jose.exceptions import ExpiredSignatureError
+from utils.task_tracker import active_tasks, track_task, cancel_all_tasks
 
 load_dotenv()
 frontend_http = os.getenv("frontend_http", None)
@@ -42,8 +43,8 @@ async def lifespan(app: FastAPI):
     # Startup
     await validate_environment()
     yield
-    # Shutdown (if needed in the future)
-    # Add cleanup code here
+    # Shutdown - cancel all active background tasks
+    await cancel_all_tasks(timeout=5.0)
 
 
 app = FastAPI(
@@ -796,13 +797,16 @@ async def login_start(
         login_session_id = str(uuid.uuid4())
         
         # Start login process in background
-        asyncio.create_task(start_login(
+        login_task = asyncio.create_task(start_login(
             phone_number=phone_number, 
             password=password_encrypted, 
             login_session_id=login_session_id,
             session_name=session_name,
             notes=notes
         ))
+        
+        # Track background task for graceful shutdown
+        track_task(login_task)
         
         # Wait a moment for the process to initialize and send code
         await asyncio.sleep(1)

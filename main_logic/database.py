@@ -236,6 +236,7 @@ class MongoStorage():
                 await cls._proxies.create_index([("active", ASCENDING), ("connected_accounts", ASCENDING)], name="ix_proxies_active_usage")
                 await cls._channels.create_index([("tags", ASCENDING)], name="ix_channels_tags")
                 await cls._channels.create_index([("channel_name", ASCENDING)], name="ix_channels_name")
+                await cls._channels.create_index([("url_aliases", ASCENDING)], name="ix_channels_url_aliases")
                 
                 # Reporter collection indexes
                 await create_unique_index_safe(cls._runs, [("run_id", ASCENDING)], "ux_runs_run_id")
@@ -1973,6 +1974,10 @@ class MongoStorage():
         if 'tags' not in channel_data:
             channel_data['tags'] = []
         
+        # Ensure url_aliases is a list
+        if 'url_aliases' not in channel_data:
+            channel_data['url_aliases'] = []
+        
         channel_data.pop('_id', None)
         await cls._channels.insert_one(channel_data)
         logger.debug(f"Channel with chat_id {chat_id} added to MongoDB")
@@ -2260,6 +2265,71 @@ class MongoStorage():
         result = await cls._channels.delete_one({"chat_id": {"$in": [normalized_id, prefixed_id]}})
         logger.debug(f"Channel delete result: {result.deleted_count}")
         return result.deleted_count > 0
+
+    @classmethod
+    async def get_channel_by_url_alias(cls, alias: str):
+        """
+        Get a channel by one of its URL aliases.
+        
+        Args:
+            alias: URL identifier (username, /c/ path, etc.)
+            
+        Returns:
+            Channel object if found, None otherwise
+        """
+        await cls._ensure_ready()
+        logger.info(f"Getting channel from MongoDB by url_alias: {alias}")
+        
+        # Search for channel with this alias
+        channel = await cls._channels.find_one({"url_aliases": alias})
+        if channel and '_id' in channel:
+            channel.pop('_id')
+        
+        if channel:
+            logger.debug(f"Found channel with chat_id {channel.get('chat_id')} for alias '{alias}'")
+            return Channel(**channel)
+        
+        logger.debug(f"No channel found with alias '{alias}'")
+        return None
+
+    @classmethod
+    async def add_channel_url_alias(cls, chat_id: int, alias: str):
+        """
+        Add a URL alias to a channel if it doesn't already exist.
+        Uses $addToSet to avoid duplicates.
+        
+        Args:
+            chat_id: Telegram chat ID (with or without -100 prefix)
+            alias: URL identifier to add (username, /c/ path, etc.)
+            
+        Returns:
+            True if alias was added or already existed, False if channel not found
+        """
+        await cls._ensure_ready()
+        # Normalize chat_id to handle -100 prefix
+        normalized_id = normalize_chat_id(chat_id)
+        # Also compute the -100 prefixed form
+        prefixed_id = int(f"-100{normalized_id}")
+        
+        logger.info(f"Adding url_alias '{alias}' to channel {chat_id}")
+        
+        # Update the modification timestamp along with adding alias
+        from datetime import datetime, timezone
+        
+        result = await cls._channels.update_one(
+            {"chat_id": {"$in": [normalized_id, prefixed_id]}},
+            {
+                "$addToSet": {"url_aliases": alias},
+                "$set": {"updated_at": datetime.now(timezone.utc)}
+            }
+        )
+        
+        if result.matched_count > 0:
+            logger.debug(f"Added alias '{alias}' to channel {chat_id}")
+            return True
+        else:
+            logger.warning(f"Channel {chat_id} not found, couldn't add alias '{alias}'")
+            return False
 
     @classmethod
     async def get_channels_with_post_counts(cls):

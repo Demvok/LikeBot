@@ -2,16 +2,14 @@
 
 ### TO DO:
 
-##### Account health system - stage 1
-- Map chat_id to chat username and include this to channel parser
-- Add chat "opening" before reacting?
-- fix proxy load balancing
+- remove entity caching
+- redo analysis & test
+- simplify agent mixins
 
 ##### Account health system - stage 2
+- Add chat "opening" before reacting? & add "warming-up" and "cooling" stage for account connect, that should help
 - review proxy assigning - should be assigning depending on load, but every account has to have list of favourites
-- add .xlsx proxy import
-- add "warming-up" and "cooling" stage for account connect, that should help
-- Review telegram API calls (especially in url parser), e.g. extracting post content and saving it. - triple check it to work with accounts in parallel
+- implement long-term caching?
 
 ##### Account health system - stage 3
 - add special logging of account's action with markers
@@ -22,12 +20,15 @@
 - rework task assigning for each account - try to make it more "individualistic"
 - change general task-account linkage - it should be dynamic
 
-
 ##### Misc
 - add creation of neccessary files if they dont exist
 - add report export as .csv/.xlsx
+- add .xlsx proxy import
+- refactor `task.py` and split it into blocks
 
-// #### TO TEST:
+#### TO TEST:
+- added task cancelling on API stop (WIP)
+- included chat_id to chat username mapping into channel parser
 
 ## Changelog
 
@@ -36,7 +37,11 @@
 - complete caching rework, now works on task scope
 - now entity object is cached completely, with thread managing
 - reviewed and reduced usage of get_messages() and get_message_content() telegram requests
+- saved post content to reduce calls
 - fixed channel indexing endpoint
+- included chat_id to chat username mapping into channel parser
+- reviewed rate limiting and delays
+- added task cancelling on API stop (WIP)
 
 ### v.1.1.1
 - fixed malformed task object creation on low RAM (cleanup and safe loading)

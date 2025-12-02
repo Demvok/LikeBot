@@ -518,6 +518,7 @@ class ChannelBase(BaseModel):
     discussion_chat_id: Optional[int] = Field(None, description="Discussion group chat ID if exists")
     channel_name: Optional[str] = Field(None, description="Channel name/title", max_length=255)
     tags: Optional[List[str]] = Field(default_factory=list, description="Channel tags for categorization")
+    url_aliases: Optional[List[str]] = Field(default_factory=list, description="URL identifiers for this channel (usernames, /c/ paths, etc.) for fast lookup")
 
     @field_validator('tags')
     def validate_tags(cls, v):
@@ -541,6 +542,7 @@ class ChannelUpdate(BaseModel):
     discussion_chat_id: Optional[int] = Field(None, description="Discussion group chat ID if exists")
     channel_name: Optional[str] = Field(None, description="Channel name/title", max_length=255)
     tags: Optional[List[str]] = Field(None, description="Channel tags for categorization")
+    url_aliases: Optional[List[str]] = Field(None, description="URL identifiers for this channel (usernames, /c/ paths, etc.)")
 
     @field_validator('tags')
     def validate_tags(cls, v):
@@ -567,6 +569,7 @@ class ChannelDict(BaseModel):
     discussion_chat_id: Optional[int]
     channel_name: Optional[str]
     tags: List[str]
+    url_aliases: List[str]
     created_at: Union[str, datetime]
     updated_at: Union[str, datetime]
 

@@ -37,37 +37,37 @@ delays:
 
   # === RATE LIMITER CONFIGURATION ===
   # Minimum delays between Telegram API calls (prevents flood errors)
-  rate_limit_get_entity: 3  # Seconds between entity lookups
-  rate_limit_get_messages: 0.3  # Seconds between message fetches
-  rate_limit_send_reaction: 0.5  # Seconds between reactions
-  rate_limit_send_message: 0.5  # Seconds between messages
-  rate_limit_default: 0.2  # Default for other API calls
+  rate_limit_get_entity: 10  # Seconds between entity lookups
+  rate_limit_get_messages: 1  # Seconds between message fetches
+  rate_limit_send_reaction: 6  # Seconds between reactions
+  rate_limit_send_message: 10  # Seconds between messages
+  rate_limit_default: 1  # Default for other API calls
 
   # === RETRY CONFIGURATION ===
   session_creation_retries: 2  # Number of retries for creating new session (code input attempts)
   connection_retries: 5  # Number of connection retries
-  reconnect_delay: 3  # Delay between reconnection attempts (seconds)
+  reconnect_delay: 6  # Delay between reconnection attempts (seconds)
   action_retries: 1  # Number of retries for Telegram actions (react, comment, etc.)
-  action_retry_delay: 30  # Delay between action retries (seconds)
-  error_retry_delay: 60  # Delay after transient errors (ConnectionError, TimeoutError, RPCError)
+  action_retry_delay: 40  # Delay between action retries (seconds)
+  error_retry_delay: 90  # Delay after transient errors (ConnectionError, TimeoutError, RPCError)
   
   # === ANTI-SPAM DELAYS (prevent account bans) ===
   
   # Delay between consecutive reactions from the same account
-  min_delay_between_reactions: 15  # Minimum seconds between reactions (per account)
-  max_delay_between_reactions: 30  # Maximum seconds between reactions (per account)
+  min_delay_between_reactions: 20  # Minimum seconds between reactions (per account)
+  max_delay_between_reactions: 40  # Maximum seconds between reactions (per account)
   
   # Additional random delay before sending reaction (humanization)
-  min_delay_before_reaction: 2  # Minimum delay before sending reaction
-  max_delay_before_reaction: 5  # Maximum delay before sending reaction
+  min_delay_before_reaction: 3  # Minimum delay before sending reaction
+  max_delay_before_reaction: 8  # Maximum delay before sending reaction
   
   # Anti-spam delays for internal operations (view increment, undo, etc.)
-  anti_spam_delay_min: 0.5  # Minimum anti-spam delay
-  anti_spam_delay_max: 2.0  # Maximum anti-spam delay
+  anti_spam_delay_min: 1  # Minimum anti-spam delay
+  anti_spam_delay_max: 3  # Maximum anti-spam delay
   
   # Worker stagger delays (prevents all accounts hitting API simultaneously)
-  worker_start_delay_min: 2  # Minimum delay before worker starts
-  worker_start_delay_max: 10  # Maximum delay before worker starts
+  worker_start_delay_min: 5  # Minimum delay before worker starts
+  worker_start_delay_max: 20  # Maximum delay before worker starts
   
   # Internal error recovery delays
   batch_error_delay: 0.2  # Delay after batch writer errors (reporter)
