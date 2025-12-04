@@ -25,6 +25,35 @@ from asyncio import Future
 from telethon import TelegramClient
 
 
+def _normalize_proxy_names(value, allow_none: bool = False) -> Optional[List[str]]:
+    """Normalize proxy name lists: trim, lowercase, unique, max 5."""
+    if value is None:
+        return None if allow_none else []
+
+    if isinstance(value, str):
+        value = [value]
+
+    if not isinstance(value, (list, tuple, set)):
+        raise ValueError('assigned_proxies must be a list of proxy names')
+
+    normalized: List[str] = []
+    for raw in value:
+        if raw is None:
+            continue
+        if not isinstance(raw, str):
+            raise ValueError('assigned_proxies entries must be strings')
+        cleaned = raw.strip().lower()
+        if not cleaned:
+            continue
+        if cleaned not in normalized:
+            normalized.append(cleaned)
+
+    if len(normalized) > 5:
+        raise ValueError('assigned_proxies cannot have more than 5 entries')
+
+    return normalized
+
+
 # ============= ENUMS =============
 
 class UserRole(Enum):
@@ -238,6 +267,7 @@ class AccountBase(BaseModel):
     password_encrypted: Optional[str] = Field(None, description="Encrypted password for 2FA")
     notes: Optional[str] = Field("", description="Account notes")
     subscribed_to: Optional[List[int]] = Field(default_factory=list, description="List of channel chat_ids the account is subscribed to")
+    assigned_proxies: List[str] = Field(default_factory=list, description="List of proxy names assigned to the account (max 5)")
     
     # Status tracking fields
     last_error: Optional[str] = Field(None, description="Last error message encountered")
@@ -265,6 +295,10 @@ class AccountBase(BaseModel):
             raise ValueError('password_encrypted is required when twofa is enabled')
         return self
 
+    @field_validator('assigned_proxies')
+    def validate_assigned_proxies(cls, value):
+        return _normalize_proxy_names(value)
+
 
 class AccountCreate(BaseModel):
     """Schema for creating new accounts."""
@@ -274,6 +308,7 @@ class AccountCreate(BaseModel):
     password: Optional[str] = Field(None, description="Plain text password for 2FA (will be encrypted server-side)")
     notes: Optional[str] = Field("", description="Account notes")
     subscribed_to: Optional[List[int]] = Field(default_factory=list, description="List of channel chat_ids the account is subscribed to")
+    assigned_proxies: List[str] = Field(default_factory=list, description="List of proxy names assigned to the account (max 5)")
 
     @field_validator('phone_number')
     def validate_phone_number(cls, v):
@@ -288,6 +323,10 @@ class AccountCreate(BaseModel):
         if self.twofa and not self.password:
             raise ValueError('password is required when twofa is enabled')
         return self
+
+    @field_validator('assigned_proxies')
+    def validate_assigned_proxies(cls, value):
+        return _normalize_proxy_names(value)
 
 class LoginProcess(BaseModel):
     """Schema for tracking login process state."""
@@ -317,9 +356,14 @@ class AccountUpdate(BaseModel):
     notes: Optional[str] = Field(None, description="Account notes")
     status: Optional[AccountStatus] = Field(None, description="Account status")
     subscribed_to: Optional[List[int]] = Field(None, description="List of channel chat_ids the account is subscribed to")
+    assigned_proxies: Optional[List[str]] = Field(None, description="List of proxy names assigned to the account (max 5)")
 
     class Config:
         use_enum_values = True
+
+    @field_validator('assigned_proxies')
+    def validate_assigned_proxies(cls, value):
+        return _normalize_proxy_names(value, allow_none=True)
 
 
 class AccountResponse(AccountBase, TimestampMixin):
@@ -352,6 +396,7 @@ class AccountDict(BaseModel):
     notes: Optional[str]
     status: Optional[AccountStatus]
     subscribed_to: Optional[List[int]]
+    assigned_proxies: Optional[List[str]]
     created_at: Optional[Union[str, datetime]]
     updated_at: Optional[Union[str, datetime]]
     last_channel_sync_at: Optional[Union[str, datetime]] = None
@@ -372,6 +417,7 @@ class AccountDictSecure(BaseModel):
     notes: Optional[str]
     status: Optional[AccountStatus]
     subscribed_to: Optional[List[int]]
+    assigned_proxies: Optional[List[str]]
     created_at: Optional[Union[str, datetime]]
     updated_at: Optional[Union[str, datetime]]
     last_channel_sync_at: Optional[Union[str, datetime]] = None

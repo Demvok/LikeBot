@@ -34,6 +34,8 @@ cache:
 
 proxy:
   mode: "soft"  # "strict" or "soft" - strict fails on proxy error, soft falls back to no proxy
+  max_per_account: 5  # Maximum number of proxies that can be assigned to a single account
+  desired_per_account: 3  # Target proxy count per account when auto-assigning proxies
 
 delays:
   # Humanization level represents the level at which bot attempts to simulate human behaviour

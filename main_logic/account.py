@@ -51,6 +51,7 @@ class Account(object):
             self.password_encrypted = account_data.get('password_encrypted', None)
             self.notes = account_data.get('notes', "")
             self.subscribed_to = account_data.get('subscribed_to', [])
+            self.assigned_proxies = account_data.get('assigned_proxies', [])
             self.status = account_data.get('status', self.AccountStatus.NEW)
             self.created_at = account_data.get('created_at', Timestamp.now())
             self.updated_at = account_data.get('updated_at', Timestamp.now())
@@ -184,6 +185,7 @@ class Account(object):
             'twofa': self.twofa,
             'notes': self.notes,
             'subscribed_to': self.subscribed_to if hasattr(self, 'subscribed_to') else [],
+            'assigned_proxies': self.assigned_proxies if hasattr(self, 'assigned_proxies') else [],
             'status': status_name(self.status),
             'created_at': self.created_at,
             'updated_at': self.updated_at,
@@ -234,6 +236,7 @@ class Account(object):
         password=None,
         notes=None,
         subscribed_to=None,
+        assigned_proxies=None,
         status=None,
         created_at=None,
         updated_at=None
@@ -248,6 +251,7 @@ class Account(object):
             'password_encrypted': password_encrypted if password_encrypted else encrypt_secret(password, PURPOSE_PASSWORD) if password else None,
             'notes': notes if notes is not None else "",
             'subscribed_to': subscribed_to if subscribed_to is not None else [],
+            'assigned_proxies': assigned_proxies if assigned_proxies is not None else [],
             'status': status if status is not None else cls.AccountStatus.NEW,
             'created_at': created_at or Timestamp.now(),
             'updated_at': updated_at or Timestamp.now()

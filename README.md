@@ -6,7 +6,6 @@
 
 ##### Account health system - stage 2
 - Add chat "opening" before reacting? & add "warming-up" and "cooling" stage for account connect, that should help
-- review proxy assigning - should be assigning depending on load, but every account has to have list of favourites`
 
 ##### Account health system - stage 3
 - add special logging of account's action with markers
@@ -24,6 +23,7 @@
 - refactor `task.py` and split it into blocks
 - add counter table reset on deletion
 - fix counters logic - merges new objects with old ones
+- fix proxy tester - fails to parse 2ip.ua output
 
 #### TO TEST:
 - added task cancelling on API stop (WIP)
@@ -34,6 +34,10 @@
 ### v.1.1.4
 - implemented process-scope caching (with safe fallback to old logic for now)
 - fixed unsuccessful cache deduplication
+- tied proxies directly to accounts (up to five per account) with new link/unlink endpoints
+- replaced runtime load balancing with linked account counters and least-linked proxy reporting
+- added configurable proxy auto-assignment helper and API endpoint to balance proxies per account
+- added 2ip.ua-based proxy connectivity test endpoint for quick SOCKS/HTTP validation
 
 ### v.1.1.3
 - removed entity caching on task scope, still is used per client

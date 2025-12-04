@@ -43,11 +43,10 @@ class ConnectionMixin(SessionMixin, ProxyMixin, LockingMixin):
         await self._acquire_lock(task_id)
         
         # Proxy configuration
-        proxy_mode = config.get('proxy', {}).get('mode', 'soft')  # 'strict' or 'soft'
+        proxy_mode = (config.get('proxy', {}).get('mode', 'soft') or 'soft').lower()  # 'strict' or 'soft'
         
         session_created = False
         force_new_session = False
-        proxy_assigned = False
         proxy_failed = False
         
         async with RetryContext(
@@ -77,7 +76,7 @@ class ConnectionMixin(SessionMixin, ProxyMixin, LockingMixin):
                         proxy_candidates, proxy_data = None, None
                         self.logger.info(f"Connecting without proxy (fallback after proxy failure)")
                     else:
-                        proxy_candidates, proxy_data = await self._get_proxy_config()  # from ProxyMixin
+                        proxy_candidates, proxy_data = await self._get_proxy_config(proxy_mode)  # from ProxyMixin
                         if proxy_candidates:
                             self.logger.info(f"Connecting with proxy record: {proxy_data.get('proxy_name')}")
                         else:
@@ -105,10 +104,6 @@ class ConnectionMixin(SessionMixin, ProxyMixin, LockingMixin):
                                     selected_candidate = candidate
                                     # Clear proxy error on success
                                     await db.clear_proxy_error(proxy_data.get('proxy_name'))
-                                    # Increment proxy usage counter once per assigned proxy record
-                                    if not proxy_assigned:
-                                        await self._increment_proxy_usage()  # from ProxyMixin
-                                        proxy_assigned = True
                                     break
                                 except (OSError, TimeoutError, ConnectionError) as proxy_error:
                                     # Candidate failed - record the error and try next candidate
@@ -170,10 +165,6 @@ class ConnectionMixin(SessionMixin, ProxyMixin, LockingMixin):
                         await self.client.disconnect()
 
                         # Decrement proxy usage if it was incremented
-                        if proxy_assigned and proxy_data:
-                            await self._decrement_proxy_usage()  # from ProxyMixin
-                            proxy_assigned = False
-
                         await ctx.failed(auth_error, delay=False)  # Retry with new session immediately
                         continue
                     except (errors.AuthKeyInvalidError, errors.UserDeactivatedError) as auth_error:
@@ -232,9 +223,6 @@ class ConnectionMixin(SessionMixin, ProxyMixin, LockingMixin):
                     
                     # Release account lock if we hold one (from LockingMixin)
                     await self._release_lock()
-                    
-                    # Decrement proxy usage counter if a proxy was used (from ProxyMixin)
-                    await self._decrement_proxy_usage()
                     
                     ctx.success()
                     return

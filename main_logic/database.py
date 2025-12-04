@@ -23,7 +23,7 @@ Environment:
 - db_url (required), db_name (default "LikeBot"), db_timeout_ms (default 5000)
 """
 import os, asyncio
-from typing import Optional
+from typing import Optional, List
 from pandas import Timestamp
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -38,6 +38,16 @@ from main_logic.channel import normalize_chat_id
 
 config = load_config()
 logger = setup_logger("DB", "main.log")
+
+MAX_ASSIGNED_PROXIES = int(config.get('proxy', {}).get('max_per_account', 5))
+if MAX_ASSIGNED_PROXIES < 1:
+    MAX_ASSIGNED_PROXIES = 1
+
+TARGET_ASSIGNED_PROXIES = int(config.get('proxy', {}).get('desired_per_account', MAX_ASSIGNED_PROXIES))
+if TARGET_ASSIGNED_PROXIES < 1:
+    TARGET_ASSIGNED_PROXIES = 1
+if TARGET_ASSIGNED_PROXIES > MAX_ASSIGNED_PROXIES:
+    TARGET_ASSIGNED_PROXIES = MAX_ASSIGNED_PROXIES
 
 load_dotenv()
 db_url = os.getenv('db_url')
@@ -234,6 +244,7 @@ class MongoStorage():
                 
                 # Non-unique indexes (can be created normally)
                 await cls._proxies.create_index([("active", ASCENDING), ("connected_accounts", ASCENDING)], name="ix_proxies_active_usage")
+                await cls._proxies.create_index([("linked_accounts_count", ASCENDING)], name="ix_proxies_linked_accounts")
                 await cls._channels.create_index([("tags", ASCENDING)], name="ix_channels_tags")
                 await cls._channels.create_index([("channel_name", ASCENDING)], name="ix_channels_name")
                 await cls._channels.create_index([("url_aliases", ASCENDING)], name="ix_channels_url_aliases")
@@ -316,7 +327,7 @@ class MongoStorage():
         # Ensure all AccountBase/AccountDict fields are present
         for field in [
             'phone_number', 'account_id', 'session_name', 'session_encrypted', 'twofa',
-            'password_encrypted', 'notes', 'status', 'created_at', 'updated_at'
+            'password_encrypted', 'notes', 'status', 'created_at', 'updated_at', 'assigned_proxies'
         ]:
             account_data.setdefault(field, None)
         phone_number = account_data.get('phone_number')
@@ -340,7 +351,7 @@ class MongoStorage():
             # Ensure all AccountBase/AccountDict fields are present
             for field in [
                 'phone_number', 'account_id', 'session_name', 'session_encrypted', 'twofa',
-                'password_encrypted', 'notes', 'status', 'created_at', 'updated_at'
+                'password_encrypted', 'notes', 'status', 'created_at', 'updated_at', 'assigned_proxies'
             ]:
                 acc.setdefault(field, None)
             logger.debug(f"Account found in MongoDB: {acc.get('phone_number', '')}, {acc.get('status', '')}, {acc.get('updated_at', '')}")
@@ -1494,6 +1505,7 @@ class MongoStorage():
         
         # Set default values
         proxy_data.setdefault('connected_accounts', 0)
+        proxy_data.setdefault('linked_accounts_count', 0)
         proxy_data.setdefault('active', True)
         proxy_data.setdefault('rdns', True)
         
@@ -1521,6 +1533,9 @@ class MongoStorage():
         if proxy and '_id' in proxy:
             proxy.pop('_id')
         
+        if proxy is not None:
+            proxy.setdefault('linked_accounts_count', 0)
+
         # Decrypt password if present
         if proxy and proxy.get('password_encrypted'):
             try:
@@ -1548,6 +1563,7 @@ class MongoStorage():
         proxies = []
         async for proxy in cursor:
             proxy.pop('_id', None)
+            proxy.setdefault('linked_accounts_count', 0)
             
             # Decrypt password if present
             if proxy.get('password_encrypted'):
@@ -1577,6 +1593,7 @@ class MongoStorage():
         proxies = []
         async for proxy in cursor:
             proxy.pop('_id', None)
+            proxy.setdefault('linked_accounts_count', 0)
             
             # Decrypt password if present
             if proxy.get('password_encrypted'):
@@ -1603,13 +1620,14 @@ class MongoStorage():
         await cls._ensure_ready()
         logger.info("Getting least used active proxy from MongoDB")
         
-        # Find active proxies sorted by connected_accounts ascending
-        cursor = cls._proxies.find({"active": True}).sort("connected_accounts", 1).limit(1)
+        # Find active proxies sorted by linked_accounts_count ascending
+        cursor = cls._proxies.find({"active": True}).sort("linked_accounts_count", 1).limit(1)
         proxy = await cursor.to_list(length=1)
         
         if proxy:
             proxy = proxy[0]
             proxy.pop('_id', None)
+            proxy.setdefault('linked_accounts_count', 0)
             
             # Decrypt password if present
             if proxy.get('password_encrypted'):
@@ -1619,11 +1637,240 @@ class MongoStorage():
                     logger.error(f"Failed to decrypt password for proxy {proxy.get('proxy_name')}: {e}")
                     proxy['password'] = None
             
-            logger.debug(f"Found least used proxy: {proxy.get('proxy_name')} with {proxy.get('connected_accounts', 0)} connections")
+            logger.debug(f"Found least used proxy: {proxy.get('proxy_name')} with {proxy.get('linked_accounts_count', 0)} linked accounts")
             return proxy
         
         logger.warning("No active proxies found")
         return None
+
+    @classmethod
+    async def link_proxy_to_account(cls, phone_number: str, proxy_name: str):
+        """Assign a proxy to an account and increment proxy linkage counter."""
+        await cls._ensure_ready()
+
+        if not proxy_name:
+            raise ValueError("proxy_name is required")
+
+        normalized_name = proxy_name.strip().lower()
+        logger.info(f"Linking proxy {normalized_name} to account {phone_number}")
+
+        account = await cls._accounts.find_one({"phone_number": phone_number}, {"assigned_proxies": 1})
+        if not account:
+            raise ValueError(f"Account {phone_number} not found")
+
+        proxy = await cls._proxies.find_one({"proxy_name": normalized_name})
+        if not proxy:
+            raise ValueError(f"Proxy {normalized_name} not found")
+        if not proxy.get('active', True):
+            raise ValueError(f"Proxy {normalized_name} is not active")
+
+        assigned = account.get('assigned_proxies', []) or []
+        if normalized_name in assigned:
+            logger.debug(f"Proxy {normalized_name} already linked to account {phone_number}")
+            return False
+        if len(assigned) >= MAX_ASSIGNED_PROXIES:
+            raise ValueError(f"Account already has maximum of {MAX_ASSIGNED_PROXIES} proxies")
+
+        update_result = await cls._accounts.update_one(
+            {"phone_number": phone_number},
+            {"$addToSet": {"assigned_proxies": normalized_name}}
+        )
+
+        if update_result.modified_count == 0:
+            refreshed = await cls._accounts.find_one({"phone_number": phone_number}, {"assigned_proxies": 1})
+            refreshed_list = refreshed.get('assigned_proxies', []) if refreshed else []
+            if normalized_name in refreshed_list:
+                logger.debug(f"Proxy {normalized_name} became linked concurrently for {phone_number}")
+                return False
+            if len(refreshed_list) >= MAX_ASSIGNED_PROXIES:
+                raise ValueError(f"Account already has maximum of {MAX_ASSIGNED_PROXIES} proxies")
+            raise RuntimeError(f"Failed to link proxy {normalized_name} to account {phone_number}")
+
+        updated_account = await cls._accounts.find_one({"phone_number": phone_number}, {"assigned_proxies": 1})
+        assigned_after = updated_account.get('assigned_proxies', []) if updated_account else []
+
+        if len(assigned_after) > MAX_ASSIGNED_PROXIES:
+            await cls._accounts.update_one(
+                {"phone_number": phone_number},
+                {"$pull": {"assigned_proxies": normalized_name}}
+            )
+            raise ValueError(f"Account already has maximum of {MAX_ASSIGNED_PROXIES} proxies")
+
+        proxy_update = await cls._proxies.update_one(
+            {"proxy_name": normalized_name},
+            {"$inc": {"linked_accounts_count": 1}}
+        )
+
+        if proxy_update.modified_count == 0:
+            await cls._accounts.update_one(
+                {"phone_number": phone_number},
+                {"$pull": {"assigned_proxies": normalized_name}}
+            )
+            raise RuntimeError(f"Failed to increment linkage counter for proxy {normalized_name}")
+
+        logger.debug(f"Linked proxy {normalized_name} to account {phone_number}")
+        return True
+
+    @classmethod
+    async def unlink_proxy_from_account(cls, phone_number: str, proxy_name: str):
+        """Remove a proxy assignment from an account and decrement linkage counter."""
+        await cls._ensure_ready()
+
+        if not proxy_name:
+            raise ValueError("proxy_name is required")
+
+        normalized_name = proxy_name.strip().lower()
+        logger.info(f"Unlinking proxy {normalized_name} from account {phone_number}")
+
+        removal_result = await cls._accounts.update_one(
+            {"phone_number": phone_number},
+            {"$pull": {"assigned_proxies": normalized_name}}
+        )
+
+        if removal_result.modified_count == 0:
+            logger.debug(f"Proxy {normalized_name} was not linked to account {phone_number}")
+            return False
+
+        proxy_update = await cls._proxies.update_one(
+            {"proxy_name": normalized_name},
+            {"$inc": {"linked_accounts_count": -1}}
+        )
+
+        if proxy_update.modified_count == 0:
+            logger.warning(f"Linked proxy {normalized_name} missing while unlinking from {phone_number}")
+
+        await cls._proxies.update_one(
+            {"proxy_name": normalized_name, "linked_accounts_count": {"$lt": 0}},
+            {"$set": {"linked_accounts_count": 0}}
+        )
+
+        logger.debug(f"Unlinked proxy {normalized_name} from account {phone_number}")
+        return True
+
+    @classmethod
+    async def get_account_assigned_proxies(cls, phone_number: str):
+        """Return proxy metadata for proxies linked to an account."""
+        await cls._ensure_ready()
+
+        account = await cls._accounts.find_one({"phone_number": phone_number}, {"assigned_proxies": 1, "_id": 0})
+        if account is None:
+            raise ValueError(f"Account {phone_number} not found")
+
+        assigned = account.get('assigned_proxies', []) or []
+        if not assigned:
+            return []
+
+        cursor = cls._proxies.find({"proxy_name": {"$in": assigned}})
+        proxy_map = {}
+        async for proxy in cursor:
+            proxy.pop('_id', None)
+            proxy.setdefault('linked_accounts_count', 0)
+            proxy.pop('password', None)
+            proxy.pop('password_encrypted', None)
+            proxy_map[proxy['proxy_name']] = proxy
+
+        ordered = [proxy_map[name] for name in assigned if name in proxy_map]
+        return ordered
+
+    @classmethod
+    async def auto_assign_proxies(cls, phone_number: str, desired_count: Optional[int] = None, active_only: bool = True):
+        """Ensure an account has up to the desired number of proxies by linking the least-used ones."""
+        await cls._ensure_ready()
+
+        account = await cls._accounts.find_one({"phone_number": phone_number}, {"assigned_proxies": 1, "_id": 0})
+        if account is None:
+            raise ValueError(f"Account {phone_number} not found")
+
+        assigned = account.get('assigned_proxies', []) or []
+        current_count = len(assigned)
+
+        try:
+            target = int(desired_count) if desired_count is not None else TARGET_ASSIGNED_PROXIES
+        except (TypeError, ValueError):
+            raise ValueError("desired_count must be an integer")
+
+        if target < 1:
+            target = 1
+        if target > MAX_ASSIGNED_PROXIES:
+            target = MAX_ASSIGNED_PROXIES
+
+        remaining_needed = max(0, target - current_count)
+        if remaining_needed == 0:
+            return {
+                "phone_number": phone_number,
+                "target": target,
+                "assigned_proxies": assigned,
+                "added": [],
+                "remaining": 0,
+                "message": "Account already meets desired proxy count"
+            }
+
+        query: dict = {"proxy_name": {"$nin": assigned}}
+        if active_only:
+            query['active'] = True
+
+        cursor = cls._proxies.find(query).sort("linked_accounts_count", 1)
+        candidates: List[str] = []
+        max_candidates = max(remaining_needed * 2, remaining_needed + 3)
+        async for proxy in cursor:
+            proxy_name = proxy.get('proxy_name')
+            if not proxy_name:
+                continue
+            candidates.append(proxy_name)
+            if len(candidates) >= max_candidates:
+                break
+
+        added: list[str] = []
+        for proxy_name in candidates:
+            if len(added) >= remaining_needed:
+                break
+            try:
+                linked = await cls.link_proxy_to_account(phone_number, proxy_name)
+            except ValueError:
+                continue
+            if linked:
+                added.append(proxy_name)
+
+        refreshed = await cls._accounts.find_one({"phone_number": phone_number}, {"assigned_proxies": 1, "_id": 0})
+        assigned_after = refreshed.get('assigned_proxies', []) if refreshed else []
+        new_count = len(assigned_after)
+        remaining_after = max(0, target - new_count)
+
+        response = {
+            "phone_number": phone_number,
+            "target": target,
+            "assigned_proxies": assigned_after,
+            "added": added,
+            "remaining": remaining_after
+        }
+
+        if remaining_after > 0:
+            response["message"] = "Not enough eligible proxies to satisfy desired count"
+
+        return response
+
+    @classmethod
+    async def get_least_linked_proxies(cls, limit: int = 10, active_only: bool = True):
+        """Fetch proxies sorted by the number of accounts linked to them."""
+        await cls._ensure_ready()
+
+        if limit <= 0:
+            return []
+
+        query = {}
+        if active_only:
+            query['active'] = True
+
+        cursor = cls._proxies.find(query).sort("linked_accounts_count", 1).limit(limit)
+        proxies = []
+        async for proxy in cursor:
+            proxy.pop('_id', None)
+            proxy.setdefault('linked_accounts_count', 0)
+            proxy.pop('password', None)
+            proxy.pop('password_encrypted', None)
+            proxies.append(proxy)
+
+        return proxies
 
     @classmethod
     async def update_proxy(cls, proxy_name: str, update_data: dict):
