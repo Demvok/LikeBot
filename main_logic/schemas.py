@@ -21,9 +21,37 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Union, Literal
 from enum import Enum, auto
 from pydantic import BaseModel, Field, field_validator, model_validator
-from pandas import Timestamp
 from asyncio import Future
 from telethon import TelegramClient
+
+
+def _normalize_proxy_names(value, allow_none: bool = False) -> Optional[List[str]]:
+    """Normalize proxy name lists: trim, lowercase, unique, max 5."""
+    if value is None:
+        return None if allow_none else []
+
+    if isinstance(value, str):
+        value = [value]
+
+    if not isinstance(value, (list, tuple, set)):
+        raise ValueError('assigned_proxies must be a list of proxy names')
+
+    normalized: List[str] = []
+    for raw in value:
+        if raw is None:
+            continue
+        if not isinstance(raw, str):
+            raise ValueError('assigned_proxies entries must be strings')
+        cleaned = raw.strip().lower()
+        if not cleaned:
+            continue
+        if cleaned not in normalized:
+            normalized.append(cleaned)
+
+    if len(normalized) > 5:
+        raise ValueError('assigned_proxies cannot have more than 5 entries')
+
+    return normalized
 
 
 # ============= ENUMS =============
@@ -92,11 +120,21 @@ class AccountStatus(Enum):
 
 
 class TaskStatus(Enum):
-    """Task execution status enumeration."""
+    """Task execution status enumeration.
+    
+    States:
+    - PENDING: Task created but not yet started
+    - RUNNING: Task is currently executing
+    - PAUSED: Task execution is paused
+    - FINISHED: Task completed successfully
+    - FAILED: Task ran correctly but all workers failed due to account issues
+    - CRASHED: Task encountered infrastructure/system-level errors
+    """
     PENDING = auto()
     RUNNING = auto()
     PAUSED = auto()
     FINISHED = auto()
+    FAILED = auto()
     CRASHED = auto()
     
     def __str__(self):
@@ -229,6 +267,7 @@ class AccountBase(BaseModel):
     password_encrypted: Optional[str] = Field(None, description="Encrypted password for 2FA")
     notes: Optional[str] = Field("", description="Account notes")
     subscribed_to: Optional[List[int]] = Field(default_factory=list, description="List of channel chat_ids the account is subscribed to")
+    assigned_proxies: List[str] = Field(default_factory=list, description="List of proxy names assigned to the account (max 5)")
     
     # Status tracking fields
     last_error: Optional[str] = Field(None, description="Last error message encountered")
@@ -237,6 +276,10 @@ class AccountBase(BaseModel):
     last_success_time: Optional[datetime] = Field(None, description="Timestamp of last successful operation")
     last_checked: Optional[datetime] = Field(None, description="Last time account status was checked")
     flood_wait_until: Optional[datetime] = Field(None, description="Timestamp until which account is in flood wait")
+    
+    # Channel sync metadata
+    last_channel_sync_at: Optional[datetime] = Field(None, description="Timestamp of last channel sync operation")
+    last_channel_sync_count: Optional[int] = Field(None, description="Number of channels found in last sync")
 
     @field_validator('phone_number')
     def validate_phone_number(cls, v):
@@ -252,6 +295,10 @@ class AccountBase(BaseModel):
             raise ValueError('password_encrypted is required when twofa is enabled')
         return self
 
+    @field_validator('assigned_proxies')
+    def validate_assigned_proxies(cls, value):
+        return _normalize_proxy_names(value)
+
 
 class AccountCreate(BaseModel):
     """Schema for creating new accounts."""
@@ -261,6 +308,7 @@ class AccountCreate(BaseModel):
     password: Optional[str] = Field(None, description="Plain text password for 2FA (will be encrypted server-side)")
     notes: Optional[str] = Field("", description="Account notes")
     subscribed_to: Optional[List[int]] = Field(default_factory=list, description="List of channel chat_ids the account is subscribed to")
+    assigned_proxies: List[str] = Field(default_factory=list, description="List of proxy names assigned to the account (max 5)")
 
     @field_validator('phone_number')
     def validate_phone_number(cls, v):
@@ -275,6 +323,10 @@ class AccountCreate(BaseModel):
         if self.twofa and not self.password:
             raise ValueError('password is required when twofa is enabled')
         return self
+
+    @field_validator('assigned_proxies')
+    def validate_assigned_proxies(cls, value):
+        return _normalize_proxy_names(value)
 
 class LoginProcess(BaseModel):
     """Schema for tracking login process state."""
@@ -304,9 +356,14 @@ class AccountUpdate(BaseModel):
     notes: Optional[str] = Field(None, description="Account notes")
     status: Optional[AccountStatus] = Field(None, description="Account status")
     subscribed_to: Optional[List[int]] = Field(None, description="List of channel chat_ids the account is subscribed to")
+    assigned_proxies: Optional[List[str]] = Field(None, description="List of proxy names assigned to the account (max 5)")
 
     class Config:
         use_enum_values = True
+
+    @field_validator('assigned_proxies')
+    def validate_assigned_proxies(cls, value):
+        return _normalize_proxy_names(value, allow_none=True)
 
 
 class AccountResponse(AccountBase, TimestampMixin):
@@ -339,8 +396,11 @@ class AccountDict(BaseModel):
     notes: Optional[str]
     status: Optional[AccountStatus]
     subscribed_to: Optional[List[int]]
+    assigned_proxies: Optional[List[str]]
     created_at: Optional[Union[str, datetime]]
     updated_at: Optional[Union[str, datetime]]
+    last_channel_sync_at: Optional[Union[str, datetime]] = None
+    last_channel_sync_count: Optional[int] = None
 
     class Config:
         use_enum_values = True
@@ -357,8 +417,11 @@ class AccountDictSecure(BaseModel):
     notes: Optional[str]
     status: Optional[AccountStatus]
     subscribed_to: Optional[List[int]]
+    assigned_proxies: Optional[List[str]]
     created_at: Optional[Union[str, datetime]]
     updated_at: Optional[Union[str, datetime]]
+    last_channel_sync_at: Optional[Union[str, datetime]] = None
+    last_channel_sync_count: Optional[int] = None
 
     class Config:
         use_enum_values = True
@@ -372,6 +435,8 @@ class PostBase(BaseModel):
     message_link: str = Field(..., description="Telegram message link")
     chat_id: Optional[int] = Field(None, description="Telegram chat ID")
     message_id: Optional[int] = Field(None, description="Telegram message ID")
+    message_content: Optional[str] = Field(None, description="Message text content (cached)")
+    content_fetched_at: Optional[datetime] = Field(None, description="When message content was last fetched")
 
     @field_validator('message_link')
     def validate_message_link(cls, v):
@@ -390,6 +455,8 @@ class PostUpdate(BaseModel):
     message_link: Optional[str] = Field(None, description="Telegram message link")
     chat_id: Optional[int] = Field(None, description="Telegram chat ID")
     message_id: Optional[int] = Field(None, description="Telegram message ID")
+    message_content: Optional[str] = Field(None, description="Message text content (cached)")
+    content_fetched_at: Optional[datetime] = Field(None, description="When message content was last fetched")
 
     @field_validator('message_link')
     def validate_message_link(cls, v):
@@ -411,6 +478,8 @@ class PostDict(BaseModel):
     message_id: Optional[int]
     message_link: str
     is_validated: bool
+    message_content: Optional[str] = None
+    content_fetched_at: Optional[Union[str, datetime]] = None
     created_at: Union[str, datetime]
     updated_at: Union[str, datetime]
 
@@ -495,6 +564,7 @@ class ChannelBase(BaseModel):
     discussion_chat_id: Optional[int] = Field(None, description="Discussion group chat ID if exists")
     channel_name: Optional[str] = Field(None, description="Channel name/title", max_length=255)
     tags: Optional[List[str]] = Field(default_factory=list, description="Channel tags for categorization")
+    url_aliases: Optional[List[str]] = Field(default_factory=list, description="URL identifiers for this channel (usernames, /c/ paths, etc.) for fast lookup")
 
     @field_validator('tags')
     def validate_tags(cls, v):
@@ -518,6 +588,7 @@ class ChannelUpdate(BaseModel):
     discussion_chat_id: Optional[int] = Field(None, description="Discussion group chat ID if exists")
     channel_name: Optional[str] = Field(None, description="Channel name/title", max_length=255)
     tags: Optional[List[str]] = Field(None, description="Channel tags for categorization")
+    url_aliases: Optional[List[str]] = Field(None, description="URL identifiers for this channel (usernames, /c/ paths, etc.)")
 
     @field_validator('tags')
     def validate_tags(cls, v):
@@ -544,6 +615,7 @@ class ChannelDict(BaseModel):
     discussion_chat_id: Optional[int]
     channel_name: Optional[str]
     tags: List[str]
+    url_aliases: List[str]
     created_at: Union[str, datetime]
     updated_at: Union[str, datetime]
 

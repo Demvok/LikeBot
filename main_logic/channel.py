@@ -63,6 +63,7 @@ class Channel:
         discussion_chat_id: Linked discussion group chat ID
         channel_name: Channel name/title
         tags: List of tags for categorization
+        url_aliases: List of URL identifiers (usernames, /c/ paths) for fast lookup
         created_at: Creation timestamp
         updated_at: Last update timestamp
     """
@@ -77,6 +78,7 @@ class Channel:
         discussion_chat_id: Optional[int] = None,
         channel_name: Optional[str] = None,
         tags: Optional[List[str]] = None,
+        url_aliases: Optional[List[str]] = None,
         created_at=None,
         updated_at=None
     ):
@@ -88,6 +90,7 @@ class Channel:
         self.discussion_chat_id = normalize_chat_id(discussion_chat_id) if discussion_chat_id else None
         self.channel_name = channel_name
         self.tags = tags or []
+        self.url_aliases = url_aliases or []
         self.created_at = created_at or Timestamp.now()
         self.updated_at = updated_at or Timestamp.now()
 
@@ -113,6 +116,7 @@ class Channel:
             'discussion_chat_id': self.discussion_chat_id,
             'channel_name': self.channel_name,
             'tags': self.tags if self.tags else [],
+            'url_aliases': self.url_aliases if self.url_aliases else [],
             'created_at': self.created_at.isoformat() if isinstance(self.created_at, Timestamp) else self.created_at,
             'updated_at': self.updated_at.isoformat() if isinstance(self.updated_at, Timestamp) else self.updated_at
         }
@@ -137,6 +141,7 @@ class Channel:
             discussion_chat_id=data.get('discussion_chat_id'),
             channel_name=data.get('channel_name'),
             tags=data.get('tags', []),
+            url_aliases=data.get('url_aliases', []),
             created_at=data.get('created_at'),
             updated_at=data.get('updated_at')
         )
@@ -151,7 +156,8 @@ class Channel:
         reactions_only_for_subscribers: bool = False,
         discussion_chat_id: Optional[int] = None,
         channel_name: Optional[str] = None,
-        tags: Optional[List[str]] = None
+        tags: Optional[List[str]] = None,
+        url_aliases: Optional[List[str]] = None
     ):
         """
         Create a Channel object from individual keys.
@@ -165,6 +171,7 @@ class Channel:
             discussion_chat_id: Linked discussion group chat ID
             channel_name: Channel name/title
             tags: List of tags
+            url_aliases: List of URL identifiers
             
         Returns:
             Channel instance
@@ -177,7 +184,8 @@ class Channel:
             reactions_only_for_subscribers=reactions_only_for_subscribers,
             discussion_chat_id=discussion_chat_id,
             channel_name=channel_name,
-            tags=tags
+            tags=tags,
+            url_aliases=url_aliases
         )
 
     def update(self, **kwargs):
@@ -190,7 +198,7 @@ class Channel:
         allowed_fields = {
             'is_private', 'channel_hash', 'has_enabled_reactions',
             'reactions_only_for_subscribers', 'discussion_chat_id',
-            'channel_name', 'tags'
+            'channel_name', 'tags', 'url_aliases'
         }
         
         for key, value in kwargs.items():
@@ -234,6 +242,41 @@ class Channel:
             True if tag exists, False otherwise
         """
         return tag in self.tags
+
+    def add_url_alias(self, alias: str):
+        """
+        Add a URL alias to the channel.
+        
+        Args:
+            alias: URL identifier to add (username, /c/ path, etc.)
+        """
+        alias = alias.strip()
+        if alias and alias not in self.url_aliases:
+            self.url_aliases.append(alias)
+            self.updated_at = Timestamp.now()
+
+    def remove_url_alias(self, alias: str):
+        """
+        Remove a URL alias from the channel.
+        
+        Args:
+            alias: URL identifier to remove
+        """
+        if alias in self.url_aliases:
+            self.url_aliases.remove(alias)
+            self.updated_at = Timestamp.now()
+
+    def has_url_alias(self, alias: str) -> bool:
+        """
+        Check if channel has a specific URL alias.
+        
+        Args:
+            alias: URL identifier to check
+            
+        Returns:
+            True if alias exists, False otherwise
+        """
+        return alias in self.url_aliases
 
     @property
     def can_react(self) -> bool:

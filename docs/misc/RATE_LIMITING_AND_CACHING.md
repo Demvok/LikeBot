@@ -78,24 +78,35 @@ All API calls now have rate limiting:
 
 ## Configuration
 
-Rate limiting delays can be adjusted in `TelegramAPIRateLimiter.__init__()`:
+### Rate Limiter
 
-```python
-self._min_delay = {
-    'get_entity': 0.5,      # Adjust as needed
-    'get_messages': 0.3,
-    'send_reaction': 0.5,
-    'send_message': 0.5,
-    'default': 0.2
-}
+Delays still live in `auxilary_logic/humaniser.py` (see `TelegramAPIRateLimiter._min_delay`). Tweak the YAML keys under `delays.rate_limit_*` to adjust production defaults.
+
+### Telegram Cache
+
+Cache behavior is now driven entirely from `config.yaml`:
+
+```yaml
+cache:
+  scope: "task"            # "task" (fresh cache per task) or "process" (semi-permanent)
+  max_size: 500            # Default LRU size for task scope
+  enable_in_flight_dedup: true
+  entity_ttl: 300
+  message_ttl: 60
+  full_channel_ttl: 600
+  discussion_ttl: 300
+  input_peer_ttl: 300
+  process:
+    max_size: 2000         # Overrides max_size when scope == "process"
+    cleanup_interval: 60   # Seconds between background sweeps for expired entries
+  per_account:
+    max_entries: 400       # Prevents a single account from evicting everyone else
 ```
 
-Cache settings in `Client.__init__()`:
+#### Cache Scopes
 
-```python
-self._entity_cache_max_size = 100  # Max cached entities
-self._entity_cache_ttl = 300       # 5 minutes in seconds
-```
+- **Task scope (default):** A brand-new `TelegramCache` is created for every `Task._run()` and cleared when the task finishes. Zero behavior change from the legacy implementation.
+- **Process scope:** A single cache instance (per process) is reused across tasks. Entries are still isolated per account and TTLs stay in effect. Background cleanup keeps memory in check, and cache stats/logs now include `scope` plus `warm_start` metadata so you can verify that reuse is working.
 
 ## Testing Recommendations
 

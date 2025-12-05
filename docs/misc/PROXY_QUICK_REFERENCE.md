@@ -42,7 +42,7 @@ await db.add_proxy({
   "type": "socks5",               // Optional: default protocol
   "rdns": true,                   // Optional: remote DNS (default: true)
   "active": true,                 // Auto-managed: availability
-  "connected_accounts": 0,        // Auto-managed: usage counter
+    "linked_accounts_count": 0,     // Auto-managed: number of accounts referencing this proxy
   "last_error": null,             // Auto-managed: last error
   "created_at": ISODate("...")    // Auto-set: creation time
 }
@@ -69,9 +69,6 @@ When multiple ports are defined, candidates are tried in this order:
 ## Database Operations
 
 ```python
-# Get least-used proxy (for load balancing)
-proxy = await db.get_least_used_proxy()
-
 # Get specific proxy
 proxy = await db.get_proxy('proxy-name')
 
@@ -84,28 +81,35 @@ await db.update_proxy('proxy-name', {'active': False})
 # Delete proxy
 await db.delete_proxy('proxy-name')
 
-# Usage tracking (auto-managed, but can be manual)
-await db.increment_proxy_usage('proxy-name')
-await db.decrement_proxy_usage('proxy-name')
+# Account linking helpers
+await db.link_proxy_to_account('+1234567890', 'proxy-name')
+await db.unlink_proxy_from_account('+1234567890', 'proxy-name')
+
+# Least-linked reporting
+proxies = await db.get_least_linked_proxies(limit=5)
 
 # Error tracking (auto-managed, but can be manual)
 await db.set_proxy_error('proxy-name', 'Connection timeout')
 await db.clear_proxy_error('proxy-name')
 ```
 
+## Account Assignments (API)
+
+- `GET /accounts/{phone}/proxies` – list proxies assigned to an account
+- `POST /accounts/{phone}/proxies/{proxy_name}` – link proxy to account (max 5)
+- `DELETE /accounts/{phone}/proxies/{proxy_name}` – unlink proxy from account
+- `GET /proxies/least-linked` – inspect proxies with the fewest linked accounts
+
 ## Proxy Module Functions
 
 ```python
-from proxy import build_proxy_dict, build_proxy_candidates, get_proxy_config
+from proxy import build_proxy_dict, build_proxy_candidates
 
 # Build single proxy dict from DB record
 proxy_dict = build_proxy_dict(proxy_data, logger)
 
 # Build multiple candidates from single record
 candidates = build_proxy_candidates(proxy_data, logger)
-
-# Get proxy config for connection (returns candidates + DB record)
-candidates, proxy_data = await get_proxy_config(phone_number, logger)
 ```
 
 ## Connection Modes
@@ -115,6 +119,7 @@ Set in `config.yaml`:
 ```yaml
 proxy:
   mode: soft  # or 'strict'
+    max_per_account: 5
 ```
 
 | Mode | Behavior |
