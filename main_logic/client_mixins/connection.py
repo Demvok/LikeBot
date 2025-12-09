@@ -5,7 +5,9 @@ Orchestrates TelegramClient lifecycle using SessionMixin, ProxyMixin, and Lockin
 Handles connection, disconnection, session validation, and error recovery.
 """
 
+import asyncio
 import os
+import random
 from telethon import TelegramClient, errors
 from dotenv import load_dotenv
 
@@ -39,6 +41,7 @@ class ConnectionMixin(SessionMixin, ProxyMixin, LockingMixin):
                      a lock on this account. If the account is already locked by
                      another task, logs a warning but continues (best-effort locking).
         """
+        await self._apply_warmup_delay('connect', 'pre', f"Pre-connect jitter for {self.phone_number}")
         # Attempt to acquire lock if task_id provided (from LockingMixin)
         await self._acquire_lock(task_id)
         
@@ -191,6 +194,7 @@ class ConnectionMixin(SessionMixin, ProxyMixin, LockingMixin):
                         await self.update_account_id_from_telegram()
                 
                     ctx.success()
+                    await self._apply_warmup_delay('connect', 'post', f"Post-connect idle for {self.phone_number}")
                     return self
                     
                 except (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError, errors.UserDeactivatedError, errors.UserDeactivatedBanError):
@@ -211,6 +215,8 @@ class ConnectionMixin(SessionMixin, ProxyMixin, LockingMixin):
 
     async def disconnect(self):
         """Disconnect the client and release account lock if held."""
+        await self._apply_warmup_delay('disconnect', 'pre', f"Pre-disconnect jitter for {self.phone_number}")
+
         async with RetryContext(
             retries_key='connection_retries',
             delay_key='reconnect_delay',
@@ -225,6 +231,7 @@ class ConnectionMixin(SessionMixin, ProxyMixin, LockingMixin):
                     await self._release_lock()
                     
                     ctx.success()
+                    await self._apply_warmup_delay('disconnect', 'post', f"Post-disconnect idle for {self.phone_number}")
                     return
                 except Exception as e:
                     await ctx.failed(e)
@@ -239,3 +246,35 @@ class ConnectionMixin(SessionMixin, ProxyMixin, LockingMixin):
         if not self.client or not self.is_connected:
             self.logger.info(f"Client for {self.phone_number} is not connected. Reconnecting...")
             await self.connect()
+
+    def _get_warmup_section(self, section: str) -> dict:
+        return config.get('delays', {}).get('connection_warmup', {}).get(section, {})
+
+    async def _apply_warmup_delay(self, section: str, phase: str, reason: str = None):
+        section_cfg = self._get_warmup_section(section)
+        min_key = f"{phase}_jitter_min"
+        max_key = f"{phase}_jitter_max"
+        min_delay = section_cfg.get(min_key)
+        max_delay = section_cfg.get(max_key)
+        await self._sleep_random(min_delay, max_delay, reason)
+
+    async def _sleep_random(self, min_delay, max_delay, reason: str = None):
+        delay = self._resolve_delay(min_delay, max_delay)
+        if delay <= 0:
+            return
+        if reason:
+            self.logger.debug(f"{reason}: {delay:.2f}s")
+        await asyncio.sleep(delay)
+
+    @staticmethod
+    def _resolve_delay(min_delay, max_delay) -> float:
+        try:
+            if min_delay is None or max_delay is None:
+                return 0.0
+            min_delay = max(0.0, float(min_delay))
+            max_delay = max(min_delay, float(max_delay))
+            if max_delay <= 0:
+                return 0.0
+            return random.uniform(min_delay, max_delay)
+        except (TypeError, ValueError):
+            return 0.0

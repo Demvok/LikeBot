@@ -31,15 +31,18 @@ This document describes the full CRUD API for the LikeBot automation system.
 
 The following notes summarize important changes in the codebase since the previous documented version (1.0.2):
 
-- Bumped API version to **1.1.1** (see health-check response below).
+- Bumped API version to **1.2.0** (health-check now simply relays the FastAPI app version string).
 - Added CORS support that can be configured via the `frontend_http` environment variable (used by the API to allow frontend origins).
-- Startup now enforces critical environment variables at launch (e.g., `KEK`, `JWT_SECRET_KEY`, `db_url`) and will fail fast if they are missing.
+- Startup now runs inside a FastAPI lifespan hook that validates critical environment variables (`KEK`, `JWT_SECRET_KEY`, `db_url`), verifies database readiness, and cancels in-flight background tasks on shutdown.
 - The application registers a cleanup handler on process exit to ensure logging/resources are cleaned up (clean shutdown behavior).
 - WebSocket `/ws/logs` accepts a `tail` query parameter (0-1000, default 200) and will send token-expiry warnings when an access token is nearing expiry.
+- Added first-class account-proxy management endpoints so operators can inspect, auto-assign, and manually link/unlink proxies without leaving the API.
+- Added proxy-operational tooling: `GET /proxies/least-linked` highlights under-utilized proxies, `POST /proxies/import` bulk-loads proxies from files, and `POST /proxies/{proxy_name}/test` validates connectivity through 2ip.ua (or a custom URL).
 
 **New Endpoints Added:**
 - **User Management** (Admin only): GET /users, PUT /users/{username}/role, PUT /users/{username}/verify, DELETE /users/{username}
-- **Proxy Management**: Full CRUD for proxy configurations (GET, POST, PUT, DELETE /proxies, GET /proxies/stats/summary)
+- **Account Proxy Management**: GET /accounts/{phone_number}/proxies, POST /accounts/{phone_number}/proxies/auto-assign, POST /accounts/{phone_number}/proxies/{proxy_name}, DELETE /accounts/{phone_number}/proxies/{proxy_name}
+- **Proxy Management**: Full CRUD for proxy configurations (GET, POST, PUT, DELETE /proxies, GET /proxies/stats/summary) plus helper endpoints (`GET /proxies/least-linked`, `POST /proxies/import`, `POST /proxies/{proxy_name}/test`)
 - **Channel Management**: Full CRUD for Telegram channels (GET, POST, PUT, DELETE /channels, POST /channels/bulk, GET /channels/{chat_id}/subscribers, GET /channels/stats/summary, GET /channels/with-post-counts)
 - **Account-Channel Subscriptions**: GET /accounts/{phone_number}/channels, POST /accounts/{phone_number}/channels/sync
 - **Reaction Palettes**: Full CRUD for emoji reaction palettes (GET, POST, PUT, DELETE /palettes)
@@ -309,7 +312,7 @@ Get server status.
 ```json
 {
   "message": "LikeBot API Server is running",
-  "version": "1.1.1"
+  "version": "1.2.0"
 }
 ```
 
@@ -794,6 +797,93 @@ Authorization: Bearer <your_admin_access_token>
 - `403`: User is not admin
 - `404`: Account not found
 - `500`: Failed to decrypt password
+
+### Account Proxy Management
+
+Accounts can reference up to five proxies (matching the schema constraint on `assigned_proxies`). Use the following endpoints to inspect and maintain those assignments without touching the database directly.
+
+#### GET /accounts/{phone_number}/proxies
+List the proxies currently linked to an account. Results are returned in the same order stored on the account record.
+
+**Authentication**: Required
+
+**Response:**
+```json
+[
+  {
+    "proxy_name": "proxy1",
+    "type": "socks5",
+    "host": "10.0.0.1",
+    "port": 1080,
+    "rdns": true,
+    "active": true,
+    "linked_accounts_count": 2,
+    "notes": "Primary exit"
+  }
+]
+```
+
+**Error Responses:**
+- `404`: Account not found
+
+#### POST /accounts/{phone_number}/proxies/auto-assign
+Ensure an account has a desired number of proxies by automatically linking the least-linked proxies that are not already assigned.
+
+**Authentication**: Required
+
+**Query Parameters:**
+- `desired_count` (optional): Target number of proxies (defaults to backend constant, capped at 5)
+- `active_only` (optional, default `true`): Only consider active proxies
+
+**Response:**
+```json
+{
+  "phone_number": "+1234567890",
+  "target": 3,
+  "assigned_proxies": ["proxy1", "proxy4", "proxy7"],
+  "added": ["proxy4", "proxy7"],
+  "remaining": 0
+}
+```
+
+**Notes:**
+- If there are not enough eligible proxies, `remaining` will stay above zero and `message` will explain the shortage.
+- Ineligible proxies (inactive, already assigned, exceeds per-account cap) are skipped automatically.
+
+**Error Responses:**
+- `400`: Invalid desired_count or no eligible proxies remain
+- `404`: Account not found
+
+#### POST /accounts/{phone_number}/proxies/{proxy_name}
+Link a specific proxy to an account. Returns `201 Created` when a new link is established.
+
+**Authentication**: Required
+
+**Response:**
+```json
+{ "message": "Proxy 'proxy1' linked to account +1234567890" }
+```
+
+**Notes:**
+- If the proxy is already linked, the API responds with a 200 status and an "already linked" message.
+- The proxy must exist, be active, and the account must have fewer than five proxies.
+
+**Error Responses:**
+- `400`: Account already at proxy limit or proxy inactive
+- `404`: Account or proxy not found
+
+#### DELETE /accounts/{phone_number}/proxies/{proxy_name}
+Unlink a proxy from an account. Safe to call even if the proxy is not currently assigned.
+
+**Authentication**: Required
+
+**Response:**
+```json
+{ "message": "Proxy 'proxy1' unlinked from account +1234567890" }
+```
+
+**Error Responses:**
+- `404`: Account not found
 
 ---
 
@@ -1843,6 +1933,35 @@ Authorization: Bearer <your_access_token>
 
 ---
 
+### GET /proxies/least-linked
+Return the least-utilized proxies to help balance assignments.
+
+**Authentication**: Required
+
+**Query Parameters:**
+- `limit` (optional, default `10`, min `1`, max `100`): Maximum number of rows to return
+- `active_only` (optional, default `true`): Restrict the list to proxies with `active=true`
+
+**Response:**
+```json
+[
+  {
+    "proxy_name": "proxy4",
+    "type": "socks5",
+    "host": "192.168.1.104",
+    "port": 1080,
+    "active": true,
+    "linked_accounts_count": 0
+  }
+]
+```
+
+**Notes:**
+- Results are sorted ascending by `linked_accounts_count`.
+- Password fields are stripped for safety.
+
+---
+
 ### GET /proxies/{proxy_name}
 Get a specific proxy by name.
 
@@ -1927,6 +2046,46 @@ POST /proxies?proxy_name=proxy1&host=192.168.1.100&port=1080&proxy_type=socks5&u
 
 ---
 
+### POST /proxies/import
+Bulk-import proxies from a text file. Each line may contain `host:port`, `host:port:user:pass`, or extended CSV-style rows. Names are inferred from the filename or the optional prefix.
+
+**Authentication**: Required
+
+**Body:** Multipart form-data with a `proxy_file` upload (UTF-8 preferred)
+
+**Query Parameters:**
+- `proxy_type` (optional): Override detected type (`socks5`, `socks4`, `http`)
+- `base_name` (optional): Prefix for generated proxy names
+- `dry_run` (optional, default `false`): Validate the file without inserting
+
+**Response (dry_run=true):**
+```json
+{
+  "message": "Proxy file parsed successfully",
+  "total": 120,
+  "dry_run": true
+}
+```
+
+**Response (import):**
+```json
+{
+  "message": "Proxy import completed",
+  "dry_run": false,
+  "total": 120,
+  "imported": 115,
+  "skipped": [
+    { "proxy_name": "proxy_existing", "reason": "already_exists" }
+  ],
+  "errors": []
+}
+```
+
+**Error Responses:**
+- `400`: Upload missing/empty, decoding failure, or parse error
+
+---
+
 ### PUT /proxies/{proxy_name}
 Update an existing proxy configuration.
 
@@ -1998,6 +2157,40 @@ Authorization: Bearer <your_access_token>
 **Error Responses:**
 - `400`: Proxy is in use (has connected accounts)
 - `404`: Proxy not found
+
+---
+
+### POST /proxies/{proxy_name}/test
+Verify that a proxy can reach an external endpoint (defaults to the 2ip.ua JSON API) and capture latency/location metadata.
+
+**Authentication**: Required
+
+**Query Parameters:**
+- `test_url` (optional): Override the default probe URL
+- `timeout_seconds` (optional, default `15`, range `1-120`): HTTP timeout per attempt
+
+**Response:**
+```json
+{
+  "proxy_name": "proxy1",
+  "endpoint": "socks5://user:******@192.168.1.100:1080",
+  "target_url": "https://2ip.ua/api/index.php?type=json",
+  "latency_ms": 428.51,
+  "status_code": 200,
+  "details": {
+    "ip": "93.184.216.34",
+    "hostname": "example-host",
+    "provider": "Example ISP",
+    "location": "Frankfurt, Germany",
+    "raw": { "ip": "93.184.216.34", "country": "Germany" }
+  }
+}
+```
+
+**Error Responses:**
+- `400`: Proxy inactive/misconfigured or invalid params
+- `404`: Proxy not found
+- `502`: Target service reported an upstream failure
 
 ---
 

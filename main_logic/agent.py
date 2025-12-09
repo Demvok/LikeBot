@@ -9,7 +9,10 @@ here for backwards compatibility.
 """
 
 import asyncio
-from utils.logger import setup_logger
+import math
+import random
+from typing import Optional
+from utils.logger import setup_logger, load_config
 from main_logic.account import Account
 from auxilary_logic.humaniser import TelegramAPIRateLimiter
 from auxilary_logic.account_locking import AccountLockManager, AccountLockError, get_account_lock_manager
@@ -25,6 +28,33 @@ from main_logic.client_mixins import (
 
 # Explicit exports for `from main_logic.agent import *`
 __all__ = ['Account', 'Client', 'TelegramAPIRateLimiter', 'AccountLockManager', 'AccountLockError', 'get_account_lock_manager']
+
+config = load_config()
+
+
+async def _sleep_random(min_delay: Optional[float], max_delay: Optional[float], logger, reason: str):
+    """Sleep for a random amount between min_delay and max_delay if configured."""
+    if min_delay is None or max_delay is None:
+        return
+    try:
+        min_delay = max(0.0, float(min_delay))
+        max_delay = max(min_delay, float(max_delay))
+    except (TypeError, ValueError):
+        return
+    if max_delay <= 0:
+        return
+    delay = random.uniform(min_delay, max_delay)
+    if delay <= 0:
+        return
+    if logger and reason:
+        logger.debug(f"{reason}: sleeping {delay:.2f}s")
+    await asyncio.sleep(delay)
+
+
+def _get_warmup_block(key: str) -> dict:
+    delays = config.get('delays', {})
+    warmup = delays.get('connection_warmup', {})
+    return warmup.get(key, {})
 
 
 class Client(
@@ -137,16 +167,35 @@ class Client(
         Returns:
             List of connected Client objects, or None if no clients connected
         """
+        total_accounts = len(accounts)
+        if total_accounts == 0:
+            if logger:
+                logger.info("No accounts provided for connection.")
+            return None
+
         if logger:
-            logger.info(f"Connecting clients for {len(accounts)} accounts...")
+            logger.info(f"Connecting clients for {total_accounts} accounts with batching enabled...")
 
         clients = [cls(account) for account in accounts]
-        
-        # Connect all clients in parallel, passing task_id for locking
-        await asyncio.gather(*(client.connect(task_id=task_id) for client in clients))
+
+        connect_cfg = _get_warmup_block('connect')
+        batch_size = max(1, int(connect_cfg.get('batch_size', 3) or 1))
+        batch_delay_min = connect_cfg.get('batch_delay_min', 0)
+        batch_delay_max = connect_cfg.get('batch_delay_max', 0)
+        total_batches = math.ceil(len(clients) / batch_size)
+
+        for batch_index in range(total_batches):
+            start = batch_index * batch_size
+            batch_clients = clients[start:start + batch_size]
+            if logger:
+                logger.debug(f"Connecting batch {batch_index + 1}/{total_batches} containing {len(batch_clients)} clients")
+            await asyncio.gather(*(client.connect(task_id=task_id) for client in batch_clients))
+            is_last_batch = batch_index == total_batches - 1
+            if not is_last_batch:
+                await _sleep_random(batch_delay_min, batch_delay_max, logger, "Inter-connection batch delay")
 
         if logger:
-            logger.info(f"Connected clients for {len(clients)} accounts.")
+            logger.info(f"Connected clients for {len(clients)} accounts in {total_batches} batches.")
 
         return clients if clients else None
     
@@ -168,11 +217,25 @@ class Client(
             if logger:
                 logger.info("No clients to disconnect.")
             return None
-            
-        if logger:
-            logger.info(f"Disconnecting {len(clients)} clients...")
 
-        await asyncio.gather(*(client.disconnect() for client in clients))
+        disconnect_cfg = _get_warmup_block('disconnect')
+        batch_size = max(1, int(disconnect_cfg.get('batch_size', 3) or 1))
+        batch_delay_min = disconnect_cfg.get('batch_delay_min', 0)
+        batch_delay_max = disconnect_cfg.get('batch_delay_max', 0)
+        total_batches = math.ceil(len(clients) / batch_size)
+
+        if logger:
+            logger.info(f"Disconnecting {len(clients)} clients using {total_batches} batches...")
+
+        for batch_index in range(total_batches):
+            start = batch_index * batch_size
+            batch_clients = clients[start:start + batch_size]
+            if logger:
+                logger.debug(f"Disconnect batch {batch_index + 1}/{total_batches} with {len(batch_clients)} clients")
+            await asyncio.gather(*(client.disconnect() for client in batch_clients))
+            is_last_batch = batch_index == total_batches - 1
+            if not is_last_batch:
+                await _sleep_random(batch_delay_min, batch_delay_max, logger, "Inter-disconnect batch delay")
 
         # Cleanup: ensure all locks for this task are released
         # This handles edge cases where disconnect might have failed silently

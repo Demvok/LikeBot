@@ -7,7 +7,7 @@ Uses humanization helpers from auxilary_logic for realistic behavior simulation.
 
 import random
 import asyncio
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, List
 from telethon.tl.functions.messages import SendReactionRequest, GetMessagesViewsRequest
 from telethon import functions, types, errors
 
@@ -26,6 +26,150 @@ class ActionsMixin:
     Handles Telegram actions: reactions, comments, undo operations.
     Uses EntityResolutionMixin and ChannelDataMixin functionality.
     """
+
+    async def _random_delay(self, min_delay: float = 0.15, max_delay: float = 0.45) -> None:
+        """Sleep for a short random interval to mimic human delays."""
+        if max_delay <= min_delay:
+            max_delay = min_delay + 0.05
+        await asyncio.sleep(random.uniform(min_delay, max_delay))
+
+    async def _fetch_full_channel_snapshot(self, input_peer) -> None:
+        """Warm up channel context with GetFullChannel before acting."""
+        try:
+            await self.client(functions.channels.GetFullChannelRequest(channel=input_peer))
+            await self._random_delay(0.05, 0.2)
+        except errors.RPCError as exc:
+            self.logger.debug(f"GetFullChannelRequest failed: {exc}")
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.debug(f"Unexpected GetFullChannelRequest issue: {exc}")
+
+    async def _maybe_fetch_neighbor_posts(self, input_peer, message_id: int) -> None:
+        """Optionally load surrounding posts via history or direct message fetch."""
+        if random.random() < 0.2:
+            self.logger.debug("Skipping neighbor history fetch for this iteration")
+            return
+
+        await self._random_delay(0.05, 0.25)
+        neighbor_ids = {max(message_id + delta, 1) for delta in (-1, 0, 1)}
+        try:
+            if random.random() < 0.5:
+                offset_id = max(message_id + random.choice([-1, 0, 1]), 1)
+                await self.client(functions.messages.GetHistoryRequest(
+                    peer=input_peer,
+                    offset_id=offset_id,
+                    offset_date=None,
+                    add_offset=-1,
+                    limit=len(neighbor_ids) + 1,
+                    max_id=0,
+                    min_id=0,
+                    hash=0
+                ))
+            else:
+                message_refs = [types.InputMessageID(id=mid) for mid in sorted(neighbor_ids)]
+                await self.client(functions.messages.GetMessagesRequest(id=message_refs))
+            await self._random_delay(0.05, 0.15)
+        except errors.RPCError as exc:
+            self.logger.debug(f"Neighbor history fetch failed: {exc}")
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.debug(f"Unexpected neighbor fetch issue: {exc}")
+
+    async def _prefetch_media_payload(self, message) -> None:
+        """Prime message media or previews before interacting."""
+        await self._random_delay(0.05, 0.2)
+        try:
+            prefer_preview = random.random() < 0.25
+            text_content = (message.message or "").strip() if hasattr(message, "message") else ""
+
+            if prefer_preview and text_content:
+                await self.client(functions.messages.GetWebPagePreviewRequest(message=text_content))
+            else:
+                # Telegram API does not expose a standalone GetMessageMedia, so fetch via GetMessages.
+                await self.client(functions.messages.GetMessagesRequest(
+                    id=[types.InputMessageID(id=message.id)]
+                ))
+        except errors.RPCError as exc:
+            self.logger.debug(f"Preloading media/preview failed: {exc}")
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.debug(f"Unexpected media preload issue: {exc}")
+
+    async def _maybe_open_replies(self, input_peer, message_id: int) -> None:
+        """With a tiny probability, open replies to mimic organic exploration."""
+        chance = random.randint(1, 5) / 100.0
+        if random.random() >= chance:
+            return
+
+        await self._random_delay(0.05, 0.15)
+        try:
+            discussion = await self.client(functions.messages.GetDiscussionMessageRequest(
+                peer=input_peer,
+                msg_id=message_id
+            ))
+            if not discussion.messages:
+                return
+
+            discussion_peer = discussion.chats[0] if discussion.chats else input_peer
+            top_message_id = discussion.messages[0].id
+            limit = random.randint(5, 15)
+            await self.client(functions.messages.GetRepliesRequest(
+                peer=discussion_peer,
+                msg_id=top_message_id,
+                offset_id=0,
+                offset_date=None,
+                add_offset=0,
+                limit=limit,
+                max_id=0,
+                min_id=0,
+                hash=0
+            ))
+            await self._random_delay(0.05, 0.2)
+        except errors.RPCError as exc:
+            self.logger.debug(f"Optional replies fetch failed: {exc}")
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.debug(f"Unexpected replies fetch issue: {exc}")
+
+    async def _prepare_message_context(self, input_peer, message) -> None:
+        """Aggregate all lightweight warm-up requests before the actual action."""
+        await self._fetch_full_channel_snapshot(input_peer)
+        await self._maybe_fetch_neighbor_posts(input_peer, message.id)
+        await self._prefetch_media_payload(message)
+        await self._maybe_open_replies(input_peer, message.id)
+
+    async def _gather_reaction_whitelist(self, input_peer, message_id: int) -> Optional[List[str]]:
+        """Fetch existing reactions to refine emoji selection."""
+        try:
+            await self._random_delay(0.05, 0.15)
+            reaction_list = await self.client(functions.messages.GetMessageReactionsListRequest(
+                peer=input_peer,
+                id=message_id,
+                limit=64,
+                offset=None
+            ))
+        except errors.RPCError as exc:
+            self.logger.debug(f"GetMessageReactionsListRequest failed: {exc}")
+            return None
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.debug(f"Unexpected reaction list issue: {exc}")
+            return None
+
+        pool: List[str] = []
+        available = getattr(reaction_list, 'available_reactions', None)
+        if available:
+            for reaction in available:
+                emoji = getattr(reaction, 'reaction', None)
+                emoticon = getattr(reaction, 'emoticon', None)
+                value = emoji or emoticon
+                if isinstance(value, str):
+                    pool.append(value)
+
+        if not pool and hasattr(reaction_list, 'reactions'):
+            for reaction in getattr(reaction_list, 'reactions', []):
+                emoticon = getattr(reaction, 'reaction', None)
+                if isinstance(emoticon, types.ReactionEmoji):
+                    pool.append(emoticon.emoticon)
+
+        # Deduplicate while preserving order
+        deduped = list(dict.fromkeys([emoji for emoji in pool if emoji]))
+        return deduped or None
     
     async def _react(self, message, target_chat, channel: Channel = None):
         """
@@ -58,6 +202,8 @@ class ActionsMixin:
                 f"Telegram may flag this as spam behavior."
             )
         
+        await self._prepare_message_context(input_peer, message)
+
         await self.client(GetMessagesViewsRequest(
             peer=input_peer,
             id=[message.id],
@@ -96,6 +242,15 @@ class ActionsMixin:
                 
         except Exception as e:
             self.logger.warning(f"Could not fetch message reactions metadata: {e}. Will try palette emojis.")
+
+        reaction_whitelist = await self._gather_reaction_whitelist(input_peer, message.id)
+        if reaction_whitelist:
+            if allowed_reactions:
+                merged = [emoji for emoji in reaction_whitelist if emoji in allowed_reactions]
+                allowed_reactions = merged or reaction_whitelist
+            else:
+                allowed_reactions = reaction_whitelist
+            self.logger.debug(f"Reaction whitelist after MessageReactionList check: {allowed_reactions}")
         
         # Filter palette based on allowed reactions (only if explicitly restricted)
         if allowed_reactions:
@@ -393,6 +548,8 @@ class ActionsMixin:
         
         # Fetch message with caching
         message = await self.get_message_cached(chat_id, message_id)
+
+        
         await self._react(message, entity, channel=channel)
         self.logger.info("Reaction added successfully")
     

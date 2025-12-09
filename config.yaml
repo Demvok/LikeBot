@@ -90,3 +90,22 @@ delays:
   # Minimal delay when humanisation_level = 0
   minimal_humanization_delay_min: 1.5  # Minimum minimal delay
   minimal_humanization_delay_max: 4  # Maximum minimal delay
+
+  # === CONNECTION WARMUP (batching & jitter) ===
+  connection_warmup:
+    connect:
+      batch_size: 3  # Max accounts per connection batch
+      batch_delay_min: 3  # Min delay between connection batches
+      batch_delay_max: 7  # Max delay between connection batches
+      pre_jitter_min: 0.7  # Min jitter before connect() per account
+      pre_jitter_max: 2.5  # Max jitter before connect() per account
+      post_jitter_min: 1.0  # Min idle after successful connect()
+      post_jitter_max: 3.0  # Max idle after successful connect()
+    disconnect:
+      batch_size: 2  # Max accounts per disconnect batch
+      batch_delay_min: 2  # Min delay between disconnect batches
+      batch_delay_max: 5  # Max delay between disconnect batches
+      pre_jitter_min: 0.5  # Min jitter before disconnect() per account
+      pre_jitter_max: 1.5  # Max jitter before disconnect() per account
+      post_jitter_min: 0.5  # Min idle after disconnect()
+      post_jitter_max: 1.5  # Max idle after disconnect()

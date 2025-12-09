@@ -2,15 +2,11 @@
 
 ### TO DO:
 
-- redo analysis & test
-
-##### Account health system - stage 2
-- Add chat "opening" before reacting? & add "warming-up" and "cooling" stage for account connect, that should help
-
 ##### Account health system - stage 3
 - add special logging of account's action with markers
 - Add health monitor system that catches ban factors and applies limits
 - provide account managing tools - freezing, status check from SpamBot
+- TelegramAPILimiter should be bound to proxy
 
 ##### Account health system - stage 4
 - rework task assigning for each account - try to make it more "individualistic"
@@ -26,10 +22,19 @@
 - fix proxy tester - fails to parse 2ip.ua output
 
 #### TO TEST:
-- added task cancelling on API stop (WIP)
-- included chat_id to chat username mapping into channel parser
+- account locking (on using account in one task it should be unusable for other tasks)
+- url parsing
+- cache reuse
+- proxy linking, usage and import
+- proxy validation
 
 ## Changelog
+
+### v.1.2.0
+- added "warming-up" and "cooling" stage for account connect to avoid syncronisity 
+- added batch logic with delays for mass connections and disconnections
+- added simulated telegram requests to simulate human activity
+- added short effectiveness and time analysis
 
 ### v.1.1.4
 - implemented process-scope caching (with safe fallback to old logic for now)

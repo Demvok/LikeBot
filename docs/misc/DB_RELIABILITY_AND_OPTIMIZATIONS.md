@@ -89,5 +89,3 @@ This document collects actionable suggestions to improve reliability, performanc
 If you want, I can implement items 1–3 now. Tell me which to start with and I'll create a PR-style patch, run quick static checks, and report results.
 
 ---
-
-End of document.
