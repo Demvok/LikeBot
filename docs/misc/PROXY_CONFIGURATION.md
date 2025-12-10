@@ -7,10 +7,10 @@ This guide explains how to configure and use proxies with LikeBot.
 LikeBot supports proxy connections for Telegram clients with the following features:
 - Multiple proxy types: SOCKS5, SOCKS4, HTTP
 - Multiple ports per proxy (e.g., both HTTP and SOCKS5 ports from same provider)
-- Automatic candidate selection and fallback
+- Account-specific proxy pools (each account can hold up to five favorites)
+- Random proxy selection per connection with automatic candidate fallback
 - Encrypted password storage
-- Load balancing across proxies
-- Usage tracking and error handling
+- Strict/soft fallback modes with detailed error tracking
 
 ## Database Schema
 
@@ -39,7 +39,7 @@ Each proxy is stored as a single MongoDB document in the `proxies` collection:
   
   // Status tracking
   "active": true,                          // Whether proxy is currently active
-  "connected_accounts": 0,                 // Number of accounts using this proxy
+  "linked_accounts_count": 0,              // Number of accounts referencing this proxy
   "last_error": null,                      // Last error message (if any)
   "last_error_time": null,                 // Timestamp of last error
   
@@ -83,7 +83,7 @@ The system supports multiple port configurations:
 #### Status Tracking Fields
 
 - **active** (bool): Whether proxy is available for use. Default: `true`
-- **connected_accounts** (int): Current number of connected accounts. Auto-managed. Default: `0`
+- **linked_accounts_count** (int): Number of accounts that list this proxy in their pool. Auto-managed. Default: `0`
 - **last_error** (string): Last error message encountered
 - **last_error_time** (datetime): Timestamp of last error
 
@@ -91,6 +91,10 @@ The system supports multiple port configurations:
 
 - **created_at** (datetime): When proxy was added
 - **notes** (string): Description, tags, or other metadata
+
+### Account Document Field
+
+Accounts include an `assigned_proxies` array containing up to five proxy names. This is the authoritative source for proxy selection. The list can be managed via the `/accounts/{phone}/proxies` endpoints described below.
 
 ## Usage Examples
 
@@ -106,7 +110,7 @@ The system supports multiple port configurations:
   "password": "mypassword",  // Will be encrypted on insert
   "rdns": true,
   "active": true,
-  "connected_accounts": 0,
+  "linked_accounts_count": 0,
   "notes": "Provider XYZ - supports both protocols"
 }
 ```
@@ -123,7 +127,7 @@ The system supports multiple port configurations:
   "username": "admin",
   "password": "secret123",
   "active": true,
-  "connected_accounts": 0
+  "linked_accounts_count": 0
 }
 ```
 
@@ -137,7 +141,7 @@ The system supports multiple port configurations:
   "host": "proxy.public.com",
   "http_port": 8080,
   "active": true,
-  "connected_accounts": 0,
+  "linked_accounts_count": 0,
   "notes": "Public HTTP proxy, no authentication"
 }
 ```
@@ -155,7 +159,7 @@ The system supports multiple port configurations:
   "username": "user",
   "password": "pass",
   "active": true,
-  "connected_accounts": 0
+  "linked_accounts_count": 0
 }
 ```
 
@@ -186,6 +190,27 @@ proxy_data = {
 await db.add_proxy(proxy_data)
 ```
 
+### Bulk Import via Upload
+
+Upload a provider dump (`host:port:username:password`) and let the API parse
+each line into proxy records.
+
+```bash
+curl -X POST "https://likebot.example.com/proxies/import" \
+  -H "Authorization: Bearer <token>" \
+  -F "proxy_file=@\u041f\u0440\u043e\u043a\u0441\u0456.csv" \
+  -F "dry_run=false"
+```
+
+Optional form/query parameters:
+
+- `proxy_type`: Force proxy type if header is missing (defaults to socks5)
+- `base_name`: Prefix for generated proxy names
+- `dry_run`: Validate/parses file without inserting anything (defaults to false)
+
+The endpoint returns how many rows were imported, skipped (already existing)
+or failed with detailed reasons.
+
 ### MongoDB Shell Example
 
 ```javascript
@@ -197,7 +222,7 @@ db.proxies.insertOne({
   // Note: Direct DB insert bypasses encryption
   // Use API for proper password encryption
   "active": true,
-  "connected_accounts": 0,
+  "linked_accounts_count": 0,
   "rdns": true,
   "created_at": new Date()
 })
@@ -211,15 +236,19 @@ db.proxies.insertOne({
 
 When a client connects, the system:
 
-1. Selects the least-used active proxy from the database
-2. Builds multiple proxy candidates from that record:
-   - Candidate 1: SOCKS5 connection (if `socks5_port` or `socks_port` present)
-   - Candidate 2: HTTP connection (if `http_port` present)
-   - Candidate 3: Generic connection (if `port` present, using `type` field)
-3. Tries each candidate in order until one succeeds
-4. If all fail:
-   - **Strict mode**: Connection fails with error
-   - **Soft mode**: Retries without proxy
+1. Reads the account's `assigned_proxies` list (up to five entries)
+2. If the list is empty, logs a warning and:
+  - **Strict mode**: aborts the connection with an error
+  - **Soft mode**: connects without a proxy
+3. Randomly shuffles the assigned proxies and picks the first usable proxy (active + valid ports)
+4. Builds multiple proxy candidates from that record:
+  - Candidate 1: SOCKS5 connection (if `socks5_port` or `socks_port` present)
+  - Candidate 2: HTTP connection (if `http_port` present)
+  - Candidate 3: Generic connection (if `port` present, using `type` field)
+5. Tries each candidate in order until one succeeds
+6. If all assigned proxies fail:
+  - **Strict mode**: Connection fails with error
+  - **Soft mode**: Retries without proxy
 
 ### Proxy Mode Configuration
 
@@ -228,14 +257,79 @@ Set in `config.yaml`:
 ```yaml
 proxy:
   mode: soft  # or 'strict'
+  max_per_account: 5  # Maximum number of proxies per account
+  desired_per_account: 3  # Target number of proxies auto-assignment will try to maintain
 ```
 
 - **soft**: Falls back to direct connection if all proxy candidates fail
 - **strict**: Connection fails if proxy cannot be established
+- **max_per_account**: Upper bound of proxies stored in `assigned_proxies` (default 5)
+- **desired_per_account**: Target number of proxies to maintain per account when calling the auto-assignment helper (default 3, capped by `max_per_account`)
 
-### Load Balancing
+### Account Proxy Pools & Linking
 
-The system automatically balances load across proxies by selecting the proxy with the lowest `connected_accounts` value. Usage counters are incremented when a connection succeeds and decremented when it disconnects.
+- Each account can hold up to **five** proxy names in `assigned_proxies`.
+- Use the API endpoints to manage assignments:
+  - `GET /accounts/{phone}/proxies` – view current assignments.
+  - `POST /accounts/{phone}/proxies/{proxy}` – add a proxy to the pool (requires proxy to be active).
+  - `DELETE /accounts/{phone}/proxies/{proxy}` – remove a proxy assignment.
+  - `POST /accounts/{phone}/proxies/auto-assign` – automatically link the least-linked proxies until the configured `desired_per_account` count (or an overridden `desired_count` query param) is reached.
+- The `linked_accounts_count` field on every proxy tracks how many accounts reference it. Use `/proxies/least-linked` or `/proxies/stats/summary` to identify underused proxies.
+- Runtime selection is driven solely by the account's pool; `linked_accounts_count` is informational and never affects which proxy a client picks.
+
+### Automatic Assignment Helper
+
+The auto-assignment endpoint relies on the new `MongoStorage.auto_assign_proxies` helper. It selects proxies ordered by `linked_accounts_count` (favoring underused entries) and links them to the account until it reaches either:
+
+1. The `desired_count` query parameter (if supplied), or
+2. The `proxy.desired_per_account` configuration value (default 3).
+
+Assignments never exceed `proxy.max_per_account`. The endpoint response includes the proxies that were added, the full assigned list, and how many proxies (if any) are still needed. If there are not enough eligible proxies (e.g., not enough active proxies remain), the response includes a message noting the shortfall so you can provision more proxies before retrying.
+
+### Connectivity Testing
+
+To verify that a proxy actually tunnels traffic, call the new endpoint:
+
+```
+POST /proxies/{proxy_name}/test
+```
+
+- By default it performs an HTTPS request to `https://2ip.ua/api/index.php?type=json` (through the proxy) and parses the IP/hostname/provider/location fields returned by 2ip.
+- You can override the URL via the `test_url` query parameter if you want to hit the plain-text landing page (`https://2ip.ua/`) or any other diagnostic host.
+- `timeout_seconds` (default 15, max 120) controls how long the request may take before it is considered a failure.
+
+Sample response:
+
+```json
+{
+  "proxy_name": "alpha-proxy",
+  "endpoint": "socks5://user:******@127.0.0.1:9050",
+  "target_url": "https://2ip.ua/api/index.php?type=json",
+  "latency_ms": 843.21,
+  "status_code": 200,
+  "details": {
+    "ip": "62.244.1.225",
+    "hostname": "62.244.1.225.ip.internetspace.com.ua",
+    "provider": "Lucky Net Ltd",
+    "location": "Hlevakha, Ukraine",
+    "raw": {
+      "ip": "62.244.1.225",
+      "hostname": "62.244.1.225.ip.internetspace.com.ua",
+      "provider": "Lucky Net Ltd",
+      "country": "Ukraine",
+      "city": "Hlevakha"
+    }
+  }
+}
+```
+
+This mirrors the manual check you would do with:
+
+```powershell
+curl.exe --socks5-hostname 127.0.0.1:9050 https://2ip.ua
+```
+
+If the reported IP/hostname/provider/location match what you expect from the proxy vendor, the tunnel is considered healthy. Otherwise, the endpoint returns an error (including the failed endpoints) so you can troubleshoot credentials or reachability issues.
 
 ### Error Handling
 
@@ -247,7 +341,6 @@ When a proxy connection fails:
 
 When a connection succeeds:
 - `last_error` and `last_error_time` are cleared
-- `connected_accounts` is incremented
 
 ## Database Operations
 
@@ -332,7 +425,7 @@ new_proxy = {
     'username': old_proxy.get('login'),
     'password': old_proxy.get('password'),  # Will be encrypted
     'active': True,
-    'connected_accounts': 0
+    'linked_accounts_count': 0
 }
 
 # Add using API (encrypts password)
@@ -387,7 +480,7 @@ pip install PySocks
 
 2. **Specify Multiple Ports**: If your provider offers both HTTP and SOCKS5, include both ports to maximize connection success rate
 
-3. **Monitor Usage**: Check `connected_accounts` field to ensure load is balanced
+3. **Monitor Usage**: Check `linked_accounts_count` (and `/proxies/least-linked`) to see which proxies are underused
 
 4. **Set Descriptive Names**: Use clear proxy names like `provider-location-protocol` (e.g., `acme-us-socks5`)
 

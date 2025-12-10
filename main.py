@@ -13,7 +13,17 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from collections import deque
 from datetime import timedelta, datetime as dt, timezone
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Depends, status
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+    Depends,
+    status,
+    UploadFile,
+    File,
+)
 from fastapi.security import OAuth2PasswordRequestForm
 from typing import Optional, List, Dict, Annotated
 from main_logic.agent import *
@@ -29,6 +39,9 @@ from auxilary_logic.auth import (
 )
 from jose import JWTError
 from jose.exceptions import ExpiredSignatureError
+from utils.task_tracker import active_tasks, track_task, cancel_all_tasks
+from utils.proxy_importer import parse_proxy_lines, ProxyParseError
+from utils.proxy_tester import test_proxy_connectivity, DEFAULT_TEST_URL
 
 load_dotenv()
 frontend_http = os.getenv("frontend_http", None)
@@ -42,14 +55,14 @@ async def lifespan(app: FastAPI):
     # Startup
     await validate_environment()
     yield
-    # Shutdown (if needed in the future)
-    # Add cleanup code here
+    # Shutdown - cancel all active background tasks
+    await cancel_all_tasks(timeout=5.0)
 
 
 app = FastAPI(
     title="LikeBot API",
     description="Full API for LikeBot automation",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan
 )
 
@@ -95,6 +108,23 @@ async def validate_environment() -> None:
     except Exception as exc:  # pragma: no cover - defensive logging
         logger.exception("Unexpected error during database readiness check")
         raise
+
+
+async def ensure_proxies_exist(proxy_names: List[str], active_only: bool = True) -> List[str]:
+    """Validate that each proxy name exists (and is active if requested)."""
+    if not proxy_names:
+        return []
+
+    db = get_db()
+    validated: List[str] = []
+    for proxy_name in proxy_names:
+        proxy = await db.get_proxy(proxy_name)
+        if not proxy:
+            raise HTTPException(status_code=404, detail=f"Proxy '{proxy_name}' not found")
+        if active_only and not proxy.get('active', True):
+            raise HTTPException(status_code=400, detail=f"Proxy '{proxy_name}' is inactive")
+        validated.append(proxy.get('proxy_name', proxy_name))
+    return validated
 
 
 @app.get("/", summary="Health check")
@@ -480,6 +510,8 @@ async def create_account_without_login(
         
         # Create account dictionary and encrypt password if provided
         account_dict = account_data.model_dump()
+        requested_proxies = await ensure_proxies_exist(account_dict.pop('assigned_proxies', []))
+        account_dict['assigned_proxies'] = []
         
         # Handle password encryption
         if account_dict.get('password'):
@@ -492,6 +524,23 @@ async def create_account_without_login(
         success = await db.add_account(account_dict)
         
         if success:
+            if requested_proxies:
+                linked = []
+                try:
+                    for proxy_name in requested_proxies:
+                        await db.link_proxy_to_account(account_data.phone_number, proxy_name)
+                        linked.append(proxy_name)
+                except ValueError as proxy_error:
+                    for proxy_name in linked:
+                        await db.unlink_proxy_from_account(account_data.phone_number, proxy_name)
+                    await db.delete_account(account_data.phone_number)
+                    raise HTTPException(status_code=400, detail=str(proxy_error))
+                except Exception as proxy_error:
+                    for proxy_name in linked:
+                        await db.unlink_proxy_from_account(account_data.phone_number, proxy_name)
+                    await db.delete_account(account_data.phone_number)
+                    raise HTTPException(status_code=500, detail=f"Failed to assign proxies: {proxy_error}")
+
             return {"message": f"Account {account_data.phone_number} created successfully"}
         else:
             raise HTTPException(status_code=500, detail="Failed to create account")
@@ -519,10 +568,11 @@ async def update_account(
         if not existing_account:
             raise HTTPException(status_code=404, detail=f"Account with phone number {phone_number} not found")
         
-        # Update account with only provided fields
-        update_dict = {k: v for k, v in account_data.model_dump().items() if v is not None}
-        
-        if not update_dict:
+        payload = account_data.model_dump()
+        requested_proxies = payload.pop('assigned_proxies', None)
+        update_dict = {k: v for k, v in payload.items() if v is not None}
+        proxies_only = requested_proxies is not None and not update_dict
+        if not update_dict and requested_proxies is None:
             raise HTTPException(status_code=400, detail="No update data provided")
         
         # Handle password encryption if password is being updated
@@ -538,9 +588,52 @@ async def update_account(
             # Remove plain text password from dict
             del update_dict['password']
         
-        success = await db.update_account(phone_number, update_dict)
+        # Apply proxy changes if requested
+        if requested_proxies is not None:
+            current_list = getattr(existing_account, 'assigned_proxies', []) or []
+            desired_list = requested_proxies or []
+            current_set = set(current_list)
+            desired_set = set(desired_list)
+            to_remove = [name for name in current_list if name not in desired_set]
+            to_add = [name for name in desired_list if name not in current_set]
+
+            if to_add:
+                await ensure_proxies_exist(to_add)
+
+            removed = []
+            added = []
+            try:
+                for proxy_name in to_remove:
+                    removed_flag = await db.unlink_proxy_from_account(phone_number, proxy_name)
+                    if removed_flag:
+                        removed.append(proxy_name)
+                for proxy_name in to_add:
+                    await db.link_proxy_to_account(phone_number, proxy_name)
+                    added.append(proxy_name)
+            except ValueError as proxy_error:
+                for proxy_name in added:
+                    await db.unlink_proxy_from_account(phone_number, proxy_name)
+                for proxy_name in removed:
+                    try:
+                        await db.link_proxy_to_account(phone_number, proxy_name)
+                    except Exception as rollback_error:
+                        logger.warning(f"Failed to restore proxy {proxy_name} for {phone_number}: {rollback_error}")
+                raise HTTPException(status_code=400, detail=str(proxy_error))
+            except Exception as proxy_error:
+                for proxy_name in added:
+                    await db.unlink_proxy_from_account(phone_number, proxy_name)
+                for proxy_name in removed:
+                    try:
+                        await db.link_proxy_to_account(phone_number, proxy_name)
+                    except Exception as rollback_error:
+                        logger.warning(f"Failed to restore proxy {proxy_name} for {phone_number}: {rollback_error}")
+                raise HTTPException(status_code=500, detail=f"Failed to update proxies: {proxy_error}")
+
+        success = True
+        if update_dict:
+            success = await db.update_account(phone_number, update_dict)
         
-        if success:
+        if success or proxies_only:
             return {"message": f"Account {phone_number} updated successfully"}
         else:
             raise HTTPException(status_code=500, detail="Failed to update account")
@@ -619,6 +712,96 @@ async def validate_account(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to validate account: {str(e)}")
 
+
+# ============= ACCOUNT PROXY MANAGEMENT =============
+
+@app.get('/accounts/{phone_number}/proxies', summary="Get proxies assigned to an account", tags=["Accounts"])
+@crash_handler
+async def get_account_proxies(phone_number: str, current_user: dict = Depends(get_current_user)):
+    """Return proxy metadata for proxies linked to a specific account."""
+    try:
+        db = get_db()
+        proxies = await db.get_account_assigned_proxies(phone_number)
+        return proxies
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load account proxies: {exc}")
+
+
+@app.post('/accounts/{phone_number}/proxies/auto-assign', summary="Auto assign proxies to account", tags=["Accounts"])
+@crash_handler
+async def auto_assign_account_proxies(
+    phone_number: str,
+    desired_count: Optional[int] = Query(None, description="Desired number of proxies to maintain"),
+    active_only: bool = Query(True, description="Only consider active proxies"),
+    current_user: dict = Depends(get_current_user)
+):
+    """Link least-linked proxies to an account until the desired count is reached."""
+    db = get_db()
+    try:
+        result = await db.auto_assign_proxies(phone_number, desired_count=desired_count, active_only=active_only)
+        return result
+    except ValueError as exc:
+        message = str(exc)
+        status = 404 if 'not found' in message.lower() else 400
+        raise HTTPException(status_code=status, detail=message)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to auto-assign proxies: {exc}")
+
+
+@app.post('/accounts/{phone_number}/proxies/{proxy_name}', summary="Link proxy to account", tags=["Accounts"], status_code=201)
+@crash_handler
+async def link_account_proxy(
+    phone_number: str,
+    proxy_name: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Link a proxy to an account's assigned proxy list."""
+    db = get_db()
+    try:
+        linked = await db.link_proxy_to_account(phone_number, proxy_name)
+        if linked:
+            return {"message": f"Proxy '{proxy_name}' linked to account {phone_number}"}
+        return {"message": f"Proxy '{proxy_name}' is already linked to account {phone_number}"}
+    except ValueError as exc:
+        message = str(exc)
+        status = 404 if 'not found' in message.lower() else 400
+        raise HTTPException(status_code=status, detail=message)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to link proxy: {exc}")
+
+
+@app.delete('/accounts/{phone_number}/proxies/{proxy_name}', summary="Unlink proxy from account", tags=["Accounts"])
+@crash_handler
+async def unlink_account_proxy(
+    phone_number: str,
+    proxy_name: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Remove a proxy assignment from an account."""
+    db = get_db()
+    try:
+        removed = await db.unlink_proxy_from_account(phone_number, proxy_name)
+        if removed:
+            return {"message": f"Proxy '{proxy_name}' unlinked from account {phone_number}"}
+        return {"message": f"Proxy '{proxy_name}' was not linked to account {phone_number}"}
+    except ValueError as exc:
+        message = str(exc)
+        status = 404 if 'not found' in message.lower() else 400
+        raise HTTPException(status_code=status, detail=message)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to unlink proxy: {exc}")
+
+
 @app.get('/accounts/{phone_number}/password', summary="Get account password (secure endpoint)", response_model=AccountPasswordResponse, tags=["Accounts"])
 @crash_handler
 async def get_account_password(
@@ -657,6 +840,114 @@ async def get_account_password(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get account password: {str(e)}")
 
+# ============= ACCOUNT LOCK ENDPOINTS =============
+
+@app.get('/accounts/locks', summary="Get all account locks", tags=["Account Locks"])
+@crash_handler
+async def get_all_account_locks(
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get all currently locked accounts and which tasks hold them.
+    Requires authentication.
+    """
+    lock_manager = get_account_lock_manager()
+    locks = lock_manager.get_all_locks()
+    
+    # Format for API response
+    result = []
+    for phone_number, info in locks.items():
+        result.append({
+            "phone_number": phone_number,
+            "task_id": info.get("task_id"),
+            "locked_at": info.get("locked_at").isoformat() if info.get("locked_at") else None
+        })
+    
+    return {
+        "count": len(result),
+        "locks": result
+    }
+
+
+@app.get('/accounts/{phone_number}/lock', summary="Get account lock status", tags=["Account Locks"])
+@crash_handler
+async def get_account_lock_status(
+    phone_number: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Check if a specific account is currently locked.
+    Requires authentication.
+    """
+    lock_manager = get_account_lock_manager()
+    
+    is_locked = lock_manager.is_locked(phone_number)
+    lock_info = lock_manager.get_lock_info(phone_number)
+    
+    if is_locked and lock_info:
+        return {
+            "phone_number": phone_number,
+            "is_locked": True,
+            "task_id": lock_info.get("task_id"),
+            "locked_at": lock_info.get("locked_at").isoformat() if lock_info.get("locked_at") else None
+        }
+    else:
+        return {
+            "phone_number": phone_number,
+            "is_locked": False,
+            "task_id": None,
+            "locked_at": None
+        }
+
+
+@app.delete('/accounts/{phone_number}/lock', summary="Force release account lock", tags=["Account Locks"])
+@crash_handler
+async def force_release_account_lock(
+    phone_number: str,
+    current_user: dict = Depends(get_current_admin_user)
+):
+    """
+    Force release a lock on an account. Use with caution - this may cause issues 
+    if a task is actively using the account.
+    Requires admin privileges.
+    """
+    lock_manager = get_account_lock_manager()
+    
+    if not lock_manager.is_locked(phone_number):
+        raise HTTPException(status_code=404, detail=f"Account {phone_number} is not locked")
+    
+    lock_info = lock_manager.get_lock_info(phone_number)
+    released = await lock_manager.release(phone_number)
+    
+    if released:
+        return {
+            "message": f"Lock on account {phone_number} released successfully",
+            "previous_task_id": lock_info.get("task_id") if lock_info else None
+        }
+    else:
+        raise HTTPException(status_code=500, detail="Failed to release lock")
+
+
+@app.delete('/tasks/{task_id}/locks', summary="Release all locks for a task", tags=["Account Locks"])
+@crash_handler
+async def release_task_locks(
+    task_id: int,
+    current_user: dict = Depends(get_current_admin_user)
+):
+    """
+    Release all account locks held by a specific task.
+    Useful for cleanup after a task crashes or is forcefully stopped.
+    Requires admin privileges.
+    """
+    lock_manager = get_account_lock_manager()
+    released_count = await lock_manager.release_all_for_task(task_id)
+    
+    return {
+        "message": f"Released {released_count} locks for task {task_id}",
+        "released_count": released_count
+    }
+
+
 # ============= LOGIN PROCESS ENDPOINTS =============
 
 @app.post('/accounts/create/start', summary="Start login process", status_code=200, tags=["Account Creation"])
@@ -688,13 +979,16 @@ async def login_start(
         login_session_id = str(uuid.uuid4())
         
         # Start login process in background
-        asyncio.create_task(start_login(
+        login_task = asyncio.create_task(start_login(
             phone_number=phone_number, 
             password=password_encrypted, 
             login_session_id=login_session_id,
             session_name=session_name,
             notes=notes
         ))
+        
+        # Track background task for graceful shutdown
+        track_task(login_task)
         
         # Wait a moment for the process to initialize and send code
         await asyncio.sleep(1)
@@ -1810,6 +2104,24 @@ async def get_proxies(
         raise HTTPException(status_code=500, detail=f"Failed to get proxies: {str(e)}")
 
 
+@app.get('/proxies/least-linked', summary="Get least-linked proxies", tags=["Proxies"])
+@crash_handler
+async def get_least_linked_proxies(
+    limit: int = Query(10, ge=1, le=100, description="Maximum number of proxies to return"),
+    active_only: bool = Query(True, description="Only include active proxies"),
+    current_user: dict = Depends(get_current_user)
+):
+    """Return proxies sorted by how many accounts are linked to them."""
+    try:
+        db = get_db()
+        proxies = await db.get_least_linked_proxies(limit=limit, active_only=active_only)
+        return proxies
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to get least-linked proxies: {exc}")
+
+
 @app.get('/proxies/{proxy_name}', summary="Get proxy by name", tags=["Proxies"])
 @crash_handler
 async def get_proxy(
@@ -1876,6 +2188,7 @@ async def create_proxy(
             'rdns': rdns,
             'active': active,
             'connected_accounts': 0,
+            'linked_accounts_count': 0,
             'created_at': datetime.now(tz.utc),
             'updated_at': datetime.now(tz.utc)
         }
@@ -1904,6 +2217,95 @@ async def create_proxy(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create proxy: {str(e)}")
+
+
+@app.post('/proxies/import', summary="Import proxies from file", tags=["Proxies"])
+@crash_handler
+async def import_proxies_from_file(
+    proxy_file: UploadFile = File(..., description="Text file with proxies in host:port:user:pass format"),
+    proxy_type: Optional[str] = Query(None, description="Override proxy type (socks5, socks4, http)"),
+    base_name: Optional[str] = Query(None, description="Prefix for generated proxy names"),
+    dry_run: bool = Query(False, description="Validate file without inserting"),
+    current_user: dict = Depends(get_current_user)
+):
+    """Bulk-import proxies by uploading a text/CSV file."""
+
+    try:
+        raw_bytes = await proxy_file.read()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to read upload: {exc}")
+
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    decoded: Optional[str] = None
+    for encoding in ('utf-8-sig', 'utf-8', 'cp1251', 'latin-1'):
+        try:
+            decoded = raw_bytes.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if decoded is None:
+        raise HTTPException(status_code=400, detail="Unable to decode file; please use UTF-8 encoding")
+
+    filename = proxy_file.filename or 'proxies'
+    inferred_prefix = base_name or os.path.splitext(filename)[0] or None
+
+    try:
+        records = parse_proxy_lines(
+            decoded.splitlines(),
+            proxy_type=proxy_type,
+            base_name=inferred_prefix,
+            source_name=filename,
+        )
+    except ProxyParseError as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to parse proxy file: {exc}")
+
+    total = len(records)
+    if total == 0:
+        return {"message": "No proxy entries detected", "total": 0, "dry_run": dry_run}
+
+    if dry_run:
+        return {
+            "message": "Proxy file parsed successfully",
+            "total": total,
+            "dry_run": True,
+        }
+
+    db = get_db()
+    imported = 0
+    skipped: List[Dict[str, str]] = []
+    errors: List[Dict[str, str]] = []
+
+    for record in records:
+        try:
+            success = await db.add_proxy(record)
+        except Exception as exc:
+            errors.append({
+                'proxy_name': record.get('proxy_name'),
+                'error': str(exc),
+            })
+            continue
+
+        if success:
+            imported += 1
+            continue
+
+        existing = await db.get_proxy(record.get('proxy_name'))
+        reason = 'already_exists' if existing else 'insert_failed'
+        skipped.append({
+            'proxy_name': record.get('proxy_name'),
+            'reason': reason,
+        })
+
+    return {
+        'message': 'Proxy import completed',
+        'dry_run': False,
+        'total': total,
+        'imported': imported,
+        'skipped': skipped,
+        'errors': errors,
+    }
 
 
 @app.put('/proxies/{proxy_name}', summary="Update proxy", tags=["Proxies"])
@@ -2001,11 +2403,11 @@ async def delete_proxy(
             raise HTTPException(status_code=404, detail=f"Proxy '{proxy_name}' not found")
         
         # Check if proxy is in use
-        connected_accounts = proxy.get('connected_accounts', 0)
-        if connected_accounts > 0:
+        linked_accounts = proxy.get('linked_accounts_count', 0)
+        if linked_accounts > 0:
             raise HTTPException(
                 status_code=400,
-                detail=f"Cannot delete proxy '{proxy_name}': currently connected to {connected_accounts} account(s)"
+                detail=f"Cannot delete proxy '{proxy_name}': linked to {linked_accounts} account(s)"
             )
         
         success = await db.delete_proxy(proxy_name)
@@ -2017,6 +2419,34 @@ async def delete_proxy(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete proxy: {str(e)}")
+
+
+@app.post('/proxies/{proxy_name}/test', summary="Test proxy connectivity via 2ip.ua", tags=["Proxies"])
+@crash_handler
+async def test_proxy_endpoint(
+    proxy_name: str,
+    test_url: Optional[str] = Query(None, description="Override the target URL (default hits 2ip.ua JSON API)"),
+    timeout_seconds: float = Query(15, ge=1, le=120, description="Request timeout in seconds"),
+    current_user: dict = Depends(get_current_user)
+):
+    """Validate that a proxy can reach 2ip.ua (or a custom URL) and return geo/IP metadata."""
+    db = get_db()
+    proxy = await db.get_proxy(proxy_name)
+    if not proxy:
+        raise HTTPException(status_code=404, detail=f"Proxy '{proxy_name}' not found")
+
+    url = test_url or DEFAULT_TEST_URL
+    try:
+        result = await test_proxy_connectivity(proxy, test_url=url, timeout_seconds=timeout_seconds)
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unexpected proxy test failure: {exc}")
 
 
 @app.get('/proxies/stats/summary', summary="Get proxy statistics", tags=["Proxies"])
@@ -2040,34 +2470,34 @@ async def get_proxy_stats(current_user: dict = Depends(get_current_user)):
         all_proxies = await db.get_all_proxies()
         active_proxies = [p for p in all_proxies if p.get('active', False)]
         
-        total_connections = sum(p.get('connected_accounts', 0) for p in all_proxies)
+        total_linked = sum(p.get('linked_accounts_count', 0) for p in all_proxies)
         
-        # Find least and most used
-        least_used = None
-        most_used = None
+        # Find least and most linked
+        least_linked = None
+        most_linked = None
         if all_proxies:
-            least_used = min(all_proxies, key=lambda p: p.get('connected_accounts', 0))
-            most_used = max(all_proxies, key=lambda p: p.get('connected_accounts', 0))
+            least_linked = min(all_proxies, key=lambda p: p.get('linked_accounts_count', 0))
+            most_linked = max(all_proxies, key=lambda p: p.get('linked_accounts_count', 0))
         
         stats = {
             'total_proxies': len(all_proxies),
             'active_proxies': len(active_proxies),
             'inactive_proxies': len(all_proxies) - len(active_proxies),
-            'total_connected_accounts': total_connections,
-            'least_used_proxy': {
-                'proxy_name': least_used.get('proxy_name'),
-                'connected_accounts': least_used.get('connected_accounts', 0)
-            } if least_used else None,
-            'most_used_proxy': {
-                'proxy_name': most_used.get('proxy_name'),
-                'connected_accounts': most_used.get('connected_accounts', 0)
-            } if most_used else None
+            'total_linked_accounts': total_linked,
+            'least_linked_proxy': {
+                'proxy_name': least_linked.get('proxy_name'),
+                'linked_accounts_count': least_linked.get('linked_accounts_count', 0)
+            } if least_linked else None,
+            'most_linked_proxy': {
+                'proxy_name': most_linked.get('proxy_name'),
+                'linked_accounts_count': most_linked.get('linked_accounts_count', 0)
+            } if most_linked else None
         }
         
         return stats
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get proxy stats: {str(e)}")
-    
+
 
 # ============= REACTION PALETTES CRUD =============
 
@@ -2359,6 +2789,36 @@ async def get_channel(
         raise HTTPException(status_code=500, detail=f"Failed to get channel: {str(e)}")
 
 
+@app.post('/channels/bulk', summary="Get multiple channels by chat_ids", tags=["Channels"])
+@crash_handler
+async def get_channels_bulk(
+    chat_ids: List[int],
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get multiple channels by their chat_ids in a single request.
+    
+    Accepts both normalized and -100 prefixed chat IDs.
+    Returns list of found channels (may be fewer than requested if some don't exist).
+    
+    Request body: List of chat_ids as JSON array
+    Example: [123456789, -1001234567890, 987654321]
+    
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        
+        if not chat_ids:
+            return []
+        
+        channels = await db.get_channels_bulk(chat_ids)
+        return [convert_to_serializable(c.to_dict()) for c in channels]
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get channels: {str(e)}")
+
+
 @app.post('/channels', summary="Create new channel", status_code=201, tags=["Channels"])
 @crash_handler
 async def create_channel(
@@ -2580,6 +3040,33 @@ async def get_channels_with_post_counts(current_user: dict = Depends(get_current
         raise HTTPException(status_code=500, detail=f"Failed to get channels with post counts: {str(e)}")
 
 
+@app.get('/channels/{chat_id}/subscribers', summary="Get accounts subscribed to a channel", tags=["Channels"])
+@crash_handler
+async def get_channel_subscribers(
+    chat_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get all accounts that are subscribed to a specific channel.
+    
+    Accepts both normalized and -100 prefixed chat IDs.
+    Returns list of Account objects (secure format, without passwords).
+    
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        
+        # Get subscribers using native MongoDB query
+        subscribers = await db.get_channel_subscribers(chat_id)
+        
+        # Convert to secure dict format (excludes passwords)
+        return [account.to_dict(secure=True) for account in subscribers]
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get channel subscribers: {str(e)}")
+
+
 @app.get('/accounts/{phone_number}/channels', summary="Get account's subscribed channels", tags=["Accounts"])
 @crash_handler
 async def get_account_subscribed_channels(
@@ -2608,6 +3095,66 @@ async def get_account_subscribed_channels(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get subscribed channels: {str(e)}")
+
+
+@app.post('/accounts/{phone_number}/channels/sync', summary="Sync account's subscribed channels from Telegram", tags=["Accounts"])
+@crash_handler
+async def sync_account_subscribed_channels(
+    phone_number: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Fetch and update all channels that an account is subscribed to from Telegram.
+    
+    This connects to Telegram, fetches all subscribed channels, updates the account's
+    subscribed_to field, and upserts channel data to the channels collection.
+    
+    Returns list of chat_ids that were synced.
+    Requires authentication.
+    """
+    try:
+        db = get_db()
+        
+        # Check if account exists
+        account = await db.get_account(phone_number)
+        if not account:
+            raise HTTPException(status_code=404, detail=f"Account with phone number {phone_number} not found")
+        
+        # Create Client
+        client = Client(account)
+        
+        try:
+            # Connect and fetch subscribed channels
+            await client.connect()
+            chat_ids = await client.fetch_and_update_subscribed_channels()
+            
+            # Record sync metadata in database
+            from datetime import datetime, timezone
+            sync_metadata = {
+                'last_channel_sync_at': datetime.now(timezone.utc),
+                'last_channel_sync_count': len(chat_ids),
+                'updated_at': datetime.now(timezone.utc)
+            }
+            await db.update_account(phone_number, sync_metadata)
+            
+            return {
+                "message": f"Successfully synced {len(chat_ids)} channels for account {phone_number}",
+                "phone_number": phone_number,
+                "channels_count": len(chat_ids),
+                "chat_ids": chat_ids,
+                "synced_at": sync_metadata['last_channel_sync_at'].isoformat()
+            }
+        finally:
+            # Always disconnect client
+            await client.disconnect()
+        
+    except HTTPException:
+        raise
+    except ValueError as e:
+        # No session available - user needs to login first
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to sync subscribed channels: {str(e)}")
 
 
 if __name__ == "__main__":

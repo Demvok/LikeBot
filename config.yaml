@@ -14,9 +14,28 @@ database:
   runs_coll: "runs"
   batch_size: 100  # Number of events to batch before writing to DB
   batch_timeout: 0.5  # Timeout for batch flushing
+  id_allocation_retries: 3  # Retries for atomic ID allocation (race condition handling)
+
+cache:
+  # Task-scoped Telegram object cache settings
+  scope: "process"  # "task" (default) or "process" for long-lived cache
+  entity_ttl: 300  # 5 minutes - entities (users, channels, chats)
+  message_ttl: 60  # 1 minute - message objects
+  full_channel_ttl: 600  # 10 minutes - full channel info (reactions, discussion groups)
+  discussion_ttl: 300  # 5 minutes - discussion group data
+  input_peer_ttl: 300  # 5 minutes - InputPeer objects
+  max_size: 500  # Maximum cache entries per task (increased from 100 per client)
+  enable_in_flight_dedup: true  # De-duplicate concurrent requests (recommended: true)
+  process:
+    max_size: 2000  # Overrides task max_size when scope == "process"
+    cleanup_interval: 60  # Seconds between background sweeps for expired entries
+  per_account:
+    max_entries: 400  # Prevent a single account from consuming the entire cache
 
 proxy:
   mode: "soft"  # "strict" or "soft" - strict fails on proxy error, soft falls back to no proxy
+  max_per_account: 5  # Maximum number of proxies that can be assigned to a single account
+  desired_per_account: 3  # Target proxy count per account when auto-assigning proxies
 
 delays:
   # Humanization level represents the level at which bot attempts to simulate human behaviour
@@ -24,16 +43,69 @@ delays:
   # At 1st level it will retrieve message content and wait estimated reading time
   humanisation_level: 1
 
+  # === RATE LIMITER CONFIGURATION ===
+  # Minimum delays between Telegram API calls (prevents flood errors)
+  rate_limit_get_entity: 10  # Seconds between entity lookups
+  rate_limit_get_messages: 1  # Seconds between message fetches
+  rate_limit_send_reaction: 6  # Seconds between reactions
+  rate_limit_send_message: 10  # Seconds between messages
+  rate_limit_default: 1  # Default for other API calls
+
+  # === RETRY CONFIGURATION ===
   session_creation_retries: 2  # Number of retries for creating new session (code input attempts)
   connection_retries: 5  # Number of connection retries
-  reconnect_delay: 3  # Delay between reconnection attempts
-  action_retries: 1  # Number of retries for actions
-  action_retry_delay: 2  # Delay between action retries
+  reconnect_delay: 6  # Delay between reconnection attempts (seconds)
+  action_retries: 1  # Number of retries for Telegram actions (react, comment, etc.)
+  action_retry_delay: 40  # Delay between action retries (seconds)
+  error_retry_delay: 90  # Delay after transient errors (ConnectionError, TimeoutError, RPCError)
+  entity_resolution_retries: 1  # Username/channel resolution attempts (set >1 to enable retries)
+  entity_resolution_retry_delay: 30  # Delay between entity resolution retries (seconds)
   
-  # CRITICAL ANTI-SPAM DELAYS (prevent account bans)
-  min_delay_between_reactions: 3  # Minimum seconds between reactions (per account)
-  max_delay_between_reactions: 8  # Maximum seconds between reactions (per account)
-  min_delay_before_reaction: 1  # Additional random delay before sending reaction (min)
-  max_delay_before_reaction: 3  # Additional random delay before sending reaction (max)
-  worker_start_delay_min: 2  # Minimum delay before worker starts (stagger workers)
-  worker_start_delay_max: 10  # Maximum delay before worker starts (stagger workers)
+  # === ANTI-SPAM DELAYS (prevent account bans) ===
+  
+  # Delay between consecutive reactions from the same account
+  min_delay_between_reactions: 20  # Minimum seconds between reactions (per account)
+  max_delay_between_reactions: 40  # Maximum seconds between reactions (per account)
+  
+  # Additional random delay before sending reaction (humanization)
+  min_delay_before_reaction: 3  # Minimum delay before sending reaction
+  max_delay_before_reaction: 8  # Maximum delay before sending reaction
+  
+  # Anti-spam delays for internal operations (view increment, undo, etc.)
+  anti_spam_delay_min: 1  # Minimum anti-spam delay
+  anti_spam_delay_max: 3  # Maximum anti-spam delay
+  
+  # Worker stagger delays (prevents all accounts hitting API simultaneously)
+  worker_start_delay_min: 5  # Minimum delay before worker starts
+  worker_start_delay_max: 20  # Maximum delay before worker starts
+  
+  # Internal error recovery delays
+  batch_error_delay: 0.2  # Delay after batch writer errors (reporter)
+  
+  # === HUMANIZATION DELAYS (reading simulation) ===
+  # Fallback delay when message content is empty (humanisation_level >= 1)
+  reading_fallback_delay_min: 2  # Minimum fallback reading delay
+  reading_fallback_delay_max: 5  # Maximum fallback reading delay
+  
+  # Minimal delay when humanisation_level = 0
+  minimal_humanization_delay_min: 1.5  # Minimum minimal delay
+  minimal_humanization_delay_max: 4  # Maximum minimal delay
+
+  # === CONNECTION WARMUP (batching & jitter) ===
+  connection_warmup:
+    connect:
+      batch_size: 3  # Max accounts per connection batch
+      batch_delay_min: 3  # Min delay between connection batches
+      batch_delay_max: 7  # Max delay between connection batches
+      pre_jitter_min: 0.7  # Min jitter before connect() per account
+      pre_jitter_max: 2.5  # Max jitter before connect() per account
+      post_jitter_min: 1.0  # Min idle after successful connect()
+      post_jitter_max: 3.0  # Max idle after successful connect()
+    disconnect:
+      batch_size: 2  # Max accounts per disconnect batch
+      batch_delay_min: 2  # Min delay between disconnect batches
+      batch_delay_max: 5  # Max delay between disconnect batches
+      pre_jitter_min: 0.5  # Min jitter before disconnect() per account
+      pre_jitter_max: 1.5  # Max jitter before disconnect() per account
+      post_jitter_min: 0.5  # Min idle after disconnect()
+      post_jitter_max: 1.5  # Max idle after disconnect()
