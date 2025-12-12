@@ -1665,7 +1665,15 @@ class MongoStorage():
         if not proxy.get('active', True):
             raise ValueError(f"Proxy {normalized_name} is not active")
 
-        assigned = account.get('assigned_proxies', []) or []
+        assigned = account.get('assigned_proxies', [])
+        if not isinstance(assigned, list):
+            await cls._accounts.update_one(
+                {"phone_number": phone_number},
+                {"$set": {"assigned_proxies": []}}
+            )
+            assigned = []
+            account['assigned_proxies'] = assigned
+
         if normalized_name in assigned:
             logger.debug(f"Proxy {normalized_name} already linked to account {phone_number}")
             return False
@@ -1782,7 +1790,14 @@ class MongoStorage():
         if account is None:
             raise ValueError(f"Account {phone_number} not found")
 
-        assigned = account.get('assigned_proxies', []) or []
+        assigned = account.get('assigned_proxies', [])
+        if not isinstance(assigned, list):
+            await cls._accounts.update_one(
+                {"phone_number": phone_number},
+                {"$set": {"assigned_proxies": []}}
+            )
+            assigned = []
+            account['assigned_proxies'] = assigned
         current_count = len(assigned)
 
         try:

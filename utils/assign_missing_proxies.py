@@ -18,6 +18,45 @@ except ImportError as exc:  # pragma: no cover - utility guard
 from main_logic.database import get_db
 
 
+def _get_account_field(account: object, field: str, default=None):
+    if isinstance(account, dict):
+        return account.get(field, default)
+    return getattr(account, field, default)
+
+
+def _coerce_proxy_list(account: object) -> list:
+    value = _get_account_field(account, "assigned_proxies")
+    return value if isinstance(value, list) else []
+
+
+def _proxy_field_is_list(account: object) -> bool:
+    return isinstance(_get_account_field(account, "assigned_proxies"), list)
+
+
+async def _normalize_proxy_field(db, phone_number: str) -> None:
+    if not phone_number:
+        raise ValueError("Cannot normalize assigned_proxies without phone_number")
+
+    collection = getattr(db, "_accounts", None)
+    if collection is None:
+        raise RuntimeError("Database handle is missing the _accounts collection")
+
+    await collection.update_one(
+        {"phone_number": phone_number},
+        {"$set": {"assigned_proxies": []}},
+    )
+
+
+def _set_proxy_field(account: object, value: list[str]) -> None:
+    if isinstance(account, dict):
+        account["assigned_proxies"] = value
+        return
+    try:
+        setattr(account, "assigned_proxies", value)
+    except AttributeError:
+        pass
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Link least-used proxies to accounts without any assigned ones."
@@ -55,7 +94,7 @@ def parse_args() -> argparse.Namespace:
 async def load_accounts_missing_proxies(limit: int | None) -> Sequence:
     db = get_db()
     accounts = await db.load_all_accounts()
-    missing = [acc for acc in accounts if not (getattr(acc, "assigned_proxies", None) or [])]
+    missing = [acc for acc in accounts if not _coerce_proxy_list(acc)]
     if limit is not None:
         return missing[: max(limit, 0)]
     return missing
@@ -76,19 +115,36 @@ async def assign_proxies(per_account: int, include_inactive: bool, dry_run: bool
     successes: list[str] = []
     partials: list[str] = []
     errors: list[tuple[str, str]] = []
+    normalized_accounts: list[str] = []
+    pending_normalization: list[str] = []
 
     with tqdm(total=total, desc="Assigning proxies", unit="acct") as progress:
         for account in accounts:
             try:
+                phone_number = getattr(account, "phone_number", None)
+                if not phone_number:
+                    raise ValueError("Encountered an account entry without phone_number")
+
+                needs_normalization = not _proxy_field_is_list(account)
+                if needs_normalization:
+                    if dry_run:
+                        if phone_number not in pending_normalization:
+                            pending_normalization.append(phone_number)
+                    else:
+                        await _normalize_proxy_field(db, phone_number)
+                        if phone_number not in normalized_accounts:
+                            normalized_accounts.append(phone_number)
+                    _set_proxy_field(account, [])
+
                 if dry_run:
                     result = {
-                        "phone_number": account.phone_number,
+                        "phone_number": phone_number,
                         "added": ["dry-run"] * per_account,
                         "remaining": 0,
                     }
                 else:
                     result = await db.auto_assign_proxies(
-                        account.phone_number,
+                        phone_number,
                         desired_count=per_account,
                         active_only=not include_inactive,
                     )
@@ -97,17 +153,18 @@ async def assign_proxies(per_account: int, include_inactive: bool, dry_run: bool
                 remaining = result.get("remaining", 0)
 
                 if added and not remaining:
-                    successes.append(f"{account.phone_number}: {len(added)} new proxies")
+                    successes.append(f"{phone_number}: {len(added)} new proxies")
                 elif added and remaining:
                     partials.append(
-                        f"{account.phone_number}: {len(added)} added, {remaining} still needed"
+                        f"{phone_number}: {len(added)} added, {remaining} still needed"
                     )
                 elif remaining:
                     partials.append(
-                        f"{account.phone_number}: no proxies added, {remaining} still needed"
+                        f"{phone_number}: no proxies added, {remaining} still needed"
                     )
             except Exception as exc:  # pragma: no cover - defensive utility script
-                errors.append((account.phone_number or "<unknown>", str(exc)))
+                label = getattr(account, "phone_number", None) or "<unknown>"
+                errors.append((label, str(exc)))
             finally:
                 progress.update(1)
 
@@ -118,6 +175,10 @@ async def assign_proxies(per_account: int, include_inactive: bool, dry_run: bool
     tqdm.write(f"Fully satisfied:   {len(successes)}")
     tqdm.write(f"Partial/missing:   {len(partials)}")
     tqdm.write(f"Errors:            {len(errors)}")
+    if dry_run:
+        tqdm.write(f"Needs normalization: {len(pending_normalization)}")
+    else:
+        tqdm.write(f"Fields normalized: {len(normalized_accounts)}")
 
     if successes:
         tqdm.write("\nAccounts updated:")
@@ -133,6 +194,16 @@ async def assign_proxies(per_account: int, include_inactive: bool, dry_run: bool
         tqdm.write("\nErrors encountered:")
         for phone, message in errors:
             tqdm.write(f"  - {phone}: {message}")
+
+    if normalized_accounts:
+        tqdm.write("\nAccounts normalized before assignment:")
+        for phone in normalized_accounts:
+            tqdm.write(f"  - {phone}")
+
+    if pending_normalization:
+        tqdm.write("\nAccounts needing normalization (run without --dry-run to fix):")
+        for phone in pending_normalization:
+            tqdm.write(f"  - {phone}")
 
 
 def main() -> None:
