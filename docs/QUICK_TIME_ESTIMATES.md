@@ -1,7 +1,7 @@
 # Quick Time Estimates
 **TL;DR:** How long will my task take?
 
-**Updated:** November 30, 2025 (reflects new rate limits: 10s, 6s, 1s)
+**Updated:** December 12, 2025 (reflects 20–40 s inter-reaction gap + long-lived caches)
 
 ---
 
@@ -12,8 +12,8 @@ Time (minutes) = (Workers × Posts × 0.1) + (Posts × 0.5)
 ```
 
 **Explanation:**
-- **0.1 min per reaction** (6 second rate limit)
-- **0.5 min overhead per post** (delays, reading, lookups)
+- **0.1 min per reaction** (global 6 second `SendReactionRequest` limit)
+- **0.5 min overhead per post** (20–40 s inter-reaction gap + reading + pre-action jitter)
 
 ---
 
@@ -57,16 +57,20 @@ Time (minutes) = (Workers × Posts × 0.1) + (Posts × 0.5)
 
 | Component | Time | Skippable? |
 |-----------|------|------------|
-| **SendReactionRequest** | **6s** | ❌ Never (rate limited) |
-| Inter-reaction delay | 30s | ❌ Never (spam prevention) |
-| Pre-action delay | 5s | ❌ Never (humanization) |
-| Reading delay | 5s | ❌ Never (humanization) |
-| get_entity | 10s | ✅ Cached after first worker |
-| get_message | 1s | ✅ Cached after first worker |
-| GetMessagesViews | <1s | ❌ Never (must increment) |
+| **SendReactionRequest** | **6 s global throttle** | ❌ Never (process-wide `TelegramAPIRateLimiter`) |
+| Inter-reaction delay | 20–40 s per post | ❌ Never (enforced in `Task.client_worker`, even for a single post) |
+| Pre-action delay | 3–8 s | ❌ Never (humanization) |
+| Reading delay | 2–41 s | ❌ Never (depends on message length via `estimate_reading_time`) |
+| Worker start jitter | 5–20 s (per worker run) | ❌ No (one-time per account at run start) |
+| Warm-up snapshot + media prefetch | ≈1 s total | ❌ No (GetFullChannel + GetMessages/WebPreview) |
+| Reaction whitelist fetch | ≈0.35 s | ❌ No (skipped only on broadcast channels) |
+| `GetMessagesViews` | <1 s | ❌ No (organic view increment) |
+| `get_entity` | ≈0.35 s once per 24 h | ✅ Cached (process scope + refresh-on-hit) |
+| `get_message` | ≈0.35 s once per 7 d | ✅ Cached (process scope + refresh-on-hit) |
 
-**Total (Cold Cache):** ~40s per post  
-**Total (Warm Cache):** ~18s per post
+**Per-account wall time (excluding the global queue):**
+- **Cold start:** ~55–65 s for short posts, up to ~110 s for 150-word posts.
+- **Warm cache:** ~27–54 s (same as above minus the first-touch cache fetch, which is <1 s and shared via in-flight dedup).
 
 ---
 
@@ -91,11 +95,11 @@ Everything else: ~30s (3% of total time)
 ### Why Does Cache Matter So Little?
 
 With 100 workers:
-- **First worker:** Fetches entity/message (+11s penalty)
-- **Workers 2-100:** Use cached data (0s penalty)
-- **Average penalty:** 11s ÷ 100 = **0.11s per worker** (negligible)
+- **First worker:** Triggers `get_entity`, `get_message`, and `GetFullChannel` once (≈1 s total, and in-flight dedup shares it with everybody else).
+- **Workers 2–100:** Immediately await the same Future because the cache scope is `process` and TTLs are ≥12 h (entities 24 h, messages 7 d, input peers 7 d).
+- **Average penalty:** <1 s ÷ 100 ≈ **0.01 s per worker**.
 
-**Insight:** Cache effectiveness is **invisible at scale** because only 1% of workers pay the cost.
+**Insight:** Cache effectiveness is now almost invisible even for single-account scripts because the TTL refresh-on-hit keeps entries alive for days; only the very first touch after a multi-day pause pays the API cost.
 
 ---
 
@@ -104,25 +108,24 @@ With 100 workers:
 ### 1 Account, 10 Posts
 
 ```
-Time per post: 40s (cold) or 18s (warm)
-Total: 400s (cold) or 180s (warm) ≈ 3-7 minutes
+Time per post: ~55–65 s (short text) or ~110 s (long text)
+Total: 9–11 min for short posts, up to ~18 min for very long posts
 
-Cache impact: 220s (55% faster with cache)
+Cache impact: <1 s after the very first post (TTL = 24 h+/7 d)
 ```
 
-**Caching matters a lot** for single-account tasks.
+Single-account runs are dominated by the enforced 20–40 s gap between posts plus reading time; caches only matter if you truly have never seen the channel before.
 
 ### 100 Accounts, 1 Post
 
 ```
-First worker: 40s
-Workers 2-100: 18s each
-Total: ~628s ≈ 10.5 minutes
-
-Cache impact: 11s (1.7% faster)
+First worker reaches the limiter after ~7 s of prep
+Global queue: 100 reactions × 6 s = 600 s
+Tail latency: + worker start jitter (≤20 s) + final 20–40 s gap
+Total: ~11 min wall clock
 ```
 
-**Caching barely matters** for multi-account tasks.
+Even though every account spends ~30–50 s “doing human stuff,” the global limiter keeps total time near `#workers × 6 s`. Cache state changes that by milliseconds at best.
 
 ---
 
@@ -225,10 +228,10 @@ Formula: (100 × 5 × 0.1) + (5 × 0.5)
    - Impact: <1% for typical tasks
    - Risk: Less human-like behavior
 
-3. **Increase cache TTLs**
-   - Gain: <1s average (already 90%+ hit rate)
-   - Impact: Negligible
-   - Risk: None
+3. **Cache tuning**
+  - Gain: <0.5 s (entity/message TTLs already 24 h / 7 d with refresh-on-hit)
+  - Impact: None unless the process restarts daily
+  - Risk: None (but also no measurable upside)
 
 **Bottom line:** Reaction rate limit is 95% of the time. Other optimizations are noise.
 
@@ -284,12 +287,12 @@ For tasks with **100+ workers**, the difference between best/typical/worst is **
 
 ### When Cache Actually Matters
 
-Cache makes a **big difference** only for:
-- **Single account** tasks (100% of workers pay penalty)
-- **Very small tasks** (<10 workers)
-- **First time seeing a channel** (no URL alias in DB)
+Cache only pops up on the radar when:
+- You hit a channel/post for the **first time ever** (no DB alias, no cached entity/input peer yet).
+- The process slept long enough for TTLs to expire (≥24 h for entities, ≥7 d for messages/input peers).
+- You run ad-hoc scripts without calling `Client.init_standalone_cache()`, forcing every call to bypass caching entirely.
 
-For your use case (100+ accounts), **ignore cache differences**.
+Under normal task execution (process-scoped cache + refresh-on-hit), cache misses amount to <<1% of the total runtime—even for single-account jobs.
 
 ---
 

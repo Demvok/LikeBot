@@ -36,13 +36,15 @@ class CacheEntry:
     """Single cache entry with metadata."""
     value: Any
     timestamp: float
-    ttl: float
+    ttl: float | None
     cache_type: str
     key: str
     owner_account: str | None = None
     
     def is_expired(self) -> bool:
         """Check if entry has expired based on TTL."""
+        if self.ttl is None or self.ttl <= 0:
+            return False
         return time.time() - self.timestamp > self.ttl
 
 
@@ -81,16 +83,19 @@ class TelegramCache:
         self.scope = scope
         self.task_id = task_id
         scope_suffix = scope.value if scope else "task"
-        label = f"TelegramCache_{scope_suffix}_{task_id or 'process'}"
+        if scope == TelegramCacheScope.TASK:
+            label = f"cache_{scope_suffix}_{task_id if task_id else None}"
+        else:
+            label = "cache"
         self.logger = setup_logger(label, "main.log")
 
         config = load_config()
         cache_config = config.get('cache', {})
 
-        # Cache storage: {(cache_type, normalized_key): CacheEntry}
-        self._cache: OrderedDict[Tuple[str, str], CacheEntry] = OrderedDict()
+        # Cache storage: {(cache_type, normalized_key, account_id): CacheEntry}
+        self._cache: OrderedDict[Tuple[str, str, str], CacheEntry] = OrderedDict()
         self._account_entry_counts: Counter[str] = Counter()
-        self._in_flight: Dict[Tuple[str, str], InFlightRequest] = {}
+        self._in_flight: Dict[Tuple[str, str, str], InFlightRequest] = {}
         self._lock = asyncio.Lock()
 
         self._max_size = max_size or cache_config.get('max_size', 500)
@@ -108,6 +113,7 @@ class TelegramCache:
             self.DISCUSSION: cache_config.get('discussion_ttl', 300),
             self.INPUT_PEER: cache_config.get('input_peer_ttl', 300),
         }
+        self._refresh_ttl_on_hit = cache_config.get('refresh_ttl_on_hit', True)
 
         self._stats = {
             'hits': 0,
@@ -212,6 +218,18 @@ class TelegramCache:
         
         return (cache_type, normalized)
 
+    def _build_cache_key(self, cache_type: str, key: Any, account_id: str | None) -> Tuple[str, str, str]:
+        """Build the storage key that enforces per-account isolation."""
+        cache_type_norm, normalized = self._normalize_key(cache_type, key)
+        owner = account_id or ""
+        return (cache_type_norm, normalized, owner)
+
+    def _resolve_ttl(self, cache_type: str, override_ttl: float | None) -> float | None:
+        """Return TTL override when provided, else fall back to configured defaults."""
+        if override_ttl is not None:
+            return override_ttl
+        return self._ttls.get(cache_type, 300)
+
     def _track_addition(self, account_id: str) -> None:
         if account_id:
             self._account_entry_counts[account_id] += 1
@@ -230,12 +248,19 @@ class TelegramCache:
         else:
             self._account_entry_counts[account_id] = current - 1
 
-    def _after_entry_removed(self, cache_key: Tuple[str, str], entry: CacheEntry | None, *, expired: bool = False, evicted: bool = False) -> None:
+    def _after_entry_removed(self, cache_key: Tuple[str, str, str], entry: CacheEntry | None, *, expired: bool = False, evicted: bool = False) -> None:
         self._track_removal_for_entry(entry)
         if expired:
             self._stats['expired'] += 1
         if evicted:
             self._stats['evictions'] += 1
+
+    def _register_hit_locked(self, cache_key: Tuple[str, str, str], entry: CacheEntry) -> None:
+        """Track hit stats and optionally extend TTL/LRU ordering for active entries."""
+        if self._refresh_ttl_on_hit:
+            entry.timestamp = time.time()
+        self._cache.move_to_end(cache_key, last=True)
+        self._stats['hits'] += 1
 
     def _evict_oldest_entry(self) -> None:
         if not self._cache:
@@ -309,21 +334,22 @@ class TelegramCache:
                 rate_limit_method='get_entity'
             )
         """
-        cache_key = self._normalize_key(cache_type, key)
-        ttl = ttl or self._ttls.get(cache_type, 300)
+        cache_key = self._build_cache_key(cache_type, key, account_id)
+        ttl = self._resolve_ttl(cache_type, ttl)
         
-        # Fast path: Check cache without lock (read-mostly optimization)
+        # Fast path: Check cache without awaiting fetch
         entry = self._cache.get(cache_key)
-        if entry and entry.is_expired():
+        if entry:
             async with self._lock:
-                if cache_key in self._cache:
-                    expired_entry = self._cache.pop(cache_key, None)
-                    self._after_entry_removed(cache_key, expired_entry, expired=True)
-        elif entry:
-            async with self._lock:  # Brief lock to update stats
-                self._stats['hits'] += 1
-            self.logger.debug("Cache HIT: %s:%s (account=%s)", cache_type, key, account_id)
-            return entry.value
+                locked_entry = self._cache.get(cache_key)
+                if locked_entry is not None:
+                    if locked_entry.is_expired():
+                        expired_entry = self._cache.pop(cache_key, None)
+                        self._after_entry_removed(cache_key, expired_entry, expired=True)
+                    else:
+                        self._register_hit_locked(cache_key, locked_entry)
+                        self.logger.debug("Cache HIT: %s:%s (account=%s)", cache_type, key, account_id)
+                        return locked_entry.value
         
         # Slow path: Need to fetch (acquire lock for coordination)
         async with self._lock:
@@ -334,7 +360,7 @@ class TelegramCache:
                     expired_entry = self._cache.pop(cache_key, None)
                     self._after_entry_removed(cache_key, expired_entry, expired=True)
                 else:
-                    self._stats['hits'] += 1
+                    self._register_hit_locked(cache_key, entry)
                     self.logger.debug("Cache HIT (after lock): %s:%s (account=%s)", cache_type, key, account_id)
                     return entry.value
             
@@ -459,18 +485,58 @@ class TelegramCache:
         Get message with caching.
         
         Args:
-            chat_id: Chat/channel ID
+            chat_id: Chat/channel ID (int, str, entity or InputPeer)
             message_id: Message ID
             client: Telethon client instance
         
         Returns:
             Telethon message object
         """
+
+        async def _resolve_entity(identifier: Any) -> Any:
+            if identifier is None:
+                raise ValueError("chat_id is required to fetch messages")
+            if hasattr(identifier, 'id') or hasattr(identifier, 'channel_id'):
+                return identifier
+            return await client.get_entity_cached(identifier)
+
+        async def _warm_input_peer(entity: Any) -> None:
+            try:
+                await self.get_input_peer(entity, client)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self.logger.debug("Input peer warmup skipped: %s", exc)
+
+        async def _fetch_message() -> Any:
+            last_error: Exception | None = None
+            for attempt in range(2):
+                entity = await _resolve_entity(chat_id)
+                await _warm_input_peer(entity)
+                try:
+                    return await client.client.get_messages(entity, ids=message_id)
+                except ValueError as exc:
+                    if "PeerUser" not in str(exc):
+                        raise
+                    last_error = exc
+                    self.logger.debug(
+                        "Peer resolution failed for %s/%s (attempt %s): %s",
+                        chat_id,
+                        message_id,
+                        attempt + 1,
+                        exc,
+                    )
+                    if client.telegram_cache is not None:
+                        entity_id = getattr(entity, 'id', chat_id)
+                        await self.invalidate(self.INPUT_PEER, client.phone_number, entity_id)
+                except Exception:
+                    raise
+            if last_error:
+                raise last_error
+
         return await self.get(
             cache_type=self.MESSAGE,
             account_id=client.phone_number,
             key=(chat_id, message_id),
-            fetch_func=lambda: client.client.get_messages(chat_id, ids=message_id),
+            fetch_func=_fetch_message,
             rate_limit_method='get_messages'
         )
     
@@ -529,7 +595,7 @@ class TelegramCache:
         Returns:
             True if entry was removed, False if not found
         """
-        cache_key = self._normalize_key(cache_type, key)
+        cache_key = self._build_cache_key(cache_type, key, account_id)
         
         async with self._lock:
             if cache_key in self._cache:

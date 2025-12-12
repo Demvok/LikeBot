@@ -34,7 +34,7 @@ from main_logic.agent import Account
 from main_logic.post import Post
 from main_logic.task import Task
 from main_logic.channel import Channel
-from main_logic.channel import normalize_chat_id
+from main_logic.channel import normalize_chat_id, ensure_channel_peer_id
 
 config = load_config()
 logger = setup_logger("DB", "main.log")
@@ -576,13 +576,14 @@ class MongoStorage():
         await cls._ensure_ready()
         # Normalize chat_id to handle -100 prefix
         normalized_id = normalize_chat_id(chat_id)
-        # Also compute the -100 prefixed form
-        prefixed_id = int(f"-100{normalized_id}")
+        prefixed_id = ensure_channel_peer_id(chat_id)
+        lookup_ids = [normalized_id]
+        if prefixed_id is not None:
+            lookup_ids.append(prefixed_id)
         
-        logger.info(f"Getting posts for chat_id: {chat_id} (searching for {normalized_id} or {prefixed_id})")
+        logger.info(f"Getting posts for chat_id: {chat_id} (searching for {lookup_ids})")
         
-        # Search for either normalized OR -100 prefixed form
-        cursor = cls._posts.find({"chat_id": {"$in": [normalized_id, prefixed_id]}})
+        cursor = cls._posts.find({"chat_id": {"$in": lookup_ids}})
         posts = []
         async for post in cursor:
             post.pop('_id', None)
@@ -2202,7 +2203,19 @@ class MongoStorage():
             channel_data = channel_data.to_dict()
         
         chat_id = channel_data.get('chat_id')
-        logger.info(f"Adding channel to MongoDB: chat_id={chat_id}, name={channel_data.get('channel_name')}")
+        normalized_chat_id = normalize_chat_id(chat_id)
+        prefixed_chat_id = ensure_channel_peer_id(chat_id)
+
+        channel_data['chat_id'] = normalized_chat_id
+        if prefixed_chat_id is not None:
+            channel_data['chat_id_prefixed'] = prefixed_chat_id
+
+        logger.info(
+            "Adding channel to MongoDB: chat_id=%s (prefixed=%s), name=%s",
+            normalized_chat_id,
+            prefixed_chat_id,
+            channel_data.get('channel_name'),
+        )
         
         # Check if channel already exists
         existing_channel = await cls.get_channel(chat_id)
@@ -2247,12 +2260,16 @@ class MongoStorage():
         # Normalize chat_id to handle -100 prefix
         normalized_id = normalize_chat_id(chat_id)
         # Also compute the -100 prefixed form
-        prefixed_id = int(f"-100{normalized_id}")
+        prefixed_id = ensure_channel_peer_id(chat_id)
         
-        logger.info(f"Getting channel from MongoDB with chat_id: {chat_id} (searching for {normalized_id} or {prefixed_id})")
+        lookup_ids = [normalized_id]
+        if prefixed_id is not None:
+            lookup_ids.append(prefixed_id)
+
+        logger.info(f"Getting channel from MongoDB with chat_id: {chat_id} (searching for {lookup_ids})")
         
         # Search for either normalized OR -100 prefixed form
-        channel = await cls._channels.find_one({"chat_id": {"$in": [normalized_id, prefixed_id]}})
+        channel = await cls._channels.find_one({"chat_id": {"$in": lookup_ids}})
         if channel and '_id' in channel:
             channel.pop('_id')
         
@@ -2282,8 +2299,10 @@ class MongoStorage():
         all_possible_ids = []
         for chat_id in chat_ids:
             normalized_id = normalize_chat_id(chat_id)
-            prefixed_id = int(f"-100{normalized_id}")
-            all_possible_ids.extend([normalized_id, prefixed_id])
+            prefixed_id = ensure_channel_peer_id(chat_id)
+            all_possible_ids.append(normalized_id)
+            if prefixed_id is not None:
+                all_possible_ids.append(prefixed_id)
         
         logger.info(f"Getting {len(chat_ids)} channels from MongoDB in bulk")
         
@@ -2418,15 +2437,15 @@ class MongoStorage():
         await cls._ensure_ready()
         # Normalize chat_id to handle -100 prefix
         normalized_id = normalize_chat_id(chat_id)
-        # Also compute the -100 prefixed form
-        prefixed_id = int(f"-100{normalized_id}")
+        prefixed_id = ensure_channel_peer_id(chat_id)
+        lookup_ids = [normalized_id]
+        if prefixed_id is not None:
+            lookup_ids.append(prefixed_id)
         
-        logger.info(f"Getting subscribers for channel: {chat_id} (searching for {normalized_id} or {prefixed_id})")
+        logger.info(f"Getting subscribers for channel: {chat_id} (searching for {lookup_ids})")
         
-        # MongoDB natively supports querying array fields - if subscribed_to contains
-        # either the normalized or prefixed form, the account will be returned
         cursor = cls._accounts.find({
-            "subscribed_to": {"$in": [normalized_id, prefixed_id]}
+            "subscribed_to": {"$in": lookup_ids}
         })
         
         accounts = []
@@ -2463,10 +2482,12 @@ class MongoStorage():
         await cls._ensure_ready()
         # Normalize chat_id to handle -100 prefix
         normalized_id = normalize_chat_id(chat_id)
-        # Also compute the -100 prefixed form
-        prefixed_id = int(f"-100{normalized_id}")
+        prefixed_id = ensure_channel_peer_id(chat_id)
+        lookup_ids = [normalized_id]
+        if prefixed_id is not None:
+            lookup_ids.append(prefixed_id)
         
-        logger.info(f"Updating channel {chat_id} (searching for {normalized_id} or {prefixed_id}) with data: {update_data.keys()}")
+        logger.info(f"Updating channel {chat_id} (searching for {lookup_ids}) with data: {update_data.keys()}")
         
         if not isinstance(update_data, dict):
             update_data = update_data.to_dict()
@@ -2480,7 +2501,7 @@ class MongoStorage():
         
         # Update whichever form exists in the database
         result = await cls._channels.update_one(
-            {"chat_id": {"$in": [normalized_id, prefixed_id]}},
+            {"chat_id": {"$in": lookup_ids}},
             {"$set": update_data}
         )
         
@@ -2503,13 +2524,14 @@ class MongoStorage():
         await cls._ensure_ready()
         # Normalize chat_id to handle -100 prefix
         normalized_id = normalize_chat_id(chat_id)
-        # Also compute the -100 prefixed form
-        prefixed_id = int(f"-100{normalized_id}")
+        prefixed_id = ensure_channel_peer_id(chat_id)
+        lookup_ids = [normalized_id]
+        if prefixed_id is not None:
+            lookup_ids.append(prefixed_id)
         
-        logger.info(f"Deleting channel from MongoDB with chat_id: {chat_id} (searching for {normalized_id} or {prefixed_id})")
+        logger.info(f"Deleting channel from MongoDB with chat_id: {chat_id} (searching for {lookup_ids})")
         
-        # Delete whichever form exists in the database
-        result = await cls._channels.delete_one({"chat_id": {"$in": [normalized_id, prefixed_id]}})
+        result = await cls._channels.delete_one({"chat_id": {"$in": lookup_ids}})
         logger.debug(f"Channel delete result: {result.deleted_count}")
         return result.deleted_count > 0
 
@@ -2555,8 +2577,10 @@ class MongoStorage():
         await cls._ensure_ready()
         # Normalize chat_id to handle -100 prefix
         normalized_id = normalize_chat_id(chat_id)
-        # Also compute the -100 prefixed form
-        prefixed_id = int(f"-100{normalized_id}")
+        prefixed_id = ensure_channel_peer_id(chat_id)
+        lookup_ids = [normalized_id]
+        if prefixed_id is not None:
+            lookup_ids.append(prefixed_id)
         
         logger.info(f"Adding url_alias '{alias}' to channel {chat_id}")
         
@@ -2564,7 +2588,7 @@ class MongoStorage():
         from datetime import datetime, timezone
         
         result = await cls._channels.update_one(
-            {"chat_id": {"$in": [normalized_id, prefixed_id]}},
+            {"chat_id": {"$in": lookup_ids}},
             {
                 "$addToSet": {"url_aliases": alias},
                 "$set": {"updated_at": datetime.now(timezone.utc)}

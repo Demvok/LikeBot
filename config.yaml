@@ -19,13 +19,14 @@ database:
 cache:
   # Task-scoped Telegram object cache settings
   scope: "process"  # "task" (default) or "process" for long-lived cache
-  entity_ttl: 300  # 5 minutes - entities (users, channels, chats)
-  message_ttl: 60  # 1 minute - message objects
-  full_channel_ttl: 600  # 10 minutes - full channel info (reactions, discussion groups)
-  discussion_ttl: 300  # 5 minutes - discussion group data
-  input_peer_ttl: 300  # 5 minutes - InputPeer objects
+  entity_ttl: 86400  # 24 hours - entities (users, channels, chats)
+  message_ttl: 604800  # 7 days - message objects (set to 0 to disable expiry)
+  full_channel_ttl: 43200  # 12 hours - full channel info (reactions, discussion groups)
+  discussion_ttl: 43200  # 12 hours - discussion group data
+  input_peer_ttl: 604800  # 7 days - InputPeer objects
   max_size: 500  # Maximum cache entries per task (increased from 100 per client)
   enable_in_flight_dedup: true  # De-duplicate concurrent requests (recommended: true)
+  refresh_ttl_on_hit: true  # Extend TTL and move entries when accessed to keep hot data alive
   process:
     max_size: 2000  # Overrides task max_size when scope == "process"
     cleanup_interval: 60  # Seconds between background sweeps for expired entries
@@ -100,12 +101,12 @@ delays:
       pre_jitter_min: 0.7  # Min jitter before connect() per account
       pre_jitter_max: 2.5  # Max jitter before connect() per account
       post_jitter_min: 1.0  # Min idle after successful connect()
-      post_jitter_max: 3.0  # Max idle after successful connect()
+      post_jitter_max: 10.0  # Max idle after successful connect()
     disconnect:
       batch_size: 2  # Max accounts per disconnect batch
       batch_delay_min: 2  # Min delay between disconnect batches
       batch_delay_max: 5  # Max delay between disconnect batches
-      pre_jitter_min: 0.5  # Min jitter before disconnect() per account
-      pre_jitter_max: 1.5  # Max jitter before disconnect() per account
+      pre_jitter_min: 2  # Min jitter before disconnect() per account
+      pre_jitter_max: 6  # Max jitter before disconnect() per account
       post_jitter_min: 0.5  # Min idle after disconnect()
       post_jitter_max: 1.5  # Max idle after disconnect()

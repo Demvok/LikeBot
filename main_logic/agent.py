@@ -109,6 +109,8 @@ class Client(
         
         # Task-scoped cache (injected by Task)
         self.telegram_cache = None  # Will be set by Task._run()
+        # Tracks which identifier variant (raw vs -100 prefixed) worked for entity resolution
+        self._entity_identifier_preferences: dict[str, int] = {}
         
         self.logger = setup_logger(f"{self.phone_number}", f"accounts/account_{self.phone_number}.log")
         self.logger.info(f"Initializing client for {self.phone_number}. Awaiting connection...")

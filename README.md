@@ -20,15 +20,37 @@
 - add counter table reset on deletion
 - fix counters logic - merges new objects with old ones
 - fix proxy tester - fails to parse 2ip.ua output
+- improve emoji whitelisting - now may be prone to spam
 
 #### TO TEST:
-- account locking (on using account in one task it should be unusable for other tasks)
-- url parsing
-- cache reuse
-- proxy linking, usage and import
-- proxy validation
+- account locking (on using account in one task it should be unusable for other tasks) ~
+- url parsing ~
+
+#### TO REVIEW IN FRONTEND:
+- review if channel viewing works correctly
+- review user creation admin panel (possibly add endpoints)
+- channel indexing from account
+- view channels subsribers and account's channels
+- add status failed
+- use new endpoints for proxy binding, now it works
+- add channel aliases for preview?
+- proxy test button
+- account activity status?
 
 ## Changelog
+
+### v.1.2.1
+- fixed channel caching
+- fixed post validation racing issue
+- dropped GetMessageReactionsListRequest for broadcast channels
+- fixed post validation now falls back to url fetch on issues
+- ensured account status update on errors (on post validation, channel fetching)
+- dropped bad accounts from task execution (still needs review)
+- added proxy assigning script
+- fixed channel prefix usage issue with telethon
+- radically expanded cache lifetime
+- fixed incorrect channel cache usage
+- updated analysis docs
 
 ### v.1.2.0
 - added "warming-up" and "cooling" stage for account connect to avoid syncronisity 
@@ -80,6 +102,12 @@
 - added proxy crud endpoints and proxy status (active/disabled for now)
 - added user register endpoints
 - added full channel logic endpoints
+
+
+
+<details>
+
+<summary>Old changes</summary>
 
 ### v.1.0.6
 - fixed multiple palette import, only on task startup
@@ -151,3 +179,5 @@
 - post ids verification
 - created emoji palettes
 - write task creation logic (start/pause/stop, status, csv import)
+
+</details>

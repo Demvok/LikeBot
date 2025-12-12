@@ -8,3 +8,4 @@ test.ipynb
 _prod_bug/
 /misc/
 pytest.ini
+API test/

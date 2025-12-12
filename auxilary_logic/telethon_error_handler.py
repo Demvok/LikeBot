@@ -93,3 +93,25 @@ def reporter_payload_from_mapping(mapping, exc=None, extra=None):
     if extra and isinstance(extra, dict):
         payload.update(extra)
     return payload
+
+
+async def apply_mapping_to_account(mapping, account, *, error=None):
+    """Apply mapping directive to an account instance.
+
+    Returns True if a status/flood-wait update was performed.
+    """
+    if not mapping or account is None:
+        return False
+
+    action = mapping.get('action')
+    if action == 'mark_status' and mapping.get('status'):
+        await account.update_status(mapping['status'], error=error)
+        return True
+
+    if action == 'set_flood_wait' and mapping.get('flood_seconds') is not None:
+        seconds = mapping.get('flood_seconds')
+        if seconds is not None and hasattr(account, 'set_flood_wait'):
+            await account.set_flood_wait(seconds, error=error)
+            return True
+
+    return False

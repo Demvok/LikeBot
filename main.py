@@ -62,7 +62,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="LikeBot API",
     description="Full API for LikeBot automation",
-    version="1.2.0",
+    version="1.2.1",
     lifespan=lifespan
 )
 
