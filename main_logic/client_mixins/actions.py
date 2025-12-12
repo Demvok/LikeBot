@@ -134,8 +134,23 @@ class ActionsMixin:
         await self._prefetch_media_payload(message)
         await self._maybe_open_replies(input_peer, message.id)
 
-    async def _gather_reaction_whitelist(self, input_peer, message_id: int) -> Optional[List[str]]:
-        """Fetch existing reactions to refine emoji selection."""
+    async def _gather_reaction_whitelist(self, input_peer, message_id: int, target_chat=None) -> Optional[List[str]]:
+        """Fetch existing reactions to refine emoji selection when API allows it."""
+        is_broadcast_channel = False
+        if target_chat is not None:
+            try:
+                is_broadcast_channel = (
+                    isinstance(target_chat, types.Channel)
+                    and getattr(target_chat, 'broadcast', False)
+                    and not getattr(target_chat, 'megagroup', False)
+                )
+            except Exception:  # pragma: no cover - defensive guard if entity lacks attrs
+                is_broadcast_channel = False
+
+        if is_broadcast_channel:
+            self.logger.debug("Skipping GetMessageReactionsListRequest: broadcast channels do not support this RPC")
+            return None
+
         try:
             await self._random_delay(0.05, 0.15)
             reaction_list = await self.client(functions.messages.GetMessageReactionsListRequest(
@@ -243,7 +258,7 @@ class ActionsMixin:
         except Exception as e:
             self.logger.warning(f"Could not fetch message reactions metadata: {e}. Will try palette emojis.")
 
-        reaction_whitelist = await self._gather_reaction_whitelist(input_peer, message.id)
+        reaction_whitelist = await self._gather_reaction_whitelist(input_peer, message.id, target_chat=target_chat)
         if reaction_whitelist:
             if allowed_reactions:
                 merged = [emoji for emoji in reaction_whitelist if emoji in allowed_reactions]

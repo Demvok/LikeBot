@@ -13,7 +13,11 @@ from auxilary_logic.reporter import Reporter
 from auxilary_logic.cache_registry import get_cache_registry
 from utils.logger import setup_logger, load_config, crash_handler, handle_task_exception
 from main_logic.schemas import TaskStatus, status_name
-from auxilary_logic.telethon_error_handler import map_telethon_exception, reporter_payload_from_mapping
+from auxilary_logic.telethon_error_handler import (
+    map_telethon_exception,
+    reporter_payload_from_mapping,
+    apply_mapping_to_account,
+)
 from utils.retry import get_retry_config, get_delay_config, random_delay, WorkerRetryContext, ActionOutcome
 
 config = load_config()
@@ -33,6 +37,10 @@ class WorkerResult:
     phone_number: str
     failure_reason: Optional[str] = None  # 'account_issue', 'error', etc.
     error: Optional[Exception] = None
+
+
+class NoUsableClientsError(RuntimeError):
+    """Raised when no healthy accounts remain to continue a task."""
 
 
 def _status_name(status) -> str:
@@ -156,11 +164,57 @@ class Task:
     async def _update_account_status_from_mapping(self, client, mapping: dict, error: Exception):
         """Helper to update account status based on telethon error mapping."""
         try:
-            if mapping.get('status'):
-                await client.account.update_status(mapping['status'], error=error)
-                self.logger.info(f"Marked account {client.phone_number} as {mapping['status']}")
+            applied = await apply_mapping_to_account(mapping, client.account, error=error)
+            if applied:
+                if mapping.get('status'):
+                    self.logger.info(f"Marked account {client.phone_number} as {mapping['status']}")
+                elif mapping.get('action') == 'set_flood_wait':
+                    self.logger.info(
+                        f"Set flood-wait for account {client.phone_number} "
+                        f"({mapping.get('flood_seconds')}s)"
+                    )
         except Exception as update_error:
             self.logger.warning(f"Failed to update account status for {client.phone_number}: {update_error}")
+
+    async def _prune_unusable_clients(self, reporter: Reporter, run_id, reason: str) -> int:
+        """Disconnect and drop clients that are no longer usable."""
+        if not self._clients:
+            return 0
+
+        unusable_clients = [client for client in self._clients if not client.account.is_usable()]
+        if not unusable_clients:
+            return 0
+
+        removed_summary = []
+        for client in unusable_clients:
+            phone = client.phone_number
+            status_label = status_name(client.account.status)
+            removed_summary.append(f"{phone} ({status_label})")
+            self.logger.warning(
+                f"Removing unusable account {phone} with status {status_label} during {reason}"
+            )
+            if reporter:
+                try:
+                    await reporter.event(
+                        run_id,
+                        self.task_id,
+                        "WARNING",
+                        "warn.account_removed",
+                        f"Removed account {phone} with status {status_label} during {reason}",
+                        {"account": phone, "status": status_label, "stage": reason},
+                    )
+                except Exception as report_error:
+                    self.logger.debug(f"Reporter event failed while pruning {phone}: {report_error}")
+            try:
+                await client.disconnect()
+            except Exception as disconnect_error:
+                self.logger.warning(f"Failed to disconnect unusable account {phone}: {disconnect_error}")
+
+        self._clients = [client for client in self._clients if client.account.is_usable()]
+        self.logger.warning(
+            f"Pruned {len(unusable_clients)} unusable account(s): {', '.join(removed_summary)}"
+        )
+        return len(unusable_clients)
 
     async def _mark_crashed(self, exc: Exception | None = None, context: str | None = None):
         """Mark the task as crashed and persist status to DB.
@@ -369,6 +423,21 @@ class Task:
                         raise
                 await reporter.event(run_id, self.task_id, "INFO", "info.connecting.posts_validated", f"Validated {len(posts)} posts.")
 
+                removed_clients = await self._prune_unusable_clients(
+                    reporter,
+                    run_id,
+                    reason="post_validation",
+                )
+                if removed_clients:
+                    self.logger.warning(
+                        f"Removed {removed_clients} clients that became unusable during validation"
+                    )
+                if not self._clients:
+                    raise NoUsableClientsError(
+                        "No usable clients remain after validation. "
+                        "Please re-login or replace the affected accounts."
+                    )
+
                 # Pre-load reaction palette once for the whole task if action is 'react'.
                 # The palette is identical for all clients in the task and can be copied to each client
                 # to avoid repeated DB calls per-worker.
@@ -474,6 +543,16 @@ class Task:
             except errors.PhoneNumberInvalidError as e:
                 self.logger.error(f"Task {self.task_id} encountered a PhoneNumberInvalidError: {e}")
                 await reporter.event(run_id, self.task_id, "ERROR", "error.phone_number_invalid", f"Encountered PhoneNumberInvalidError: {e}", {'error': repr(e)})
+            except NoUsableClientsError as e:
+                self.logger.error(f"Task {self.task_id} cannot continue: {e}")
+                await reporter.event(
+                    run_id,
+                    self.task_id,
+                    "ERROR",
+                    "error.no_usable_clients_remaining",
+                    str(e),
+                )
+                self._final_status = Task.TaskStatus.FAILED
             except Exception as e:
                 import sys
                 self.logger.error(f"Error starting task {self.task_id}: {e}")

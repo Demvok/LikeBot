@@ -6,6 +6,10 @@ from telethon import errors
 
 from utils.logger import load_config
 from main_logic.channel import normalize_chat_id
+from auxilary_logic.telethon_error_handler import (
+    map_telethon_exception,
+    apply_mapping_to_account,
+)
 
 config = load_config()
 
@@ -128,8 +132,9 @@ class Post:
         # Fetch message content during validation to minimize future API calls
         try:
             message_content = await client.get_message_content(
-                chat_id=self.chat_id, 
-                message_id=self.message_id
+                chat_id=self.chat_id,
+                message_id=self.message_id,
+                message_link=self.message_link
             )
             self.message_content = message_content
             self.content_fetched_at = Timestamp.now()
@@ -301,6 +306,23 @@ class Post:
                                 last_error = client_error
                                 if logger:
                                     logger.warning(f"Error validating post {post.post_id} with client {client.phone_number}: {client_error}")
+                                try:
+                                    mapping = map_telethon_exception(client_error)
+                                    applied = await apply_mapping_to_account(mapping, client.account, error=client_error)
+                                    if applied and logger:
+                                        if mapping.get('status'):
+                                            logger.info(
+                                                f"Marked account {client.phone_number} as {mapping['status']} after validation error"
+                                            )
+                                        elif mapping.get('action') == 'set_flood_wait':
+                                            logger.info(
+                                                f"Set flood-wait for account {client.phone_number} ({mapping.get('flood_seconds')}s)"
+                                            )
+                                except Exception as update_error:
+                                    if logger:
+                                        logger.warning(
+                                            f"Failed to update account status for {client.phone_number}: {update_error}"
+                                        )
                                 # Try next client
                                 continue
                         

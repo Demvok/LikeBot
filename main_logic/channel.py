@@ -48,6 +48,24 @@ def normalize_chat_id(chat_id: int) -> int:
     # Return absolute value if negative but not -100 prefix
     return abs(chat_id)
 
+
+def ensure_channel_peer_id(chat_id: int) -> int | None:
+    """Return the -100-prefixed channel id Telethon expects."""
+
+    if chat_id is None:
+        return None
+
+    normalized = normalize_chat_id(chat_id)
+    if normalized is None:
+        return None
+
+    # Preserve already prefixed inputs without double-prefixing
+    chat_id_str = str(chat_id)
+    if chat_id_str.startswith('-100'):
+        return int(chat_id)
+
+    return int(f"-100{normalized}")
+
 class Channel:
     """
     Represents a Telegram channel with metadata and configuration.
@@ -64,6 +82,7 @@ class Channel:
         channel_name: Channel name/title
         tags: List of tags for categorization
         url_aliases: List of URL identifiers (usernames, /c/ paths) for fast lookup
+        chat_id_prefixed: -100-prefixed identifier for Telegram API interoperability
         created_at: Creation timestamp
         updated_at: Last update timestamp
     """
@@ -83,6 +102,7 @@ class Channel:
         updated_at=None
     ):
         self.chat_id = normalize_chat_id(chat_id)
+        self.chat_id_prefixed = ensure_channel_peer_id(chat_id)
         self.is_private = is_private
         self.channel_hash = channel_hash or ""
         self.has_enabled_reactions = has_enabled_reactions
@@ -109,6 +129,7 @@ class Channel:
         """
         return {
             'chat_id': self.chat_id,
+            'chat_id_prefixed': self.chat_id_prefixed,
             'is_private': self.is_private,
             'channel_hash': self.channel_hash,
             'has_enabled_reactions': self.has_enabled_reactions,
@@ -277,6 +298,12 @@ class Channel:
             True if alias exists, False otherwise
         """
         return alias in self.url_aliases
+
+    @property
+    def prefixed_chat_id(self) -> Optional[int]:
+        """Return the -100-prefixed chat id used by the Telegram API."""
+
+        return self.chat_id_prefixed
 
     @property
     def can_react(self) -> bool:

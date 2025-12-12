@@ -1,42 +1,55 @@
 # Action Time Scenarios
 
-Estimated runtimes for reactions and comments, covering best / typical / worst cases for a fleet of ~100 accounts handling 1–3 posts per task.
+Updated reaction/comment timing guidance for the current LikeBot runtime: 100 accounts per worker, process-scoped cache, strict global rate limiting, and the new 20–40 s inter-reaction gap baked into `Task.client_worker`.
 
-## Assumptions
+## Assumptions (current code)
 
-- Average Telegram RPC latency (including Telethon serialization) ≈ **0.35 s** per call.
-- Reading delay uses `humaniser.estimate_reading_time` (≈230 wpm skewed distribution). We model three representative message lengths: empty (fallback), 60 words, and 150 words.
-- Random warm-up jitters from `ActionsMixin` are summed per stage; probabilistic branches (neighbor posts, replies) appear in the typical/worst scenarios only.
-- `rate_limiter.wait_if_needed('send_reaction')` enforces 6 s between `SendReactionRequest`s; `send_message` is limited to 10 s. These cool-downs only add time if the business logic otherwise runs faster than the limiter.
-- All 100 accounts run in parallel on the same worker host (as the code already does via `asyncio.gather`). A "sequential" column is included to illustrate the cost if accounts were processed one-by-one.
+- **Global rate limiter:** `TelegramAPIRateLimiter` is a module-level singleton. It enforces ≥6 s between any two `SendReactionRequest`s and ≥10 s between `send_message` calls across the entire process, not per account.
+- **Per-account pacing:** After every post (even if there is only one) `Task.client_worker` sleeps a random 20–40 s (`min_delay_between_reactions` / `max_delay_between_reactions`). Worker start jitter adds another 5–20 s before the very first action.
+- **Humaniser model:** `apply_reading_delay` samples WPM from 160–300 (skewed to ~230). Representative lengths stay: fallback text (2–5 s), 60 words (≈16 s), 150 words (≈39–41 s).
+- **Warm-up branches:** `_prepare_message_context` always runs `GetFullChannel`, media prefetch, and often (80%) a neighbor fetch; replies fire with a 1–5% chance.
+- **Cache scope & TTLs:** The process-scoped `TelegramCache` (max 2,000 entries, per-account cap 400) refreshes TTLs on every hit and deduplicates in-flight fetches. Current TTLs from `config.yaml`:
+	- Entities/InputPeer: 24 h / 7 d
+	- Messages: 7 d
+	- Full channel + discussion metadata: 12 h
+- **Reading level:** `delays.humanisation_level = 1`, so reading delay always runs when text is available; fallback delays only trigger on empty captions.
 
 ## Reaction timing
 
-| Scenario | Key drivers | Per account (1 post) | Per account (3 posts) | 100 accounts, parallel | 100 accounts, sequential |
+| Scenario | Key drivers | Per account (1 post) | Per account (3 posts) | 100 accounts, parallel (1p / 3p) | 100 accounts, sequential (3p) |
 | --- | --- | --- | --- | --- | --- |
-| **Best** | Cache warm, neighbor/reply branches skipped, empty message (fallback 2 s), pre-action min 3 s, single emoji succeeds | ~7 s | ~21 s | ~21 s (entire fleet finishes when the slowest account completes 3 posts) | ~2,100 s (~35 min) |
-| **Typical** | Neighbor fetch fires (adds 1 RPC + 0.4 s jitter), 60-word post (≈16 s reading), pre-action avg 5.5 s, 5–6 RPCs | ~24 s | ~72 s | ~72 s | ~7,200 s (~2 h) |
-| **Worst** | Cold caches, neighbor + replies warm-up, 150-word post (≈41 s reading), 4 emoji attempts (3 extra waits × 6 s), 11 RPCs | ~72 s | ~216 s | ~216 s | ~21,600 s (~6 h) |
+| **Best** | Cache warm, neighbor + reply branches skipped, empty post (fallback 2 s), pre-action min 3 s, single emoji accepted immediately | ~27 s (≈7 s pipeline + 20 s enforced gap) | ~81 s | ≈11 min / ≈33 min (600 or 1,800 `SendReactionRequest`s × 6 s + start/finish jitter) | ~8,100 s (~135 min) |
+| **Typical** | Neighbor fetch hits (adds ≈0.7 s jitter + 1 RPC), 60-word post (≈16 s reading), pre-action avg 5.5 s, 5–6 RPCs, average 30 s post gap | ~54 s | ~162 s | ≈12 min / ≈35 min (queue stays saturated, palette succeeds on first try) | ~16,200 s (~270 min) |
+| **Worst** | Cold start for the first actor on a channel, neighbor + replies + media prefetch all fire, 150-word post (≈41 s reading), palette tries four emojis (3 extra limiter waits), 11 RPCs + 40 s post gap | ~112 s | ~336 s | ≈40 min / ≈120 min (400 / 1,200 reaction attempts when everyone retries 3 emojis) | ~33,600 s (~560 min) |
 
-Notes:
-- Even in the best case the per-reaction pipeline already exceeds the 6 s reaction rate limit, so the limiter rarely stalls additional posts. Extra emoji retries, however, incur 6 s per retry.
-- With caches warm the only irreducible calls per account are: `GetFullChannel` (warm-up), media prefetch, `GetMessagesViews`, `GetMessageReactionsList`, and `SendReaction`.
+**How to read the table**
 
-## Comment timing
+- Per-account numbers now include the mandatory 20–40 s `random_delay` that happens after every post. Even a “single post” task pays this delay before the worker exits.
+- The parallel column reports total wall-clock for 100 accounts on the same worker host. Because the limiter is global, one `SendReactionRequest` is allowed every 6 s, so throughput is bounded by `#reactions × 6 s` regardless of cache state. Additional emoji retries consume additional 6 s slots.
+- Sequential mode imagines processing accounts one-by-one. It multiplies the per-account “3 posts” value by 100, illustrating why sequential fallbacks are unacceptable.
 
-| Scenario | Key drivers | Per account (1 post) | Per account (3 posts) | 100 accounts, parallel | 100 accounts, sequential |
-| --- | --- | --- | --- | --- | --- |
-| **Best** | Cache warm, empty/very short post (fallback 2 s), anti-spam min 1 s, initial send not rate-limited | ~4 s | ~12 s | ~12 s | ~1,200 s (~20 min) |
-| **Typical** | 60-word post (≈16 s reading), anti-spam avg 2 s, 3 RPCs (views, discussion, send) | ~19 s | ~57 s | ~57 s | ~5,700 s (~95 min) |
-| **Worst** | 150-word post (≈41 s reading), anti-spam max 3 s, prior comment <10 s ago so rate limiter forces full 10 s gap (adds ~7 s wait), same 3 RPCs | ~52 s | ~156 s | ~156 s | ~15,600 s (~4.3 h) |
+**Call counts per account**
 
-Notes:
-- When comments are long, the natural reading delay already exceeds the 10 s message limiter, so no extra wait occurs. The worst case assumes very short content on rapid-fire tasks, making the limiter dominate.
-- `_comment` does not run the heavy warm-up sequence, so its runtime variance comes mainly from reading delay and the anti-spam jitter.
+- **Best case (everything already cached, optional branches skipped):** 5 uncached RPCs → `GetFullChannel` warm-up, media prefetch, `GetMessagesViews`, `GetMessageReactionsList`, `SendReaction`.
+- **Typical case:** add one neighbor fetch so 6 calls.
+- **Worst case:** cache misses + replies branch raise that to 11 `functions.messages/*` + up to 4 `SendReactionRequest`s if the palette keeps failing.
+- Since cache TTLs are ≥12 h (24 h for entities, 7 d for messages/input peers) and hits refresh TTLs, only the first account touching a channel/post in a multi-day window pays the cacheable calls. Everyone else awaits the same in-flight Future.
+
+## Comment timing (current limitations)
+
+- LikeBot already implements `_comment`/`comment`, but `Task.client_worker` still emits a “Comment actions are not implemented yet” warning. The table below therefore describes *per-account* timings when `Client.comment()` is called directly (scripts/tests), not via the task orchestrator.
+- Components: `GetMessagesViews` → reading delay → `GetDiscussionMessageRequest` → anti-spam delay (1–3 s) → `rate_limiter.wait_if_needed('send_message')` (global 10 s) → `client.send_message`.
+
+| Scenario | Key drivers | Per account (1 post) | Notes |
+| --- | --- | --- | --- |
+| **Best** | Empty/very short post (fallback 2 s), anti-spam min 1 s, first send_message in >10 s window | ~13 s (2 s read + 1 s anti-spam + 10 s limiter) | Warm caches skip entity/message fetch; throughput is still capped at one comment every 10 s globally. |
+| **Typical** | 60-word post (≈16 s reading), anti-spam avg 2 s | ~28 s | Reading dominates; limiter rarely adds extra wait because the human delay already exceeds 10 s. |
+| **Worst** | Rapid-fire short comments after another account just sent (limiter fully triggers) | ~41 s | Short content (<5 s to read) hits the 10 s limiter head-on; additional retries would add another 10 s each. |
 
 ## Practical implications for 100-account batches
 
-1. **Parallelism keeps wall-clock dominated by per-account latency.** As long as the orchestrator awaits all accounts concurrently, total task duration is effectively the per-account number in the tables above.
-2. **Sequential fallbacks are expensive.** If a safety mode ever processes accounts one-by-one, even the "typical" reaction scenario balloons to ~2 hours for 3 posts, purely due to humanisation delays.
-3. **Cache warm-up matters only at the beginning.** The timing tables already assume caches are warm; cold starts add ~1–2 s per reaction (extra RPC + latency) but only for the first account that touches a channel/post in a five-minute window.
-4. **Message TTL (60 s) is the main risk for sequential waves.** If orchestration ever becomes mostly sequential, increase `cache.message_ttl` or prefetch posts per shard so that later accounts reuse the initial `GetMessages` response instead of paying the latency again.
+1. **Global limiter first, per-account delay second.** Expect ≈10–11 min per post for 100 accounts because 600 reactions × 6 s dominate. The 20–40 s per-account gap mainly affects sequential fallbacks and single-account runs.
+2. **Emoji retries have multiplicative cost.** A single palette miss consumes another global 6 s slot *and* forces the account to sit idle while still holding its inter-reaction delay afterwards. Keep palettes tightly curated.
+3. **Caches are effectively long-lived.** With entity/input-peer TTLs at 24 h/7 d and messages at 7 d (with refresh-on-hit), sequential waves within a campaign reuse the same objects. Missing caches now only happens on first-touch channels or after explicit invalidation.
+4. **Message TTL is no longer the bottleneck.** The earlier 60 s TTL risk is gone; `cache.message_ttl = 604800` s. Sequential batches spanning minutes or even hours still reuse cached posts, so API pressure stays low.
+5. **Cold start penalties are tiny.** Even if the very first account pays the cache miss, in-flight dedup ensures the remaining 99 accounts simply await that Future, so the wall-clock impact is under one RPC round-trip (~0.35 s).

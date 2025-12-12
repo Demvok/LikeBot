@@ -608,6 +608,7 @@ class ChannelResponse(ChannelBase, TimestampMixin):
 class ChannelDict(BaseModel):
     """Schema for Channel.to_dict() output."""
     chat_id: int
+    chat_id_prefixed: Optional[int]
     is_private: bool
     channel_hash: Optional[str]
     has_enabled_reactions: bool

@@ -192,6 +192,20 @@ def _cleanup_old_crash_reports():
 # Set up the logging queue and listener (main process only)
 _log_queue = multiprocessing.Queue(-1)
 
+
+class SafeQueueHandler(QueueHandler):
+    """Queue handler that swallows shutdown-time errors to avoid noisy traces."""
+
+    def emit(self, record):
+        try:
+            super().emit(record)
+        except (ValueError, RuntimeError):
+            # Happens when the queue is already closed during interpreter shutdown
+            return
+        except Exception:
+            # Logging should never raise at shutdown; drop the record quietly
+            return
+
 # Map logger names to their intended log files
 _logger_file_map = {}
 _logger_file_map_lock = threading.Lock()
@@ -351,7 +365,7 @@ def setup_logger(name: str, log_file: str) -> logging.Logger:
         logger.removeHandler(handler)
 
     # Add QueueHandler to send logs to the main process
-    logger.addHandler(QueueHandler(_log_queue))
+    logger.addHandler(SafeQueueHandler(_log_queue))
 
     # Ensure the listener is running (main process only)
     _ensure_listener()
