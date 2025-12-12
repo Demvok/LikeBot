@@ -6,11 +6,11 @@ This document summarizes how the LikeBot client hits the Telegram API during cor
 
 | Layer | Data types | TTL / persistence | Scope | Effect on calls |
 | --- | --- | --- | --- | --- |
-| `TelegramCache.get_entity` | Channel/user entities, `InputPeer` wrappers | 300 s | Process (per `config.cache.scope`) | First account to touch a channel fetches it once; the other ~99 accounts reuse the entity + input peer for 5 minutes. |
-| `TelegramCache.get_message` | `GetMessages` payloads | 60 s | Process | Message contents are fetched once per post, provided the rest of the fleet touches the post within a minute. |
-| `TelegramCache.get_full_channel` | `GetFullChannel` payload used by `ChannelDataMixin` | 600 s | Process | Paying the cost of a channel lookup populates discussion/reaction settings for ten minutes. |
-| Channel / post collections in DB | Channel metadata, URL aliases, validated posts | Persistent | Shared DB | Once a channel/post has been seen, most future link resolutions avoid Telegram entirely and return cached IDs straight from Mongo. |
-| In-flight dedup | All of the above | During call | Process | If 30 accounts ask for the same entity simultaneously, only the first actually calls Telegram; the rest await the same Future. |
+| `TelegramCache.get_entity` | Channel/user entities, `InputPeer` wrappers | 24 h for entities, 7 d for input peers (TTL refreshes on every hit) | Process (`scope = process`, max ≈2,000 entries) | First account to touch a channel fetches it once; everyone else reuses the entity/input peer for an entire day (or indefinitely while active). |
+| `TelegramCache.get_message` | `GetMessages` payloads | 7 d | Process | Posts are fetched once per channel/post combo per week; sequential batches within minutes or hours reuse the same message body. |
+| `TelegramCache.get_full_channel` | `GetFullChannel` payload used by `ChannelDataMixin` | 12 h | Process | Warm-up cost is paid twice a day at most; DB persistence plus TTL refresh keeps settings hot. |
+| Channel / post collections in DB | Channel metadata, URL aliases, validated posts | Persistent | Shared DB | Once a channel/post has been seen, further resolutions hit Mongo without calling Telegram, except for the uncached warm-up snapshot. |
+| In-flight dedup | All of the above | During call | Process | If dozens of accounts ask for the same entity at once, only the first hits Telegram; the rest await the same Future and see identical data. |
 
 Warm caches dramatically lower per-account API counts, but some calls are intentionally uncached (e.g., view increments) to mimic human behaviour.
 
@@ -18,9 +18,9 @@ Warm caches dramatically lower per-account API counts, but some calls are intent
 
 | Stage | Telethon API | Cacheable? | Notes | Calls (cold start) | Calls (warm cache) |
 | --- | --- | --- | --- | --- | --- |
-| Link → IDs (`get_message_ids`) | `GetEntity` (via `client.get_entity`) | ✅ (300 s) | Only when DB lacks the channel/post. Post-validation or alias hits skip this entirely. | 1 | 0 |
-| Message fetch (`get_message_cached`) | `GetMessages` | ✅ (60 s) | First account per post pays; others reuse for 1 minute. | 1 | 0 |
-| Channel metadata (`_get_or_fetch_channel_data`) | `functions.channels.GetFullChannelRequest` | ✅ (600 s) | Only hits when DB lacks the channel. | 1 | 0 |
+| Link → IDs (`get_message_ids`) | `GetEntity` (via `client.get_entity`) | ✅ (24 h) | Only when DB lacks the channel/post. Post-validation or alias hits skip this entirely. | 1 | 0 |
+| Message fetch (`get_message_cached`) | `GetMessages` | ✅ (7 d) | First account per post pays once per week; hits refresh TTL so active channels never expire. | 1 | 0 |
+| Channel metadata (`_get_or_fetch_channel_data`) | `functions.channels.GetFullChannelRequest` | ✅ (12 h) | Only hits when DB lacks the channel, then refreshes twice per day at most. | 1 | 0 |
 | Warm-up snapshot | `functions.channels.GetFullChannelRequest` | ❌ | Always executed to “touch” the channel before acting. | 1 | 1 |
 | Neighbor prefetch (80% probability) | `messages.GetHistoryRequest` **or** `messages.GetMessagesRequest` | ❌ | Randomized humanisation step; skipped ~20% of the time. | 1 | 0–1 |
 | Media prep | `messages.GetMessagesRequest` **or** `messages.GetWebPagePreviewRequest` | ❌ | Always executed, but choice of endpoint varies. | 1 | 1 |
@@ -39,9 +39,9 @@ Warm caches dramatically lower per-account API counts, but some calls are intent
 
 | Stage | Telethon API | Cacheable? | Notes | Calls (cold start) | Calls (warm cache) |
 | --- | --- | --- | --- | --- | --- |
-| Link → IDs | `GetEntity` | ✅ (300 s) | Same mechanics as reactions. | 1 | 0 |
-| Message fetch | `GetMessages` | ✅ (60 s) | Reused if <60 s. | 1 | 0 |
-| Channel metadata (rare) | `GetFullChannel` | ✅ (600 s) | Only when DB lacks channel. | 1 | 0 |
+| Link → IDs | `GetEntity` | ✅ (24 h) | Same mechanics as reactions. | 1 | 0 |
+| Message fetch | `GetMessages` | ✅ (7 d) | Reused unless nobody touches the post for a week. | 1 | 0 |
+| Channel metadata (rare) | `GetFullChannel` | ✅ (12 h) | Only when DB lacks channel or TTL expires. | 1 | 0 |
 | View increment | `GetMessagesViewsRequest` | ❌ | Always done to look human. | 1 | 1 |
 | Discussion lookup | `messages.GetDiscussionMessageRequest` | ❌ | Required to reach the linked chat + reply id. | 1 | 1 |
 | Comment send | `client.send_message` → `messages.SendMessage` | ❌ | Rate-limited (10 s) per account. | 1 | 1 |
@@ -55,19 +55,19 @@ Totals:
 
 ### Cache behaviour over time
 
-- **Process scope** means all 100 accounts share one `TelegramCache`, so once a channel is “touched” the entity/input peer/message objects are global until their TTL expires.
-- **Entity/InputPeer TTL (300 s):** as long as every account hits the same channel within five minutes, only the very first one calls `GetEntity`. Nightly jobs that revisit the same channels every few hours will re-hit Telegram once per channel per run.
-- **Message TTL (60 s):** this is the tightest window. If 100 accounts react sequentially and need ~10 seconds each, the tail of the batch will miss the cache and re-fetch the message. Running accounts concurrently (or increasing the TTL) keeps this at a single call per post.
-- **Channel metadata TTL (600 s) plus database persistence** keeps most `GetFullChannel` calls at onboarding-time only. After the first success the data is in Mongo permanently; future sessions straight-up read from DB and skip Telegram entirely, except for the warm-up snapshot (which is intentionally uncached).
+- **Process scope + refresh-on-hit** keeps hot data resident indefinitely. The shared cache (max 2,000 entries per process, per-account cap 400) refreshes each entry’s TTL whenever it is touched.
+- **Entity/InputPeer TTLs:** entities live for 24 h; input peers for 7 d. Repeated runs during a campaign therefore never re-fetch identities unless the bot sleeps for a day or more.
+- **Message TTL (7 d):** this used to be the shortest window; now a post has to be idle for a full week before the cache expires. Sequential waves that take minutes or hours stay on the cached payload.
+- **Channel metadata TTL (12 h) + Mongo persistence:** once a channel is inserted into the database its structural data is retrieved at most twice per day; the warm-up `GetFullChannel` snapshot in `_prepare_message_context` still executes intentionally every time to mimic organic behavior.
 
 ### Example: 100 accounts reacting to the same post
 
-| Scenario | Cold start (first-ever time) | Warm, concurrent batch (<60 s window) | Long gap (>5 min between batches) |
+| Scenario | Cold start (first-ever time) | Warm batch (<24 h since last touch) | Long gap (>7 d or explicit eviction) |
 | --- | --- | --- | --- |
-| Cacheable calls (entity, input peer, message, channel metadata) | ~4 calls total (paid once) | 0 new calls | Repeated once per gap |
+| Cacheable calls (entity, input peer, message, channel metadata) | ~4 calls total (paid once, deduped for all waiters) | 0 new calls (TTL refreshed on every hit) | Repeated per TTL: entities every 24 h, full channel every 12 h, messages every 7 d |
 | Uncached per-account calls | 5–7 each | 5–7 each | 5–7 each |
-| Total calls/post | ≈ `100 × 5 + 4` = **504–704** | ≈ `100 × 5` = **500** | Same as warm batch, but pay the cacheable 4 calls again |
-| 3 posts/task | Multiply by 3 → **1512–2112** calls | **1500** calls | `1500 + occasional refetches` |
+| Total calls/post | ≈ `100 × 5 + 4` = **504–704** | Same **500** calls no matter how long the batch takes | Adds back 4 cacheable calls only when TTLs truly expire |
+| 3 posts/task | Multiply by 3 → **1512–2112** calls | **1500** calls | `1500` + the occasional TTL refresh |
 
 The table assumes every account finishes its per-post work well inside the message TTL. If the fleet executes sequentially and needs ~1,000 seconds to march through 100 accounts, expect message-cache misses for the last ~40% of clients, adding roughly 40 extra `GetMessages` calls per post.
 
@@ -79,5 +79,5 @@ The table assumes every account finishes its per-post work well inside the messa
 ### Takeaways
 
 1. **Process-scoped cache + DB aliasing eliminates 60–70% of API calls after the first wave.** Only humanisation steps (`GetMessagesViews`, reaction whitelist, warm-up snapshot) remain per account.
-2. **Message TTL is the limiting factor** for very long runs; consider bumping `cache.message_ttl` if sequential fleets routinely exceed 60 seconds per post.
-3. **Neighbor/reply warm-ups dominate variability.** In pathological runs where every random branch fires, the uncached call count per account almost doubles, so monitoring cache stats (`TelegramCache.get_stats()`) helps confirm whether this is due to randomness or cache expiry.
+2. **Message TTL is no longer the limiting factor.** With a 7-day window (and refresh-on-hit), sequential fleets and multi-hour batches keep reusing the initial `GetMessages` payload. Explicit invalidation or week-long gaps are now the only reasons to re-fetch.
+3. **Neighbor/reply warm-ups still dominate variability.** In pathological runs where every random branch fires, the uncached call count per account almost doubles, so monitoring cache stats (`TelegramCache.get_stats()`) helps confirm whether this is due to randomness or persisting random branches.

@@ -103,26 +103,29 @@ async def test_in_flight_deduplication():
 
 
 @pytest.mark.asyncio
-async def test_cross_account_inflight_deduplication():
-    """Concurrent cross-account requests should reuse same in-flight future."""
+async def test_cross_account_isolation():
+    """Accounts should maintain isolated cache entries for identical keys."""
     cache = TelegramCache(task_id=1)
 
     call_count = 0
 
-    async def slow_fetch():
-        nonlocal call_count
-        call_count += 1
-        await asyncio.sleep(0.05)
-        return {"id": 555}
+    def fetch_factory(account):
+        async def fetch():
+            nonlocal call_count
+            call_count += 1
+            await asyncio.sleep(0.05)
+            return {"id": 555, "account": account}
+        return fetch
 
     results = await asyncio.gather(
-        cache.get("entity", ACCOUNT_1, 555, slow_fetch),
-        cache.get("entity", ACCOUNT_2, 555, slow_fetch),
+        cache.get("entity", ACCOUNT_1, 555, fetch_factory(ACCOUNT_1)),
+        cache.get("entity", ACCOUNT_2, 555, fetch_factory(ACCOUNT_2)),
     )
 
-    assert all(r == {"id": 555} for r in results)
-    assert call_count == 1
-    assert cache.get_stats()['dedup_saves'] >= 1
+    assert results[0]["account"] == ACCOUNT_1
+    assert results[1]["account"] == ACCOUNT_2
+    assert call_count == 2
+    assert cache.get_stats()['dedup_saves'] == 0
 
 
 @pytest.mark.asyncio
@@ -396,8 +399,8 @@ async def test_cache_stats_accuracy():
 
 
 @pytest.mark.asyncio
-async def test_cross_account_cache_hit():
-    """Same entity fetched by different accounts should hit shared cache."""
+async def test_cross_account_cache_entries_are_isolated():
+    """Identical entity lookups for different accounts must not be shared."""
     cache = TelegramCache(task_id=1)
 
     call_count = 0
@@ -410,9 +413,9 @@ async def test_cross_account_cache_hit():
     result1 = await cache.get("entity", ACCOUNT_1, 123, fetch_shared)
     result2 = await cache.get("entity", ACCOUNT_2, 123, fetch_shared)
 
-    assert call_count == 1  # Second call reused cache
+    assert call_count == 2  # Each account fetched independently
     assert result1 == result2
-    assert len(cache._cache) == 1
+    assert len(cache._cache) == 2
 
 
 @pytest.mark.asyncio

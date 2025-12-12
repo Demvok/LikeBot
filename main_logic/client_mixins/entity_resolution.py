@@ -6,10 +6,11 @@ Provides caching and optimization for entity lookups.
 """
 
 import asyncio
-from typing import Optional, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 from urllib.parse import urlparse, unquote
 from telethon import errors, functions
-from main_logic.channel import normalize_chat_id
+from telethon.tl.types import InputPeerChannel
+from main_logic.channel import normalize_chat_id, ensure_channel_peer_id
 from auxilary_logic.humaniser import rate_limiter
 from utils.retry import async_retry
 
@@ -46,6 +47,37 @@ class EntityResolutionMixin:
         if stripped.startswith('@'):
             return stripped[1:]
         return stripped
+
+    def _get_identifier_preference_store(self) -> dict:
+        """Return (and lazily initialize) the identifier preference cache."""
+        store = getattr(self, '_entity_identifier_preferences', None)
+        if store is None:
+            store = {}
+            setattr(self, '_entity_identifier_preferences', store)
+        return store
+
+    def _identifier_preference_key(self, identifier: Any) -> str:
+        """Build a canonical key so +-100 variants map to the same entry."""
+        try:
+            if isinstance(identifier, int):
+                normalized = normalize_chat_id(identifier)
+                return f"id:{normalized}"
+            if isinstance(identifier, str):
+                stripped = identifier.strip()
+                if stripped.startswith('-100') and stripped[4:].isdigit():
+                    normalized = normalize_chat_id(int(stripped))
+                    return f"id:{normalized}"
+                if stripped.isdigit():
+                    normalized = normalize_chat_id(int(stripped))
+                    return f"id:{normalized}"
+                return f"alias:{self._normalize_url_identifier(stripped)}"
+        except Exception:
+            pass
+        return f"raw:{type(identifier).__name__}:{repr(identifier)}"
+
+    def _is_cacheable_identifier_variant(self, candidate: Any) -> bool:
+        """Only store numeric variants (int) as preferences."""
+        return isinstance(candidate, int)
     
     def _extract_identifier_from_link(self, link: str):
         """
@@ -335,6 +367,61 @@ class EntityResolutionMixin:
             self.logger.warning(f"Error extracting IDs from '{link}': {e}")
             raise
 
+    async def _build_entity_identifier_candidates(self, identifier):
+        """Generate a prioritized list of identifiers to resolve an entity."""
+        candidates = []
+        seen = set()
+
+        def add_candidate(value):
+            if value is None:
+                return
+            marker = (type(value), repr(value))
+            if marker in seen:
+                return
+            seen.add(marker)
+            candidates.append(value)
+
+        add_candidate(identifier)
+
+        numeric_identifier = None
+        if isinstance(identifier, int):
+            numeric_identifier = identifier
+        elif isinstance(identifier, str):
+            stripped = identifier.strip()
+            if stripped.startswith('-100') and stripped[4:].isdigit():
+                numeric_identifier = int(stripped)
+            elif stripped.isdigit():
+                numeric_identifier = int(stripped)
+
+        if numeric_identifier is None:
+            return candidates
+
+        normalized_id = normalize_chat_id(numeric_identifier)
+        add_candidate(normalized_id)
+        prefixed_id = ensure_channel_peer_id(numeric_identifier)
+        if prefixed_id is not None:
+            add_candidate(prefixed_id)
+
+        try:
+            from main_logic.database import get_db
+            db = get_db()
+            channel = await db.get_channel(normalized_id)
+            if channel:
+                if getattr(channel, 'channel_hash', None):
+                    try:
+                        access_hash = int(channel.channel_hash)
+                        peer = InputPeerChannel(channel_id=normalized_id, access_hash=access_hash)
+                        add_candidate(peer)
+                    except (TypeError, ValueError):
+                        pass
+                for alias in (getattr(channel, 'url_aliases', []) or []):
+                    if alias:
+                        add_candidate(alias)
+        except Exception as channel_err:
+            self.logger.debug(f"Channel lookup failed while expanding identifier {identifier}: {channel_err}")
+
+        return candidates
+
     @async_retry(
         retries_key='entity_resolution_retries',
         delay_key='entity_resolution_retry_delay',
@@ -342,7 +429,6 @@ class EntityResolutionMixin:
         no_retry_exceptions=(
             errors.AuthKeyUnregisteredError,
             errors.AuthKeyInvalidError,
-            errors.SessionRevokedError,
             errors.UserDeactivatedError,
             errors.UserDeactivatedBanError,
             errors.UsernameNotOccupiedError,
@@ -381,7 +467,55 @@ class EntityResolutionMixin:
                 f"or use client.client.get_entity() directly for uncached access."
             )
         
-        return await self._fetch_entity_with_retry(identifier)
+        candidates = await self._build_entity_identifier_candidates(identifier)
+        preference_store = self._get_identifier_preference_store()
+        preference_key = self._identifier_preference_key(identifier)
+        active_preference = preference_store.get(preference_key)
+
+        if active_preference is not None:
+            for idx, candidate in enumerate(candidates):
+                if candidate == active_preference:
+                    if idx != 0:
+                        candidates.insert(0, candidates.pop(idx))
+                        self.logger.debug(
+                            "Prioritizing identifier variant %s for %s based on prior success",
+                            active_preference,
+                            preference_key,
+                        )
+                    break
+            else:
+                # Preference is stale; drop it so the normal ordering is used
+                preference_store.pop(preference_key, None)
+                active_preference = None
+
+        last_error = None
+
+        for idx, candidate in enumerate(candidates):
+            try:
+                result = await self._fetch_entity_with_retry(candidate)
+                if idx > 0 and self._is_cacheable_identifier_variant(candidate):
+                    preference_store[preference_key] = candidate
+                    active_preference = candidate
+                    self.logger.debug(
+                        "Promoted identifier variant %s for %s after fallback success",
+                        candidate,
+                        preference_key,
+                    )
+                return result
+            except (
+                errors.UsernameNotOccupiedError,
+                errors.UsernameInvalidError,
+                ValueError,
+            ) as candidate_error:
+                if active_preference is not None and candidate == active_preference:
+                    preference_store.pop(preference_key, None)
+                    active_preference = None
+                last_error = candidate_error
+                continue
+
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"Unable to resolve entity for identifier {identifier}")
     
     async def get_message_content(self, chat_id=None, message_id=None, message_link=None) -> str | None:
         """
@@ -397,18 +531,37 @@ class EntityResolutionMixin:
         """
         try:
             await self.ensure_connected()
-            if message_link and not (message_id and chat_id):
-                entity, message = await self._get_message_ids(message_link)
-                return message.message if message else None
+            resolved_entity = None
+            resolved_chat_id = chat_id
+            resolved_message_id = message_id
+
+            if message_link and (not resolved_chat_id or not resolved_message_id):
+                resolved_chat_id, resolved_message_id, resolved_entity = await self.get_message_ids(link=message_link)
             else:
-                if not chat_id or not message_id:
+                if not resolved_chat_id or not resolved_message_id:
                     raise ValueError("Either message_link or both chat_id and message_id must be provided.")
 
-            # Use cached get_entity with rate limiting
-            entity = await self.get_entity_cached(chat_id)
+            try:
+                entity = resolved_entity or await self.get_entity_cached(resolved_chat_id)
+            except ValueError as entity_error:
+                if message_link:
+                    self.logger.debug(
+                        "Entity lookup failed for chat_id %s (%s). Retrying via message link %s",
+                        resolved_chat_id,
+                        entity_error,
+                        message_link,
+                    )
+                    link_chat_id, link_message_id, link_entity = await self.get_message_ids(link=message_link)
+                    if link_chat_id is not None:
+                        resolved_chat_id = link_chat_id
+                    if link_message_id is not None:
+                        resolved_message_id = link_message_id
+                    entity = link_entity or await self.get_entity_cached(resolved_chat_id)
+                else:
+                    raise
             # Rate limit message fetching
             await rate_limiter.wait_if_needed('get_messages')
-            message = await self.client.get_messages(entity, ids=message_id)
+            message = await self.client.get_messages(entity, ids=resolved_message_id)
             return message.message if message else None
         except Exception as e:
             self.logger.warning(f"Error retrieving message content: {e}")
