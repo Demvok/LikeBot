@@ -31,7 +31,7 @@ This document describes the full CRUD API for the LikeBot automation system.
 
 The following notes summarize important changes in the codebase since the previous documented version (1.0.2):
 
-- Bumped API version to **1.2.0** (health-check now simply relays the FastAPI app version string).
+- Bumped API version to **1.2.1** (health-check now simply relays the FastAPI app version string).
 - Added CORS support that can be configured via the `frontend_http` environment variable (used by the API to allow frontend origins).
 - Startup now runs inside a FastAPI lifespan hook that validates critical environment variables (`KEK`, `JWT_SECRET_KEY`, `db_url`), verifies database readiness, and cancels in-flight background tasks on shutdown.
 - The application registers a cleanup handler on process exit to ensure logging/resources are cleaned up (clean shutdown behavior).
@@ -312,7 +312,7 @@ Get server status.
 ```json
 {
   "message": "LikeBot API Server is running",
-  "version": "1.2.0"
+  "version": "1.2.1"
 }
 ```
 

@@ -98,11 +98,16 @@ class Channel:
         channel_name: Optional[str] = None,
         tags: Optional[List[str]] = None,
         url_aliases: Optional[List[str]] = None,
+        chat_id_prefixed: Optional[int] = None,
         created_at=None,
         updated_at=None
     ):
         self.chat_id = normalize_chat_id(chat_id)
-        self.chat_id_prefixed = ensure_channel_peer_id(chat_id)
+        self.chat_id_prefixed = (
+            ensure_channel_peer_id(chat_id_prefixed)
+            if chat_id_prefixed is not None
+            else ensure_channel_peer_id(chat_id)
+        )
         self.is_private = is_private
         self.channel_hash = channel_hash or ""
         self.has_enabled_reactions = has_enabled_reactions
@@ -163,6 +168,7 @@ class Channel:
             channel_name=data.get('channel_name'),
             tags=data.get('tags', []),
             url_aliases=data.get('url_aliases', []),
+            chat_id_prefixed=data.get('chat_id_prefixed'),
             created_at=data.get('created_at'),
             updated_at=data.get('updated_at')
         )

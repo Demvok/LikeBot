@@ -15,5 +15,3 @@ cryptography
 python-jose[cryptography]
 bcrypt
 python-multipart
-
-tqdm

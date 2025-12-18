@@ -39,6 +39,10 @@
 
 ## Changelog
 
+### v.1.2.2
+- Client +12089974607 failed to react to post 33: Channel.__init__() got an unexpected keyword argument 'chat_id_prefixed'
+
+
 ### v.1.2.1
 - fixed channel caching
 - fixed post validation racing issue
